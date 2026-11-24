@@ -6,7 +6,7 @@
 
 
 """▶~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~☯
-DEVELOPER: @RBX404
+DEVELOPER: @RONxOFFIClAL
 WhatsApp: https://whatsapp.com/channel/0027t5X4o7qJuL6cYQ3N
 telegram: https://t.me/jaatt352626
 telegram: https://t.me/RONxOFFIClAL
@@ -66,7 +66,11 @@ ADMIN_IDS = [int(x) for x in _env("ADMIN_IDS").replace(";", ",").split(",") if x
 DB_PATH = _env("DB_PATH", "rbx404_tempmail.db")                 # point to a persistent disk on ephemeral hosts
 
 BOT_NAME = _env("BOT_NAME", "RBX404 Temp Mail")
-SUPPORT_USERNAME = _env("SUPPORT_USERNAME", "RBX404")           # without @
+SUPPORT_USERNAME = _env("SUPPORT_USERNAME", "@RONxOFFIClAL")           # without @
+GROUP_LINK = _env("GROUP_LINK", "https://t.me/jaatt352626")
+GROUP_CHAT_ID = _env("GROUP_CHAT_ID", "@jaatt352626")
+ALLOWED_GROUP_IDS = [int(x) for x in _env("ALLOWED_GROUP_IDS").replace(";", ",").split(",")
+                     if x.strip().lstrip("-").isdigit()]
 WELCOME_MESSAGE = ("Disposable inboxes in one tap.\nHi {name}, generate an address, use it anywhere, "
                    "and read incoming mail right here.")
 
@@ -117,7 +121,6 @@ import string
 import sys
 import tempfile
 import time
-from collections import defaultdict, deque
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import quote, urlparse
@@ -167,6 +170,21 @@ def loads_obj(s):
         return d if isinstance(d, dict) else {}
     except (ValueError, TypeError):
         return {}
+
+
+def is_group_chat(chat_type: str) -> bool:
+    return chat_type in ("group", "supergroup")
+
+
+def allowed_in_chat(msg_or_cb) -> bool:
+    chat = msg_or_cb.message.chat if isinstance(msg_or_cb, CallbackQuery) and msg_or_cb.message else (
+        msg_or_cb.chat if isinstance(msg_or_cb, Message) else None
+    )
+    if not chat:
+        return True
+    if is_group_chat(chat.type) and ALLOWED_GROUP_IDS:
+        return chat.id in ALLOWED_GROUP_IDS
+    return True
 
 
 MEDIA_LABELS = {
@@ -259,8 +277,6 @@ async def mig_2(conn):
     await conn.execute("UPDATE admins SET must_change=1 WHERE password_hash IS NOT NULL")
 
 
-# (version, function). Version 1 is the original schema in SCHEMA (CREATE ... IF NOT EXISTS), so databases made by
-# earlier releases are simply "version 1". Each migration runs in one transaction and is recorded once applied.
 async def mig_3(conn):
     """Admin audit log (bot admin panel) and per-screen media enable/disable."""
     await conn.execute("CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, "
@@ -342,7 +358,6 @@ SETTING_DEFAULTS = {
     "health_interval": str(HEALTH_INTERVAL), "provider_fail_threshold": str(PROVIDER_FAIL_THRESHOLD),
     "provider_cooldown": str(PROVIDER_COOLDOWN), "http_timeout": str(HTTP_TIMEOUT),
 }
-# key -> (kind, min, max, label): drives validation and the Settings screen of the admin panel
 SETTING_META = {
     "bot_name": ("text", 1, 40, "Bot name"),
     "welcome_message": ("text", 1, 800, "Welcome message ({name} = first name)"),
@@ -363,7 +378,6 @@ def S(key):
 
 
 def si(key) -> int:
-    """Integer setting, clamped to its allowed range; falls back to the configured default."""
     _, lo, hi, _ = SETTING_META[key]
     n = to_int(S(key), lo, hi)
     return n if n is not None else int(SETTING_DEFAULTS[key])
@@ -395,8 +409,6 @@ def check_pw(pw: str, stored: str) -> bool:
         return False
 
 
-
-
 async def init_data():
     for k, v in SETTING_DEFAULTS.items():
         await db.run("INSERT OR IGNORE INTO bot_settings(key,value) VALUES(?,?)", (k, v))
@@ -409,6 +421,11 @@ async def init_data():
         for p in DEFAULT_PROVIDERS:
             await db.run("INSERT OR IGNORE INTO providers(name,api_type,base_url,priority) VALUES(?,?,?,?)",
                          (p["name"], p["api_type"], p["base_url"], p.get("priority", 100)))
+    if GROUP_CHAT_ID and GROUP_LINK:
+        exists = await db.one("SELECT id FROM force_join WHERE chat_id=?", (GROUP_CHAT_ID,))
+        if not exists:
+            await db.run("INSERT INTO force_join(title,kind,chat_id,link,enabled) VALUES(?,?,?,?,0)",
+                         ("RBX404 Group", "group", GROUP_CHAT_ID, GROUP_LINK))
     if not await db.one("SELECT id FROM admins WHERE tg_id IS NOT NULL LIMIT 1"):
         for i in ADMIN_IDS:
             await db.run("INSERT OR IGNORE INTO admins(tg_id,created_at) VALUES(?,?)", (int(i), now()))
@@ -478,9 +495,8 @@ class Adapter:
         except aiohttp.ClientError as ex:
             raise ProviderError(ex.__class__.__name__)
 
-    # interface -------------------------------------------------------------
     async def health(self): raise NotImplementedError
-    async def create(self): raise NotImplementedError          # -> (address, secret_json)
+    async def create(self): raise NotImplementedError
     async def list_messages(self, address, secret): raise NotImplementedError
     async def read_message(self, address, secret, mid): raise NotImplementedError
     async def delete(self, address, secret): return None
@@ -785,12 +801,22 @@ async def _drop(msg):
             pass
 
 
+def resolve_chat_id(ev, old=None) -> int:
+    if isinstance(old, Message) and old.chat:
+        return old.chat.id
+    if isinstance(ev, CallbackQuery) and ev.message and ev.message.chat:
+        return ev.message.chat.id
+    if isinstance(ev, Message) and ev.chat:
+        return ev.chat.id
+    return ev.from_user.id
+
+
 async def screen(ev, key, text, markup=None, replace=None):
-    """Show a screen: media (if configured and valid) with text caption, else text-only. Returns the sent Message."""
-    chat_id = ev.from_user.id
+    """Show a screen in the current chat (private or group): media with caption, else text-only."""
     old = replace if replace is not None else (ev.message if isinstance(ev, CallbackQuery) else None)
     if not isinstance(old, Message):
         old = None
+    chat_id = resolve_chat_id(ev, old)
     if len(text) > 4096:
         text = text[:4090] + "…"
     url = await media_url(key) if key else ""
@@ -838,7 +864,6 @@ async def missing_joins(uid, fresh=False):
         except TelegramRetryAfter:
             continue
         except TelegramAPIError as ex:
-            # Bot lacks access to that chat: cannot verify, so do not lock users out. Fix it in Force Join > Check.
             log.warning("force-join check failed for chat %s: %s", r["chat_id"], str(ex)[:80])
     return missing
 
@@ -852,7 +877,11 @@ async def join_screen(ev, missing):
 
 
 async def guard(ev, fresh=False) -> bool:
+    if not allowed_in_chat(ev):
+        return False
     u = ev.from_user
+    if not u:
+        return False
     is_cb = isinstance(ev, CallbackQuery)
     t = time.monotonic()
     if is_cb:
@@ -909,9 +938,16 @@ async def show_home(ev, replace=None):
     name = esc(ev.from_user.first_name or "there")
     text = head(esc(S("bot_name")).upper()) + esc(S("welcome_message")).replace("{name}", name)
     sup = S("support_username").lstrip("@")
-    rows = [[btn("📨 New Email", "gen"), btn("📥 Inbox", "inbox:0")],
-            [btn("🗂 My Emails", "list"), btn("👤 Account", "acct")],
-            [btn("❓ Help", "help")] + ([btn("💬 Support", url=f"https://t.me/{sup}")] if sup else [])]
+    row3 = [btn("❓ Help", "help")]
+    if GROUP_LINK:
+        row3.append(btn("👥 Group", url=GROUP_LINK))
+    elif sup:
+        row3.append(btn("💬 Support", url=f"https://t.me/{sup}"))
+    rows = [
+        [btn("📨 New Email", "gen"), btn("📥 Inbox", "inbox:0")],
+        [btn("🗂 My Emails", "list"), btn("👤 Account", "acct")],
+        row3,
+    ]
     if ev.from_user.id in ADMIN_SET:
         rows.append([ADMIN_HOME])
     await screen(ev, "welcome", text, kb(*rows), replace)
@@ -1023,6 +1059,16 @@ HELP_TEXT = (head("HELP") + "<b>How it works</b>\n1️⃣ Tap <b>New Email</b> t
 
 
 async def handle_callback(cb: CallbackQuery):
+    if not allowed_in_chat(cb):
+        return
+    if cb.message and cb.message.reply_to_message and cb.message.reply_to_message.from_user:
+        if cb.message.reply_to_message.from_user.id != cb.from_user.id:
+            try:
+                await cb.answer("Sirf jisne command bheji hai wahi is menu ka use kar sakta hai.", show_alert=True)
+            except TelegramAPIError:
+                pass
+            return
+
     action, _, rest = (cb.data or "").partition(":")
     uid = cb.from_user.id
     if not await guard(cb, fresh=(action == "verify")):
@@ -1079,13 +1125,13 @@ async def handle_callback(cb: CallbackQuery):
 async def cmd_start(m: Message):
     if m.from_user:
         PENDING.pop(m.from_user.id, None)
-    if m.chat.type == "private" and await guard(m):
+    if m.chat.type in ("private", "group", "supergroup") and await guard(m):
         await log_act(m.from_user.id, "start")
         await show_home(m)
 
 
 async def cmd_help(m: Message):
-    if m.chat.type == "private" and await guard(m):
+    if m.chat.type in ("private", "group", "supergroup") and await guard(m):
         await screen(m, "help", HELP_TEXT, kb([MENU]))
 
 
@@ -1095,9 +1141,10 @@ async def on_error(event: ErrorEvent):
     upd = event.update
     u = (upd.callback_query or upd.message)
     if u is not None and u.from_user:
+        target_chat_id = resolve_chat_id(u)
         key = "db" if isinstance(ex, aiosqlite.Error) else ("tg" if isinstance(ex, TelegramAPIError) else "generic")
         try:
-            await bot.send_message(u.from_user.id, ERR[key], reply_markup=kb([MENU]))
+            await bot.send_message(target_chat_id, ERR[key], reply_markup=kb([MENU]))
         except TelegramAPIError:
             pass
     return True
@@ -1126,9 +1173,7 @@ async def cleanup_loop():
 
 
 # ------------------------------------------------------------------ telegram admin panel
-# Everything the old web panel did, inside the bot. Open with /admin (or the "Admin" button on the main menu).
-# Admins = ADMIN_SET. Super admins (ADMIN_IDS from the environment) can also manage admins and download backups.
-PENDING: dict = {}          # admin id -> {"act": ..., "exp": ts, ...}: the bot is waiting for that admin's next text message
+PENDING: dict = {}
 SUPER_ADMINS = set(ADMIN_IDS)
 BCJOB = {"running": False, "cancel": False, "total": 0, "sent": 0, "failed": 0, "blocked": 0, "started": 0, "task": None}
 ADMIN_HOME = btn("🛠 Admin", "a:home")
@@ -1141,7 +1186,6 @@ def is_super(uid) -> bool:
     return uid in SUPER_ADMINS
 
 
-# ---- pure validators / formatters (unit-tested) ----
 def validate_setting(key, raw):
     kind, lo, hi, _ = SETTING_META[key]
     raw = (raw or "").strip()
@@ -1189,7 +1233,7 @@ def valid_http_url(u: str) -> bool:
 def csv_cell(v) -> str:
     s = "" if v is None else str(v)
     if s[:1] in ("=", "+", "-", "@", "\t", "\r"):
-        s = "'" + s            # stop spreadsheet formula injection
+        s = "'" + s
     return '"' + s.replace('"', '""') + '"'
 
 
@@ -1201,7 +1245,6 @@ def users_csv(rows) -> bytes:
     return ("\n".join(out) + "\n").encode("utf-8")
 
 
-# ---- helpers ----
 async def audit(uid, action, detail=""):
     try:
         await db.run("INSERT INTO admin_audit(admin_id,action,detail,created_at) VALUES(?,?,?,?)",
@@ -1224,7 +1267,6 @@ async def ask(ev, uid, act, prompt, **data):
                kb([btn("✖️ Cancel", "a:cancel")]))
 
 
-# ---- home / stats / audit ----
 async def admin_home(ev):
     uid = ev.from_user.id
     rows = [[btn("📊 Stats", "a:stats"), btn("👥 Users", "a:us")],
@@ -1268,7 +1310,6 @@ async def admin_audit_view(ev):
     await ascr(ev, text, kb([back()]))
 
 
-# ---- providers ----
 async def prov_list(ev):
     rows = await db.all("SELECT * FROM providers ORDER BY priority,id")
     lines = [f"{PSTAT.get(p['status'], '⚪')} {'✅' if p['enabled'] else '⛔'} <b>{esc(p['name'])}</b> · {esc(p['api_type'])} · prio {p['priority']}"
@@ -1310,7 +1351,6 @@ PV_PROMPTS = {
 
 
 async def pv_apply(pid, field, text):
-    """Validate and store one provider field. Raises ValueError with a user-facing message."""
     text = text.strip()
     try:
         if field == "name":
@@ -1340,7 +1380,6 @@ async def pv_apply(pid, field, text):
         raise ValueError("A provider with that name already exists")
 
 
-# ---- media ----
 async def media_list(ev):
     rows = {r["key"]: r for r in await db.all("SELECT * FROM media_settings")}
     kbrows = []
@@ -1379,7 +1418,6 @@ async def media_url_raw(key):
     return (r or {}).get("url", "")
 
 
-# ---- force join ----
 async def fj_list(ev):
     rows = await db.all("SELECT * FROM force_join ORDER BY id")
     lines = [f"{'✅' if r['enabled'] else '⛔'} <b>{esc(r['title'])}</b> · {esc(r['kind'])} · <code>{esc(r['chat_id'])}</code>" for r in rows] \
@@ -1421,7 +1459,6 @@ def fj_validate(field, text):
 FJ_COL = {"title": "title", "chat": "chat_id", "link": "link"}
 
 
-# ---- settings ----
 async def settings_list(ev):
     lines = []
     for k, (kind, lo, hi, label) in SETTING_META.items():
@@ -1437,7 +1474,6 @@ async def settings_list(ev):
     await ascr(ev, head("SETTINGS") + "\n".join(lines) + "\n\n<i>Changes apply immediately, no restart needed.</i>", kb(*kbrows))
 
 
-# ---- users ----
 async def users_menu(ev):
     n = (await db.one("SELECT COUNT(*) c FROM users"))["c"]
     await ascr(ev, head("USERS") + f"{n} users in total.",
@@ -1472,7 +1508,6 @@ async def user_card(ev, uid2, note=""):
         [back("a:us")]))
 
 
-# ---- admins (super admins only) ----
 async def admins_list(ev):
     rows = await db.all("SELECT * FROM admins WHERE tg_id IS NOT NULL ORDER BY id")
     lines = [f"{'👑' if is_super(r['tg_id']) else '👤'} <code>{r['tg_id']}</code> · added {fmt_ts(r['created_at'])}" for r in rows]
@@ -1482,7 +1517,6 @@ async def admins_list(ev):
                "All admins bypass maintenance and force join.", kb(*kbrows))
 
 
-# ---- broadcast ----
 def bc_progress_text():
     done = BCJOB["sent"] + BCJOB["failed"] + BCJOB["blocked"]
     pct = int(done * 100 / BCJOB["total"]) if BCJOB["total"] else 100
@@ -1494,7 +1528,7 @@ async def bc_edit(prog, text, markup=None):
     try:
         await bot.edit_message_text(text, chat_id=prog[0], message_id=prog[1], reply_markup=markup)
     except TelegramAPIError:
-        pass        # message unchanged / deleted: progress display is best-effort
+        pass
 
 
 async def broadcast_worker(admin_id, src_chat, src_msg, markup, prog):
@@ -1522,7 +1556,7 @@ async def broadcast_worker(admin_id, src_chat, src_msg, markup, prog):
                 BCJOB["failed"] += 1
             if i % 25 == 0:
                 await bc_edit(prog, head("BROADCAST") + bc_progress_text(), stop_kb)
-            await asyncio.sleep(0.05)       # ~20 msg/s, below Telegram's ~30/s global limit
+            await asyncio.sleep(0.05)
     finally:
         cancelled = BCJOB["cancel"]
         BCJOB["running"] = False
@@ -1565,7 +1599,6 @@ def bc_markup(button):
     return kb([btn(button[0], url=button[1])])
 
 
-# ---- backup (super admins) ----
 async def send_backup(ev, uid):
     tmp = os.path.join(tempfile.mkdtemp(), f"rbx404-backup-{now()}.db")
     try:
@@ -1581,7 +1614,6 @@ async def send_backup(ev, uid):
     await audit(uid, "backup")
 
 
-# ---- entry points ----
 async def cmd_admin(m: Message):
     if m.chat.type == "private" and m.from_user and m.from_user.id in ADMIN_SET:
         PENDING.pop(m.from_user.id, None)
@@ -1605,7 +1637,7 @@ async def admin_cb(cb: CallbackQuery):
     if sec not in ("pvat", "fjak", "bcg", "bcb"):
         PENDING.pop(uid, None)
     n = to_int(arg, 0, 2 ** 62)
-    yes = lambda t, cb_yes, cb_no: kb([btn("✅ Yes, confirm", cb_yes), btn("✖️ No", cb_no)])  # noqa: E731
+    yes = lambda t, cb_yes, cb_no: kb([btn("✅ Yes, confirm", cb_yes), btn("✖️ No", cb_no)])
 
     if sec in ("home", "cancel"):
         await admin_home(cb)
@@ -1613,8 +1645,6 @@ async def admin_cb(cb: CallbackQuery):
         await admin_stats(cb)
     elif sec == "au":
         await admin_audit_view(cb)
-
-    # providers
     elif sec == "pv":
         await (prov_card(cb, n) if n else prov_list(cb))
     elif sec in ("pvt", "pvc", "pvu", "pvd", "pvx", "pvX", "pve") and n:
@@ -1648,8 +1678,6 @@ async def admin_cb(cb: CallbackQuery):
         st = PENDING.get(uid)
         if st and st["act"] == "pv_add_type" and arg in ADAPTERS:
             await ask(cb, uid, "pv_add_url", f"Type <b>{esc(arg)}</b>. Now send the API base URL.", name=st["name"], type=arg)
-
-    # media
     elif sec == "md":
         await (media_card(cb, arg) if arg in MEDIA_LABELS else media_list(cb))
     elif sec in ("mds", "mdr", "mdt", "mdp") and arg in MEDIA_LABELS:
@@ -1675,8 +1703,6 @@ async def admin_cb(cb: CallbackQuery):
                 log.warning("media test error: %s", ex.__class__.__name__)
             await media_card(cb, arg, "✅ Telegram loaded the media (sent above).\n\n" if sent else
                              "❌ Telegram could not load this URL. Users would see text only.\n\n")
-
-    # force join
     elif sec == "fj":
         await (fj_card(cb, n) if n else fj_list(cb))
     elif sec in ("fjt", "fjc", "fjm", "fjx", "fjX", "fje") and n:
@@ -1721,8 +1747,6 @@ async def admin_cb(cb: CallbackQuery):
         if st and st["act"] == "fj_add_kind" and arg in ("channel", "group"):
             await ask(cb, uid, "fj_add_chat", f"{esc(arg).title()} <b>{esc(st['title'])}</b>.\nSend the chat @username or numeric ID "
                       "(private chats need -100…).", title=st["title"], kind=arg)
-
-    # settings
     elif sec == "st":
         await settings_list(cb)
     elif sec == "stm":
@@ -1733,8 +1757,6 @@ async def admin_cb(cb: CallbackQuery):
         kind, lo, hi, label = SETTING_META[arg]
         rng = f"{lo} to {hi}" if kind == "int" else f"{lo}-{hi} characters"
         await ask(cb, uid, "st_edit", f"<b>{esc(label)}</b>\nCurrent: <code>{esc(S(arg)) or '-'}</code>\nSend the new value ({rng}).", key=arg)
-
-    # users
     elif sec == "us":
         await (user_card(cb, n) if n else users_menu(cb))
     elif sec == "uss":
@@ -1767,8 +1789,6 @@ async def admin_cb(cb: CallbackQuery):
             text = head("EMAIL RECORDS") + ("\n".join(f"• <code>{esc(r['address'])}</code> · {'active' if is_alive(r) else 'closed'} · "
                                                       f"{fmt_ts(r['created_at'])}" for r in rows) or "No records.")
             await ascr(cb, text, kb([back(f"a:us:{n}")]))
-
-    # admins (super only)
     elif sec in ("ad", "ada", "adx", "adX"):
         if not is_super(uid):
             return await ascr(cb, head("ADMINS") + "Only super admins can manage admins.", kb([back()]))
@@ -1789,8 +1809,6 @@ async def admin_cb(cb: CallbackQuery):
                 await load_admins()
                 await audit(uid, "admin_remove", str(r["tg_id"]))
             await admins_list(cb)
-
-    # broadcast
     elif sec == "bc":
         await bc_start(cb, uid)
     elif sec == "bcx":
@@ -1813,8 +1831,6 @@ async def admin_cb(cb: CallbackQuery):
         await audit(uid, "broadcast_start", f"msg {st['src_msg']}")
         await ascr(cb, head("BROADCAST") + "📤 Starting…", kb([btn("🛑 Cancel broadcast", "a:bcx")]))
         BCJOB["task"] = asyncio.create_task(broadcast_worker(uid, st["src_chat"], st["src_msg"], bc_markup(st["button"]), prog))
-
-    # backup
     elif sec == "bk":
         if not is_super(uid):
             return await ascr(cb, head("BACKUP") + "Only super admins can download backups.", kb([back()]))
