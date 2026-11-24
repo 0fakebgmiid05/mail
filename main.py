@@ -97,8 +97,8 @@ DEFAULT_PROVIDERS = [
     {"name": "mail.gw", "api_type": "mailtm", "base_url": "https://api.mail.gw", "priority": 2},
 ]
 
-MAX_EMAILS_PER_USER = _env_int("MAX_EMAILS_PER_USER", 3)        # simultaneously active addresses per user
-EMAIL_TTL_MINUTES = _env_int("EMAIL_TTL_MINUTES", 60)           # 0 = never expires
+MAX_EMAILS_PER_USER = _env_int("MAX_EMAILS_PER_USER", 100)        # simultaneously active addresses per user
+EMAIL_TTL_MINUTES = _env_int("EMAIL_TTL_MINUTES", 0)           # 0 = never expires
 MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 2500)         # max characters of an email body shown (<= 3000)
 HTTP_TIMEOUT = _env_int("HTTP_TIMEOUT", 15)                     # seconds, every provider request
 HEALTH_INTERVAL = _env_int("HEALTH_INTERVAL", 60)               # seconds between background provider checks
