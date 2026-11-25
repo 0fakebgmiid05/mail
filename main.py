@@ -1,6 +1,6 @@
 import asyncio
+import json
 import logging
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -20,23 +20,19 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# CONFIGURATION
+# DIRECT CONFIGURATION (NO ENV NEEDED)
 # ==============================================================================
-BOT_TOKEN = (
-    os.getenv("BOT_TOKEN")
-    or os.getenv("TELEGRAM_BOT_TOKEN")
-    or "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
-).strip()
+BOT_TOKEN = "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
+GEMINI_API_KEY = "AQ.Ab8RN6LKHe0Rp-B5loqNfPLVz32jwQgnFCorUoYe2kGX09U4PA"
 
-GEMINI_API_KEY = "AQ.Ab8RN6I9cos8rT2ACgxwY70oDOEiigJFEL7O1CBnpwQ0l9VQgA"
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DISCONNECT_THRESHOLD = timedelta(hours=5)
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-ALERT_COOLDOWN = timedelta(hours=int(os.getenv("ALERT_COOLDOWN_HOURS", "6")))
+CHECK_INTERVAL_SECONDS = 300
+ALERT_COOLDOWN = timedelta(hours=6)
 
 USER_SESSIONS: dict[int, dict[str, Any]] = {}
 ALERTED_DEVICES: dict[str, datetime] = {}
@@ -59,8 +55,7 @@ def esc(text: Any) -> str:
     )
 
 
-async def animate_message(msg, frames: list[str], delay: float = 0.45) -> None:
-    """Classic text animation via message edits."""
+async def animate_message(msg, frames: list[str], delay: float = 0.4) -> None:
     for frame in frames:
         try:
             await msg.edit_text(frame, parse_mode=ParseMode.HTML)
@@ -150,37 +145,62 @@ def parse_timestamp(raw: str) -> datetime | None:
     return None
 
 
-def parse_devices_page(
-    html: str, log_sample: bool = False
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    meta: dict[str, Any] = {
-        "server_error_500": False,
-        "html_length": len(html or ""),
-        "tr_total": 0,
-        "unparsed_ts_count": 0,
-        "source": "html",
+def build_device_record(
+    serial_no: str,
+    industry: str,
+    site: str,
+    device_type: str,
+    firmware: str,
+    status_text: str,
+    ts_raw: str,
+    now: datetime,
+) -> dict[str, Any]:
+    s_clean = (serial_no or "N/A").strip() or "N/A"
+    ind_clean = (industry or "N/A").strip() or "N/A"
+    site_clean = (site or "N/A").strip() or "N/A"
+    type_clean = (device_type or "LOGPRO PLUS").strip() or "LOGPRO PLUS"
+    fw_clean = (firmware or "N/A").strip() or "N/A"
+    st_clean = (status_text or "").strip()
+    ts_clean = (ts_raw or "").strip()
+
+    is_connected = (
+        "connected" in st_clean.lower()
+        and "disconnected" not in st_clean.lower()
+    )
+    last_seen = parse_timestamp(ts_clean)
+    offline_td = (now - last_seen) if last_seen else None
+    is_offline_5h = bool(
+        (offline_td and offline_td > DISCONNECT_THRESHOLD)
+        or (not is_connected and offline_td is None)
+    )
+
+    return {
+        "serial_no": s_clean,
+        "industry": ind_clean,
+        "site": site_clean,
+        "device_type": type_clean,
+        "firmware": fw_clean,
+        "status": st_clean or ("Connected" if is_connected else "Disconnected"),
+        "is_connected": is_connected,
+        "timestamp_raw": ts_clean or "N/A",
+        "last_seen": last_seen,
+        "offline_duration": offline_td,
+        "disconnected_5h": is_offline_5h,
     }
 
-    if (
-        not html
-        or "500 - internal server error" in html.lower()
-        or "internal server error" in html.lower()
-    ):
-        meta["server_error_500"] = True
-        return [], meta
 
-    soup = BeautifulSoup(html, "html.parser")
+def extract_devices_from_html_table(
+    soup: BeautifulSoup, now: datetime, log_sample: bool = False
+) -> tuple[list[dict[str, Any]], int, int]:
     all_trs = soup.select("tr")
-    meta["tr_total"] = len(all_trs)
-
     if log_sample:
-        logger.info("HTML length=%d | Total <tr>=%d", len(html), len(all_trs))
+        logger.info("Total <tr> in HTML: %d", len(all_trs))
         for idx, tr in enumerate(all_trs[:5]):
             snippet = " | ".join(tr.get_text(" ", strip=True).split())[:260]
             logger.info("Sample TR[%d]: %s", idx, snippet)
 
-    now = datetime.now(timezone.utc)
     devices: list[dict[str, Any]] = []
+    unparsed_ts = 0
 
     for tr in all_trs:
         tds = tr.find_all("td")
@@ -209,7 +229,6 @@ def parse_devices_page(
         site = cols[2] if len(cols) > 2 else "N/A"
         device_type = cols[4] if len(cols) > 4 else "LOGPRO PLUS"
         firmware = cols[5] if len(cols) > 5 else "N/A"
-
         status_text = next(
             (
                 c
@@ -218,48 +237,205 @@ def parse_devices_page(
             ),
             cols[6] if len(cols) > 6 else "Unknown",
         )
-        is_connected = (
-            "connected" in status_text.lower()
-            and "disconnected" not in status_text.lower()
-        )
-
         ts_raw = ts_match.group(0) if ts_match else cols[-1]
-        last_seen = parse_timestamp(ts_raw)
-        if not last_seen:
-            meta["unparsed_ts_count"] += 1
-
-        offline_td = (now - last_seen) if last_seen else None
-        is_offline_5h = bool(
-            (offline_td and offline_td > DISCONNECT_THRESHOLD)
-            or (not is_connected and offline_td is None)
-        )
+        if not parse_timestamp(ts_raw):
+            unparsed_ts += 1
 
         devices.append(
-            {
-                "serial_no": serial_no,
-                "industry": industry,
-                "site": site,
-                "device_type": device_type,
-                "firmware": firmware,
-                "status": status_text,
-                "is_connected": is_connected,
-                "timestamp_raw": ts_raw,
-                "last_seen": last_seen,
-                "offline_duration": offline_td,
-                "disconnected_5h": is_offline_5h,
-            }
+            build_device_record(
+                serial_no=serial_no,
+                industry=industry,
+                site=site,
+                device_type=device_type,
+                firmware=firmware,
+                status_text=status_text,
+                ts_raw=ts_raw,
+                now=now,
+            )
         )
 
-    return devices, meta
+    return devices, len(all_trs), unparsed_ts
 
 
-def discover_and_fetch_ajax_devices(
-    session: requests.Session, html: str
+def parse_json_payload_devices(payload: Any, now: datetime) -> list[dict[str, Any]]:
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                payload = json.loads(stripped)
+            except Exception:
+                return []
+        else:
+            return []
+
+    rows: list[Any] = []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        for key in (
+            "data",
+            "aaData",
+            "rows",
+            "items",
+            "devices",
+            "result",
+            "Data",
+            "Rows",
+            "Items",
+            "Devices",
+            "Result",
+        ):
+            val = payload.get(key)
+            if isinstance(val, list):
+                rows = val
+                break
+            if isinstance(val, str) and val.strip().startswith(("{", "[")):
+                try:
+                    decoded = json.loads(val)
+                    if isinstance(decoded, list):
+                        rows = decoded
+                        break
+                except Exception:
+                    pass
+        if not rows:
+            for val in payload.values():
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    rows = val
+                    break
+
+    parsed: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        blob = " ".join(str(v) for v in item.values() if v is not None)
+        if not any(
+            k in blob.lower()
+            for k in (
+                "connected",
+                "disconnected",
+                "logpro",
+                "serial",
+                "mac",
+                "firmware",
+                "site",
+            )
+        ):
+            continue
+
+        lower_map = {str(k).lower(): v for k, v in item.items()}
+
+        def pick(*keys: str, default: str = "N/A") -> str:
+            for k in keys:
+                if k.lower() in lower_map and lower_map[k.lower()] is not None:
+                    val = str(lower_map[k.lower()]).strip()
+                    if val != "":
+                        return val
+            return default
+
+        serial_no = pick(
+            "SerialNo",
+            "Serial_No",
+            "serialNo",
+            "Serial",
+            "serial",
+            "DeviceSerial",
+            "Id",
+            "id",
+        )
+        site = pick("SiteName", "Site", "site", "LocationName", "Location")
+        industry = pick("IndustryName", "Industry", "industry", "Sector")
+        device_type = pick(
+            "DeviceType",
+            "deviceType",
+            "Type",
+            "type",
+            default="LOGPRO PLUS",
+        )
+        firmware = pick("Firmware", "firmware", "FW", "fw", "FirmwareVersion")
+        status_text = pick(
+            "Status",
+            "status",
+            "ConnectionStatus",
+            "State",
+            default="",
+        )
+        ts_raw = pick(
+            "Timestamp",
+            "timestamp",
+            "LastSeen",
+            "lastSeen",
+            "LastCommunication",
+            "DateTime",
+            default="",
+        )
+
+        parsed.append(
+            build_device_record(
+                serial_no=serial_no,
+                industry=industry,
+                site=site,
+                device_type=device_type,
+                firmware=firmware,
+                status_text=status_text,
+                ts_raw=ts_raw,
+                now=now,
+            )
+        )
+
+    return parsed
+
+
+def extract_devices_via_js_ajax(
+    session: requests.Session, html: str, now: datetime
 ) -> list[dict[str, Any]]:
+    js_paths = [
+        "/Scripts/Pages/devices.js?v=1.4.5",
+        "/Scripts/Pages/devices.js",
+        "/Scripts/datagrid.js",
+    ]
+    js_paths.extend(
+        re.findall(
+            r"""["'](/Scripts/[^"']*\.js(?:\?[^"']*)?)["']""",
+            html,
+            re.IGNORECASE,
+        )
+    )
+
+    blobs: list[str] = [html]
+    for jpath in list(dict.fromkeys(js_paths))[:8]:
+        try:
+            jr = session.get(urljoin(BASE_URL, jpath), timeout=15)
+            if jr.ok and jr.text:
+                blobs.append(jr.text)
+                urls_in_js = re.findall(r"""["'](/[^"']{3,120})["']""", jr.text)
+                interesting = [
+                    u
+                    for u in sorted(set(urls_in_js))
+                    if any(
+                        k in u.lower()
+                        for k in (
+                            "device",
+                            "grid",
+                            "data",
+                            "list",
+                            "get",
+                            "load",
+                            "pae",
+                            "control",
+                            "api",
+                        )
+                    )
+                ]
+                if interesting:
+                    logger.info("URLs in %s: %s", jpath, interesting[:20])
+        except Exception:
+            continue
+
+    combined = "\n".join(blobs)
     candidates = set(
         re.findall(
-            r"""["'](/pae/[^"']*(?:Device|Grid|Data|List|Get|Load|Table)[^"']*)["']""",
-            html,
+            r"""["'](/pae/[^"']{2,100}|/api/[^"']{2,100}|/[A-Za-z0-9_/-]+(?:Device|Grid|Data|List|Get|Load|Table)[A-Za-z0-9_/-]*)["']""",
+            combined,
             re.IGNORECASE,
         )
     )
@@ -269,170 +445,230 @@ def discover_and_fetch_ajax_devices(
             "/pae/ControlPanel/DevicesList",
             "/pae/ControlPanel/LoadDevices",
             "/pae/ControlPanel/GetAllDevices",
+            "/pae/ControlPanel/DevicesData",
         }
     )
 
-    now = datetime.now(timezone.utc)
-    found: list[dict[str, Any]] = []
-
-    for path in list(candidates)[:12]:
+    for path in list(candidates)[:30]:
         url = urljoin(BASE_URL, path)
-        for method in ("GET", "POST"):
+        for method in ("POST", "GET"):
             try:
                 if method == "GET":
                     r = session.get(url, timeout=15)
                 else:
                     r = session.post(
                         url,
-                        data={"draw": "1", "start": "0", "length": "500"},
+                        json={
+                            "draw": 1,
+                            "start": 0,
+                            "length": 1000,
+                            "page": 1,
+                            "pageSize": 1000,
+                        },
                         timeout=15,
                     )
-
-                if (
-                    not r.ok
-                    or "application/json" not in r.headers.get("Content-Type", "").lower()
-                ):
-                    continue
-
-                payload = r.json()
-                rows = (
-                    payload.get("data")
-                    or payload.get("aaData")
-                    or payload.get("rows")
-                    or payload.get("items")
-                    or (payload if isinstance(payload, list) else [])
-                )
-                if not isinstance(rows, list) or not rows:
-                    continue
-
-                for item in rows:
-                    if not isinstance(item, dict):
-                        continue
-                    blob = " ".join(str(v) for v in item.values() if v is not None)
-                    if not (
-                        "connected" in blob.lower()
-                        or "disconnected" in blob.lower()
-                        or "logpro" in blob.lower()
+                    if not r.ok or (
+                        "json" not in r.headers.get("Content-Type", "").lower()
+                        and not r.text.strip().startswith(("{", "["))
                     ):
-                        continue
+                        r = session.post(
+                            url,
+                            data={
+                                "draw": "1",
+                                "start": "0",
+                                "length": "1000",
+                                "page": "1",
+                                "pageSize": "1000",
+                            },
+                            timeout=15,
+                        )
 
-                    serial_no = str(
-                        item.get("SerialNo")
-                        or item.get("Serial_No")
-                        or item.get("serialNo")
-                        or item.get("Id")
-                        or "N/A"
-                    )
-                    site = str(
-                        item.get("SiteName")
-                        or item.get("Site")
-                        or item.get("site")
-                        or "N/A"
-                    )
-                    industry = str(
-                        item.get("IndustryName")
-                        or item.get("Industry")
-                        or item.get("industry")
-                        or "N/A"
-                    )
-                    device_type = str(
-                        item.get("DeviceType")
-                        or item.get("deviceType")
-                        or "LOGPRO PLUS"
-                    )
-                    firmware = str(
-                        item.get("Firmware") or item.get("firmware") or "N/A"
-                    )
-                    status_text = str(
-                        item.get("Status") or item.get("status") or ""
-                    )
-                    ts_raw = str(
-                        item.get("Timestamp")
-                        or item.get("LastSeen")
-                        or item.get("timestamp")
-                        or ""
-                    )
+                if not r.ok:
+                    continue
 
-                    is_connected = (
-                        "connected" in status_text.lower()
-                        and "disconnected" not in status_text.lower()
-                    )
-                    last_seen = parse_timestamp(ts_raw)
-                    offline_td = (now - last_seen) if last_seen else None
-                    is_offline_5h = bool(
-                        (offline_td and offline_td > DISCONNECT_THRESHOLD)
-                        or (not is_connected and offline_td is None)
-                    )
+                ctype = r.headers.get("Content-Type", "").lower()
+                txt = r.text.strip()
+                if "json" not in ctype and not txt.startswith(("{", "[")):
+                    continue
 
-                    found.append(
-                        {
-                            "serial_no": serial_no,
-                            "industry": industry,
-                            "site": site,
-                            "device_type": device_type,
-                            "firmware": firmware,
-                            "status": status_text
-                            or ("Connected" if is_connected else "Disconnected"),
-                            "is_connected": is_connected,
-                            "timestamp_raw": ts_raw,
-                            "last_seen": last_seen,
-                            "offline_duration": offline_td,
-                            "disconnected_5h": is_offline_5h,
-                        }
-                    )
-
-                if found:
+                devices = parse_json_payload_devices(txt, now)
+                if devices:
                     logger.info(
-                        "AJAX endpoint matched: %s (%s) -> %d devices",
+                        "AJAX matched %s (%s) -> %d devices",
                         method,
                         path,
-                        len(found),
+                        len(devices),
                     )
-                    return found
+                    return devices
             except Exception:
                 continue
 
     return []
 
 
+def extract_devices_via_embedded_or_dom(
+    soup: BeautifulSoup, raw_html: str, now: datetime
+) -> list[dict[str, Any]]:
+    # 1) Embedded JSON / script assignments check
+    for script in soup.find_all("script"):
+        stext = script.string or script.get_text() or ""
+        for match in re.finditer(r"(\[[\s\S]{20,80000}?\]|\{[\s\S]{20,80000}?\})", stext):
+            chunk = match.group(1)
+            if "serial" in chunk.lower() and (
+                "connected" in chunk.lower() or "site" in chunk.lower()
+            ):
+                devs = parse_json_payload_devices(chunk, now)
+                if devs:
+                    return devs
+
+    # 2) Non-table row containers (e.g., div / row / card / dx-view)
+    devices: list[dict[str, Any]] = []
+    selectors = [
+        "div.row",
+        "div[class*='row']",
+        "div[class*='grid-row']",
+        "li[class*='device']",
+        "div[class*='device-item']",
+    ]
+    seen_texts: set[str] = set()
+
+    for sel in selectors:
+        for node in soup.select(sel):
+            text = " ".join(node.get_text(" | ", strip=True).split())
+            if len(text) < 15 or text in seen_texts:
+                continue
+            has_status = ("connected" in text.lower()) or (
+                "disconnected" in text.lower()
+            )
+            ts_match = re.search(
+                r"\b\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}(?:\s*(?:AM|PM))?\b",
+                text,
+                re.IGNORECASE,
+            )
+            if not has_status and not ts_match:
+                continue
+
+            seen_texts.add(text)
+            parts = [p.strip() for p in text.split("|") if p.strip()]
+            if len(parts) < 3:
+                continue
+
+            serial_no = parts[0]
+            site = parts[2] if len(parts) > 2 else parts[1]
+            industry = parts[1] if len(parts) > 1 else "N/A"
+            firmware = next(
+                (p for p in parts if re.fullmatch(r"v?\d+(?:\.\d+)+", p, re.I)),
+                "N/A",
+            )
+            status_text = next(
+                (
+                    p
+                    for p in parts
+                    if "disconnected" in p.lower() or "connected" in p.lower()
+                ),
+                "Unknown",
+            )
+            ts_raw = ts_match.group(0) if ts_match else parts[-1]
+
+            devices.append(
+                build_device_record(
+                    serial_no=serial_no,
+                    industry=industry,
+                    site=site,
+                    device_type="LOGPRO PLUS",
+                    firmware=firmware,
+                    status_text=status_text,
+                    ts_raw=ts_raw,
+                    now=now,
+                )
+            )
+        if devices:
+            return devices
+
+    return []
+
+
+def fetch_devices_multi_strategy(
+    session: requests.Session, log_sample: bool = False
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    resp = session.get(DEVICES_URL, timeout=25)
+    resp.raise_for_status()
+    raw_html = resp.text or ""
+
+    meta: dict[str, Any] = {
+        "server_error_500": False,
+        "html_length": len(raw_html),
+        "tr_total": 0,
+        "unparsed_ts_count": 0,
+        "source": "none",
+    }
+
+    if (
+        not raw_html
+        or "500 - internal server error" in raw_html.lower()
+        or "internal server error" in raw_html.lower()
+    ):
+        meta["server_error_500"] = True
+        return [], meta
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    now = datetime.now(timezone.utc)
+
+    # IF / ELSE STRATEGY 1: Direct HTML <tr> table parsing
+    html_devices, tr_total, unparsed_ts = extract_devices_from_html_table(
+        soup, now, log_sample=log_sample
+    )
+    meta["tr_total"] = tr_total
+    meta["unparsed_ts_count"] = unparsed_ts
+
+    if html_devices:
+        meta["source"] = "html-table"
+        return html_devices, meta
+
+    # ELSE STRATEGY 2: JS/AJAX endpoint discovery & JSON parsing
+    ajax_devices = extract_devices_via_js_ajax(session, raw_html, now)
+    if ajax_devices:
+        meta["source"] = "js-ajax-json"
+        return ajax_devices, meta
+
+    # ELSE STRATEGY 3: Embedded script JSON or non-table DOM rows
+    dom_devices = extract_devices_via_embedded_or_dom(soup, raw_html, now)
+    if dom_devices:
+        meta["source"] = "embedded-or-dom"
+        return dom_devices, meta
+
+    # ELSE: Log helpful diagnostic info when all strategies return 0
+    meta["source"] = "0-found"
+    scripts_text = "\n".join(
+        s.get_text(" ", strip=True) for s in soup.find_all("script")
+    )
+    urls_found = set(re.findall(r"""["'](/[^"']{3,100})["']""", raw_html))
+    interesting_urls = [
+        u
+        for u in sorted(urls_found)
+        if any(
+            k in u.lower()
+            for k in (
+                "device",
+                "grid",
+                "data",
+                "list",
+                "get",
+                "load",
+                "pae",
+                "control",
+            )
+        )
+    ]
+    logger.info("Candidate URLs in HTML: %s", interesting_urls[:20])
+    logger.info("Script snippet: %s", " ".join(scripts_text.split())[:600])
+    return [], meta
+
+
 def run_self_analysis(
     session: requests.Session, log_sample: bool = False
 ) -> dict[str, Any]:
-    resp = session.get(DEVICES_URL, timeout=25)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    devices, meta = parse_devices_page(resp.text, log_sample=log_sample)
-
-    if len(devices) == 0 and not meta["server_error_500"]:
-        ajax_devices = discover_and_fetch_ajax_devices(session, resp.text)
-        if ajax_devices:
-            devices = ajax_devices
-            meta["source"] = "ajax/json"
-
-    if len(devices) == 0 and not meta["server_error_500"]:
-        scripts_text = "\n".join(
-            s.get_text(" ", strip=True) for s in soup.find_all("script")
-        )
-        urls_found = set(re.findall(r"""["'](/[^"']{3,100})["']""", resp.text))
-        interesting_urls = [
-            u
-            for u in sorted(urls_found)
-            if any(
-                k in u.lower()
-                for k in (
-                    "device",
-                    "grid",
-                    "data",
-                    "list",
-                    "get",
-                    "load",
-                    "pae",
-                    "control",
-                )
-            )
-        ]
-        logger.info("Candidate URLs in HTML: %s", interesting_urls[:20])
-        logger.info("Script snippet: %s", " ".join(scripts_text.split())[:600])
+    devices, meta = fetch_devices_multi_strategy(session, log_sample=log_sample)
 
     total = len(devices)
     online_list = [d for d in devices if d["is_connected"]]
@@ -476,14 +712,6 @@ def run_self_analysis(
 
 
 def generate_ai_analysis(analysis: dict[str, Any]) -> str:
-    if not GEMINI_API_KEY:
-        return (
-            "<i>Gemini API key set nahi hai.</i>\n"
-            "Rule-based self-analysis ke mutabik "
-            f"<b>{analysis['disconnected_5h_count']}</b> devices 5+ hours se offline hain."
-        )
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
     compact_offline = [
         {
             "serial": d["serial_no"],
@@ -515,11 +743,78 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
         f"Top Offline Devices (>5h): {compact_offline}"
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    fallback_text = (
+        f"Overall Status: Total {analysis['total']} devices | "
+        f"Online {analysis['connected']} | Offline (>5h) {analysis['disconnected_5h_count']}.\n"
+        f"Data Source: {analysis['meta'].get('source')}.\n"
+        "Action: Agar total 0 aa raha hai to /debug_rows chalakar devices.js ka exact AJAX URL check karein."
     )
-    return response.text or "AI analysis se koi response nahi aaya."
+
+    if not GEMINI_API_KEY:
+        return fallback_text
+
+    # IF / ELSE AI CHAIN: 1) google-genai SDK -> 2) REST X-goog-api-key -> 3) REST ?key= -> 4) Fallback
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        if response and response.text:
+            return response.text
+    except Exception as sdk_exc:
+        logger.warning("Gemini SDK call failed, trying REST fallback: %s", sdk_exc)
+
+    rest_models = ("gemini-flash-latest", "gemini-2.5-flash")
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    for m_name in rest_models:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-goog-api-key": GEMINI_API_KEY,
+                },
+                json=body,
+                timeout=25,
+            )
+            if r.ok:
+                data = r.json()
+                parts = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [])
+                )
+                txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                if txt:
+                    return txt
+        except Exception:
+            continue
+
+    for m_name in rest_models:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent",
+                params={"key": GEMINI_API_KEY},
+                headers={"Content-Type": "application/json"},
+                json=body,
+                timeout=25,
+            )
+            if r.ok:
+                data = r.json()
+                parts = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [])
+                )
+                txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                if txt:
+                    return txt
+        except Exception:
+            continue
+
+    return fallback_text
 
 
 def require_auth(chat_id: int) -> dict[str, Any] | None:
@@ -550,7 +845,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     existing = require_auth(chat_id)
 
-    # Agar pehle se login hai, to dobara ID/Password nahi maangega
     if existing:
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -865,7 +1159,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "<b>SYSTEM &amp; PARSER DIAGNOSTICS</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▸ <b>Server HTTP 500:</b> <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
-            f"▸ <b>Data Source:</b> <code>{esc(meta.get('source', 'html'))}</code>\n"
+            f"▸ <b>Data Source:</b> <code>{esc(meta.get('source', 'none'))}</code>\n"
             f"▸ <b>HTML Size:</b> <code>{meta['html_length']}</code> bytes\n"
             f"▸ <b>Raw &lt;tr&gt; Rows:</b> <code>{meta['tr_total']}</code>\n"
             f"▸ <b>Parsed Devices:</b> <code>{analysis['total']}</code>\n"
@@ -897,7 +1191,8 @@ async def debug_rows_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         meta = analysis["meta"]
         await update.message.reply_text(
             "Debug rows Railway logs mein print kar diye gaye hain.\n"
-            f"TR count: <code>{meta['tr_total']}</code> | Parsed: <code>{analysis['total']}</code>",
+            f"Source: <code>{esc(meta.get('source'))}</code> | "
+            f"TR: <code>{meta['tr_total']}</code> | Parsed: <code>{analysis['total']}</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
@@ -1077,7 +1372,7 @@ async def post_init(app) -> None:
 
 
 def main() -> None:
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+    if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing hai.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
