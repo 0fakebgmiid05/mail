@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin
@@ -28,6 +29,7 @@ GEMINI_API_KEY = "AQ.Ab8RN6LKHe0Rp-B5loqNfPLVz32jwQgnFCorUoYe2kGX09U4PA"
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
+WS_DEVICES_URL = f"{BASE_URL}/Services/EF/WS/Devices"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DISCONNECT_THRESHOLD = timedelta(hours=5)
@@ -83,7 +85,7 @@ def login_envirofront(username: str, password: str) -> requests.Session | None:
         {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36"
             ),
             "Referer": LOGIN_URL,
             "Origin": BASE_URL,
@@ -134,6 +136,8 @@ def parse_timestamp(raw: str) -> datetime | None:
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %I:%M:%S %p",
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
         "%d/%m/%Y %H:%M:%S",
         "%m/%d/%Y %I:%M:%S %p",
     )
@@ -188,6 +192,211 @@ def build_device_record(
         "offline_duration": offline_td,
         "disconnected_5h": is_offline_5h,
     }
+
+
+def extract_rows_from_any_json(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, str):
+        s = payload.strip()
+        if s.startswith(("{", "[")):
+            try:
+                payload = json.loads(s)
+            except Exception:
+                return []
+        else:
+            return []
+
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+
+    if isinstance(payload, dict):
+        for key in (
+            "Devices",
+            "devices",
+            "Data",
+            "data",
+            "Rows",
+            "rows",
+            "Items",
+            "items",
+            "Result",
+            "result",
+            "aaData",
+            "Records",
+            "records",
+        ):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                inner = extract_rows_from_any_json(val)
+                if inner:
+                    return inner
+            if isinstance(val, str) and val.strip().startswith(("{", "[")):
+                inner = extract_rows_from_any_json(val)
+                if inner:
+                    return inner
+
+        for val in payload.values():
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                inner = extract_rows_from_any_json(val)
+                if inner:
+                    return inner
+
+    return []
+
+
+def flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}".lower() if prefix else str(k).lower()
+        if isinstance(v, dict):
+            out.update(flatten_dict(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
+    flat = flatten_dict(item)
+
+    def pick(*candidates: str, default: str = "N/A") -> str:
+        for c in candidates:
+            cl = c.lower()
+            if cl in flat and flat[cl] is not None:
+                val = str(flat[cl]).strip()
+                if val != "":
+                    return val
+        # Partial key match fallback
+        for c in candidates:
+            cl = c.lower()
+            for fk, fv in flat.items():
+                if fv is not None and (fk.endswith(f".{cl}") or cl in fk):
+                    val = str(fv).strip()
+                    if val != "":
+                        return val
+        return default
+
+    serial_no = pick(
+        "serialno",
+        "serial_no",
+        "serial",
+        "deviceserial",
+        "device_serial",
+        "mac",
+        "id",
+    )
+    site = pick(
+        "sitename",
+        "site.name",
+        "site",
+        "locationname",
+        "location",
+    )
+    industry = pick(
+        "industryname",
+        "industry.name",
+        "industry",
+        "sector",
+    )
+    device_type = pick(
+        "devicetype",
+        "device_type",
+        "type.name",
+        "type",
+        default="LOGPRO PLUS",
+    )
+    firmware = pick(
+        "firmware",
+        "firmwareversion",
+        "fw",
+        "fwversion",
+        "version",
+    )
+    status_text = pick(
+        "status",
+        "connectionstatus",
+        "isconnected",
+        "online",
+        "state",
+        default="",
+    )
+    ts_raw = pick(
+        "timestamp",
+        "lastseen",
+        "lastcommunication",
+        "lastpackettime",
+        "lastlogtime",
+        "datetime",
+        "updatedon",
+        default="",
+    )
+
+    return build_device_record(
+        serial_no=serial_no,
+        industry=industry,
+        site=site,
+        device_type=device_type,
+        firmware=firmware,
+        status_text=status_text,
+        ts_raw=ts_raw,
+        now=now,
+    )
+
+
+def extract_devices_from_ws(
+    session: requests.Session, now: datetime, log_sample: bool = False
+) -> list[dict[str, Any]]:
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "text/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": DEVICES_URL,
+    }
+
+    all_parsed: list[dict[str, Any]] = []
+    seen_serials: set[str] = set()
+    page_size = 100
+
+    for page in range(1, 25):
+        params = {
+            "uac": "pae",
+            "rp": str(page_size),
+            "page": str(page),
+            "devices": "",
+            "deviceType": "",
+            "ind": "",
+            "status": "all",
+            "_": str(int(time.time() * 1000)),
+        }
+        try:
+            r = session.get(WS_DEVICES_URL, params=params, headers=headers, timeout=20)
+            r.raise_for_status()
+            raw_rows = extract_rows_from_any_json(r.text)
+            if not raw_rows:
+                break
+
+            if log_sample and page == 1:
+                logger.info("WS first item keys/sample: %s", str(raw_rows[0])[:500])
+
+            page_added = 0
+            for item in raw_rows:
+                dev = parse_ws_device_item(item, now)
+                dedup_key = f"{dev['serial_no']}|{dev['site']}|{dev['timestamp_raw']}"
+                if dedup_key not in seen_serials:
+                    seen_serials.add(dedup_key)
+                    all_parsed.append(dev)
+                    page_added += 1
+
+            # Agar rows page_size se kam aayi hain to aage aur pages nahi hain
+            if len(raw_rows) < page_size or page_added == 0:
+                break
+        except Exception as exc:
+            logger.warning("WS fetch failed on page %d: %s", page, exc)
+            break
+
+    return all_parsed
 
 
 def extract_devices_from_html_table(
@@ -258,352 +467,6 @@ def extract_devices_from_html_table(
     return devices, len(all_trs), unparsed_ts
 
 
-def parse_json_payload_devices(payload: Any, now: datetime) -> list[dict[str, Any]]:
-    if isinstance(payload, str):
-        stripped = payload.strip()
-        if stripped.startswith(("{", "[")):
-            try:
-                payload = json.loads(stripped)
-            except Exception:
-                return []
-        else:
-            return []
-
-    rows: list[Any] = []
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict):
-        for key in (
-            "data",
-            "aaData",
-            "rows",
-            "items",
-            "devices",
-            "result",
-            "Data",
-            "Rows",
-            "Items",
-            "Devices",
-            "Result",
-        ):
-            val = payload.get(key)
-            if isinstance(val, list):
-                rows = val
-                break
-            if isinstance(val, str) and val.strip().startswith(("{", "[")):
-                try:
-                    decoded = json.loads(val)
-                    if isinstance(decoded, list):
-                        rows = decoded
-                        break
-                except Exception:
-                    pass
-        if not rows:
-            for val in payload.values():
-                if isinstance(val, list) and val and isinstance(val[0], dict):
-                    rows = val
-                    break
-
-    parsed: list[dict[str, Any]] = []
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        blob = " ".join(str(v) for v in item.values() if v is not None)
-        if not any(
-            k in blob.lower()
-            for k in (
-                "connected",
-                "disconnected",
-                "logpro",
-                "serial",
-                "mac",
-                "firmware",
-                "site",
-            )
-        ):
-            continue
-
-        lower_map = {str(k).lower(): v for k, v in item.items()}
-
-        def pick(*keys: str, default: str = "N/A") -> str:
-            for k in keys:
-                if k.lower() in lower_map and lower_map[k.lower()] is not None:
-                    val = str(lower_map[k.lower()]).strip()
-                    if val != "":
-                        return val
-            return default
-
-        serial_no = pick(
-            "SerialNo",
-            "Serial_No",
-            "serialNo",
-            "Serial",
-            "serial",
-            "DeviceSerial",
-            "Id",
-            "id",
-        )
-        site = pick("SiteName", "Site", "site", "LocationName", "Location")
-        industry = pick("IndustryName", "Industry", "industry", "Sector")
-        device_type = pick(
-            "DeviceType",
-            "deviceType",
-            "Type",
-            "type",
-            default="LOGPRO PLUS",
-        )
-        firmware = pick("Firmware", "firmware", "FW", "fw", "FirmwareVersion")
-        status_text = pick(
-            "Status",
-            "status",
-            "ConnectionStatus",
-            "State",
-            default="",
-        )
-        ts_raw = pick(
-            "Timestamp",
-            "timestamp",
-            "LastSeen",
-            "lastSeen",
-            "LastCommunication",
-            "DateTime",
-            default="",
-        )
-
-        parsed.append(
-            build_device_record(
-                serial_no=serial_no,
-                industry=industry,
-                site=site,
-                device_type=device_type,
-                firmware=firmware,
-                status_text=status_text,
-                ts_raw=ts_raw,
-                now=now,
-            )
-        )
-
-    return parsed
-
-
-def extract_devices_via_js_ajax(
-    session: requests.Session, html: str, now: datetime
-) -> list[dict[str, Any]]:
-    js_paths = [
-        "/Scripts/Pages/devices.js?v=1.4.5",
-        "/Scripts/Pages/devices.js",
-        "/Scripts/datagrid.js",
-        "/Scripts/Pages/utils.js",
-    ]
-    js_paths.extend(
-        re.findall(
-            r"""["'](/Scripts/[^"']*\.js(?:\?[^"']*)?)["']""",
-            html,
-            re.IGNORECASE,
-        )
-    )
-
-    blobs: list[str] = [html]
-    for jpath in list(dict.fromkeys(js_paths))[:8]:
-        try:
-            jr = session.get(urljoin(BASE_URL, jpath), timeout=15)
-            if jr.ok and jr.text:
-                blobs.append(jr.text)
-                urls_in_js = re.findall(r"""["'](/[^"']{3,120})["']""", jr.text)
-                interesting = [
-                    u
-                    for u in sorted(set(urls_in_js))
-                    if any(
-                        k in u.lower()
-                        for k in (
-                            "device",
-                            "grid",
-                            "data",
-                            "list",
-                            "get",
-                            "load",
-                            "pae",
-                            "control",
-                            "api",
-                            "site",
-                            "status",
-                        )
-                    )
-                ]
-                if interesting:
-                    logger.info("URLs in %s: %s", jpath, interesting[:20])
-        except Exception:
-            continue
-
-    combined = "\n".join(blobs)
-    candidates = set(
-        re.findall(
-            r"""["'](/pae/[^"']{2,100}|/api/[^"']{2,100}|/Services/[^"']{2,100}|/[A-Za-z0-9_/-]+(?:Device|Grid|Data|List|Get|Load|Table|Status)[A-Za-z0-9_/-]*)["']""",
-            combined,
-            re.IGNORECASE,
-        )
-    )
-    candidates.update(
-        {
-            "/pae/ControlPanel/GetDevices",
-            "/pae/ControlPanel/DevicesList",
-            "/pae/ControlPanel/LoadDevices",
-            "/pae/ControlPanel/GetAllDevices",
-            "/pae/ControlPanel/DevicesData",
-            "/pae/SiteStatus",
-            "/pae/LiveMap",
-        }
-    )
-
-    for path in list(candidates)[:35]:
-        url = urljoin(BASE_URL, path)
-        for method in ("POST", "GET"):
-            try:
-                if method == "GET":
-                    r = session.get(url, timeout=15)
-                else:
-                    r = session.post(
-                        url,
-                        json={
-                            "draw": 1,
-                            "start": 0,
-                            "length": 1000,
-                            "page": 1,
-                            "pageSize": 1000,
-                        },
-                        timeout=15,
-                    )
-                    if not r.ok or (
-                        "json" not in r.headers.get("Content-Type", "").lower()
-                        and not r.text.strip().startswith(("{", "["))
-                    ):
-                        r = session.post(
-                            url,
-                            data={
-                                "draw": "1",
-                                "start": "0",
-                                "length": "1000",
-                                "page": "1",
-                                "pageSize": "1000",
-                            },
-                            timeout=15,
-                        )
-
-                if not r.ok:
-                    continue
-
-                ctype = r.headers.get("Content-Type", "").lower()
-                txt = r.text.strip()
-                if "json" in ctype or txt.startswith(("{", "[")):
-                    devices = parse_json_payload_devices(txt, now)
-                    if devices:
-                        logger.info(
-                            "AJAX JSON matched %s (%s) -> %d devices",
-                            method,
-                            path,
-                            len(devices),
-                        )
-                        return devices
-                elif "html" in ctype and path != "/pae/ControlPanel/Devices":
-                    sub_soup = BeautifulSoup(txt, "html.parser")
-                    sub_devs, _, _ = extract_devices_from_html_table(sub_soup, now)
-                    if len(sub_devs) > 1:
-                        logger.info(
-                            "Subpage table matched %s (%s) -> %d devices",
-                            method,
-                            path,
-                            len(sub_devs),
-                        )
-                        return sub_devs
-            except Exception:
-                continue
-
-    return []
-
-
-def extract_devices_via_embedded_or_dom(
-    soup: BeautifulSoup, raw_html: str, now: datetime
-) -> list[dict[str, Any]]:
-    # 1) Embedded JSON / script objects
-    for script in soup.find_all("script"):
-        stext = script.string or script.get_text() or ""
-        for match in re.finditer(r"(\[[\s\S]{20,80000}?\]|\{[\s\S]{20,80000}?\})", stext):
-            chunk = match.group(1)
-            if "serial" in chunk.lower() and (
-                "connected" in chunk.lower() or "site" in chunk.lower()
-            ):
-                devs = parse_json_payload_devices(chunk, now)
-                if devs:
-                    return devs
-
-    # 2) Non-table rows (div / li / cards / grids)
-    devices: list[dict[str, Any]] = []
-    selectors = [
-        "div.row",
-        "div[class*='row']",
-        "div[class*='grid-row']",
-        "li[class*='device']",
-        "div[class*='device-item']",
-        "div[class*='card']",
-    ]
-    seen_texts: set[str] = set()
-
-    for sel in selectors:
-        for node in soup.select(sel):
-            text = " ".join(node.get_text(" | ", strip=True).split())
-            if len(text) < 15 or text in seen_texts:
-                continue
-            has_status = ("connected" in text.lower()) or (
-                "disconnected" in text.lower()
-            )
-            ts_match = re.search(
-                r"\b\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}(?:\s*(?:AM|PM))?\b",
-                text,
-                re.IGNORECASE,
-            )
-            if not has_status and not ts_match:
-                continue
-
-            seen_texts.add(text)
-            parts = [p.strip() for p in text.split("|") if p.strip()]
-            if len(parts) < 3:
-                continue
-
-            serial_no = parts[0]
-            site = parts[2] if len(parts) > 2 else parts[1]
-            industry = parts[1] if len(parts) > 1 else "N/A"
-            firmware = next(
-                (p for p in parts if re.fullmatch(r"v?\d+(?:\.\d+)+", p, re.I)),
-                "N/A",
-            )
-            status_text = next(
-                (
-                    p
-                    for p in parts
-                    if "disconnected" in p.lower() or "connected" in p.lower()
-                ),
-                "Unknown",
-            )
-            ts_raw = ts_match.group(0) if ts_match else parts[-1]
-
-            devices.append(
-                build_device_record(
-                    serial_no=serial_no,
-                    industry=industry,
-                    site=site,
-                    device_type="LOGPRO PLUS",
-                    firmware=firmware,
-                    status_text=status_text,
-                    ts_raw=ts_raw,
-                    now=now,
-                )
-            )
-        if devices:
-            return devices
-
-    return []
-
-
 def fetch_devices_multi_strategy(
     session: requests.Session, log_sample: bool = False
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -630,55 +493,26 @@ def fetch_devices_multi_strategy(
     soup = BeautifulSoup(raw_html, "html.parser")
     now = datetime.now(timezone.utc)
 
-    # IF / ELSE CHAIN FOR ALL DEVICE FETCHING METHODS
-    html_devices, tr_total, unparsed_ts = extract_devices_from_html_table(
+    _, tr_total, unparsed_ts = extract_devices_from_html_table(
         soup, now, log_sample=log_sample
     )
     meta["tr_total"] = tr_total
     meta["unparsed_ts_count"] = unparsed_ts
 
+    # Strategy 1: Direct WS Devices JSON endpoint (/Services/EF/WS/Devices)
+    ws_devices = extract_devices_from_ws(session, now, log_sample=log_sample)
+    if ws_devices:
+        meta["source"] = "ws-devices-json"
+        return ws_devices, meta
+
+    # Strategy 2: HTML Table fallback
+    html_devices, _, _ = extract_devices_from_html_table(soup, now, log_sample=False)
     if len(html_devices) > 1:
         meta["source"] = "html-table"
         return html_devices, meta
-    else:
-        ajax_devices = extract_devices_via_js_ajax(session, raw_html, now)
-        if ajax_devices:
-            meta["source"] = "js-ajax-json"
-            return ajax_devices, meta
-        else:
-            dom_devices = extract_devices_via_embedded_or_dom(soup, raw_html, now)
-            if dom_devices:
-                meta["source"] = "embedded-or-dom"
-                return dom_devices, meta
-            else:
-                if html_devices:
-                    meta["source"] = "html-table-single"
-                    return html_devices, meta
-                meta["source"] = "0-found"
-                scripts_text = "\n".join(
-                    s.get_text(" ", strip=True) for s in soup.find_all("script")
-                )
-                urls_found = set(re.findall(r"""["'](/[^"']{3,100})["']""", raw_html))
-                interesting_urls = [
-                    u
-                    for u in sorted(urls_found)
-                    if any(
-                        k in u.lower()
-                        for k in (
-                            "device",
-                            "grid",
-                            "data",
-                            "list",
-                            "get",
-                            "load",
-                            "pae",
-                            "control",
-                        )
-                    )
-                ]
-                logger.info("Candidate URLs in HTML: %s", interesting_urls[:20])
-                logger.info("Script snippet: %s", " ".join(scripts_text.split())[:600])
-                return [], meta
+
+    meta["source"] = "0-found"
+    return [], meta
 
 
 def run_self_analysis(
@@ -727,26 +561,36 @@ def run_self_analysis(
     }
 
 
+def build_rich_local_summary(analysis: dict[str, Any]) -> str:
+    off_lines = [
+        f"- {d['serial_no']} | {d['site']} | FW {d['firmware']} | Last: {d['timestamp_raw']}"
+        for d in analysis["disconnected_5h_list"][:10]
+    ]
+    fw_summary = ", ".join(
+        f"{k}: {v}" for k, v in analysis["firmware_breakdown"].items()
+    ) or "N/A"
+    return (
+        f"Total Devices: {analysis['total']} | Online: {analysis['connected']} | Offline (>5h): {analysis['disconnected_5h_count']}\n"
+        f"Firmware: {fw_summary}\n"
+        + ("Offline (>5h) Devices:\n" + "\n".join(off_lines) if off_lines else "Koi device >5h offline nahi hai.")
+    )
+
+
 def call_gemini_with_fallback(prompt: str, fallback_text: str) -> str:
     if not GEMINI_API_KEY:
         return fallback_text
 
     models_to_try = ("gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash")
 
-    # 1) SDK attempt
     for m_name in models_to_try:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
-            response = client.models.generate_content(
-                model=m_name,
-                contents=prompt,
-            )
+            response = client.models.generate_content(model=m_name, contents=prompt)
             if response and response.text:
                 return response.text.strip()
         except Exception:
             continue
 
-    # 2) REST X-goog-api-key attempt
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     for m_name in models_to_try:
         try:
@@ -756,29 +600,6 @@ def call_gemini_with_fallback(prompt: str, fallback_text: str) -> str:
                     "Content-Type": "application/json",
                     "X-goog-api-key": GEMINI_API_KEY,
                 },
-                json=body,
-                timeout=25,
-            )
-            if r.ok:
-                data = r.json()
-                parts = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [])
-                )
-                txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                if txt:
-                    return txt
-        except Exception:
-            continue
-
-    # 3) REST ?key= attempt
-    for m_name in models_to_try:
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent",
-                params={"key": GEMINI_API_KEY},
-                headers={"Content-Type": "application/json"},
                 json=body,
                 timeout=25,
             )
@@ -814,7 +635,7 @@ def build_project_context(analysis: dict[str, Any]) -> str:
             else None,
             "last_seen": d["timestamp_raw"],
         }
-        for d in analysis["all_devices"][:40]
+        for d in analysis["all_devices"][:50]
     ]
     return (
         f"Checked At: {analysis['checked_at_ist']}\n"
@@ -824,7 +645,7 @@ def build_project_context(analysis: dict[str, Any]) -> str:
         f"Top Offline Sites: {analysis['top_offline_sites']}\n"
         f"Firmware Breakdown: {analysis['firmware_breakdown']}\n"
         f"Parser/Server Meta: {analysis['meta']}\n"
-        f"Devices Sample (up to 40): {compact_devices}"
+        f"Devices (up to 50): {compact_devices}"
     )
 
 
@@ -836,35 +657,23 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
         "Hinglish mein crisp, executive aur actionable analysis do:\n"
         "1. Overall Health & Risk Level\n"
         "2. Sabse Critical Sites / Devices (>5h offline)\n"
-        "3. Firmware / Server / Parser / Connectivity Patterns\n"
-        "4. Immediate Action Checklist (short bullets)\n"
-        "Plain text / simple lines rakho.\n\n"
+        "3. Firmware / Connectivity Patterns\n"
+        "4. Immediate Action Checklist\n\n"
         f"{context_str}"
     )
-    fallback = (
-        f"Project Snapshot: Total={analysis['total']} | Online={analysis['connected']} | "
-        f"Offline(>5h)={analysis['disconnected_5h_count']} | Source={analysis['meta'].get('source')}."
-    )
-    return call_gemini_with_fallback(prompt, fallback)
+    return call_gemini_with_fallback(prompt, build_rich_local_summary(analysis))
 
 
 def answer_project_question(user_question: str, analysis: dict[str, Any]) -> str:
     context_str = build_project_context(analysis)
     prompt = (
         "Tum EnviroFRONT (M2MLogger) telemetry monitoring bot aur dashboard ke dedicated AI assistant ho. "
-        "User ka sawaal sirf is project ke live data, devices, sites, firmware, offline alerts aur "
-        "parser/API diagnostics ke context mein samjho aur Hinglish mein seedha, helpful jawab do. "
-        "Agar koi device/site data mein abhi nahi hai (jaise 0 devices parsed), to wahi fact saaf batao "
-        "aur agla practical step suggest karo.\n\n"
+        "User ke message ka jawab sirf is project ke live devices, sites, serials, firmware, timestamps aur "
+        "alerts ke context mein Hinglish mein do.\n\n"
         f"LIVE PROJECT DATA:\n{context_str}\n\n"
         f"USER MESSAGE:\n{user_question}"
     )
-    fallback = (
-        f"Project Data ({analysis['checked_at_ist']}): Total={analysis['total']}, "
-        f"Online={analysis['connected']}, Offline(>5h)={analysis['disconnected_5h_count']}, "
-        f"Source={analysis['meta'].get('source')}."
-    )
-    return call_gemini_with_fallback(prompt, fallback)
+    return call_gemini_with_fallback(prompt, build_rich_local_summary(analysis))
 
 
 def require_auth(chat_id: int) -> dict[str, Any] | None:
@@ -1243,10 +1052,11 @@ async def debug_rows_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             run_self_analysis, sess_data["session"], True
         )
         meta = analysis["meta"]
+        sample_dev = analysis["all_devices"][0] if analysis["all_devices"] else {}
         await update.message.reply_text(
-            "Debug rows Railway logs mein print kar diye gaye hain.\n"
-            f"Source: <code>{esc(meta.get('source'))}</code> | "
-            f"TR: <code>{meta['tr_total']}</code> | Parsed: <code>{analysis['total']}</code>",
+            "Debug info Railway logs mein print kar di gayi hai.\n"
+            f"Source: <code>{esc(meta.get('source'))}</code> | Parsed: <code>{analysis['total']}</code>\n"
+            f"Sample: <code>{esc(sample_dev.get('serial_no'))}</code> / <code>{esc(sample_dev.get('site'))}</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
@@ -1274,7 +1084,6 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Ab aap jo bhi message likhenge, main aapke <b>EnviroFRONT project</b> ke live "
             "data ke hisaab se jawab dunga.\n"
-            "Example: <code>kaunsi site 5h se offline hai?</code>\n"
             "Normal mode mein jaane ke liye <code>/exit_ai</code> likhein.",
             parse_mode=ParseMode.HTML,
         )
@@ -1425,7 +1234,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         return
 
-    # Agar /ai chat mode ON hai to message ko project-aware AI se answer karein
     if chat_id in AI_CHAT_MODE:
         sess_data = require_auth(chat_id)
         if not sess_data:
