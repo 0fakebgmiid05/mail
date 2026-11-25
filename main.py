@@ -28,8 +28,7 @@ BOT_TOKEN = (
     or "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
 ).strip()
 
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-
+GEMINI_API_KEY = "AQ.Ab8RN6I9cos8rT2ACgxwY70oDOEiigJFEL7O1CBnpwQ0l9VQgA"
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
