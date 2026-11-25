@@ -133,7 +133,6 @@ def parse_timestamp(raw: str) -> datetime | None:
     if not cleaned:
         return None
 
-    # ASP.NET /Date(1795607005920+0000)/ or /Date(1795607005920)/
     ms_match = re.search(r"/Date\((\-?\d+)(?:[+\-]\d{4})?\)/", cleaned)
     if ms_match:
         try:
@@ -166,10 +165,26 @@ def format_display_time(dt_utc: datetime | None, fallback_raw: str) -> str:
     return (fallback_raw or "N/A").strip() or "N/A"
 
 
+def format_site_label(industry: str, site_type: str) -> str:
+    """Format strictly as INDUSTRYNAME(SITE TYPE)."""
+    ind = (industry or "N/A").strip() or "N/A"
+    stype = (site_type or "N/A").strip() or "N/A"
+
+    if ind == "N/A" and stype == "N/A":
+        return "N/A(N/A)"
+    if ind == "N/A":
+        return f"N/A({stype})"
+    if stype == "N/A":
+        return f"{ind}(N/A)"
+    if ind.lower() == stype.lower():
+        return f"{ind}({stype})"
+    return f"{ind}({stype})"
+
+
 def build_device_record(
     serial_no: str,
     industry: str,
-    site: str,
+    site_type: str,
     device_type: str,
     firmware: str,
     status_text: str,
@@ -178,7 +193,7 @@ def build_device_record(
 ) -> dict[str, Any]:
     s_clean = (serial_no or "N/A").strip() or "N/A"
     ind_clean = (industry or "N/A").strip() or "N/A"
-    site_clean = (site or "N/A").strip() or "N/A"
+    stype_clean = (site_type or "N/A").strip() or "N/A"
     type_clean = (device_type or "LOGPRO PLUS").strip() or "LOGPRO PLUS"
     fw_clean = (firmware or "N/A").strip() or "N/A"
     st_clean = (status_text or "").strip()
@@ -209,15 +224,22 @@ def build_device_record(
     )
 
     display_ts = format_display_time(last_seen, ts_clean)
+    site_formatted = format_site_label(ind_clean, stype_clean)
+    status_word = "ONLINE" if is_connected else "DISCONNECTED"
+    status_with_time = f"{status_word} ({display_ts})"
+    badge = "🟢" if is_connected else "🔴"
 
     return {
         "serial_no": s_clean,
         "industry": ind_clean,
-        "site": site_clean,
+        "site_type": stype_clean,
+        "site": site_formatted,
         "device_type": type_clean,
         "firmware": fw_clean,
         "status": st_clean or ("Connected" if is_connected else "Disconnected"),
-        "conn_label": "CONNECT" if is_connected else "DISCONNECT",
+        "status_word": status_word,
+        "status_with_time": status_with_time,
+        "badge": badge,
         "is_connected": is_connected,
         "timestamp_raw": ts_clean or "N/A",
         "display_time": display_ts,
@@ -319,7 +341,7 @@ def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
         "mac",
         "id",
     )
-    site = pick(
+    site_type = pick(
         "sitename",
         "site.name",
         "site",
@@ -370,7 +392,7 @@ def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
     return build_device_record(
         serial_no=serial_no,
         industry=industry,
-        site=site,
+        site_type=site_type,
         device_type=device_type,
         firmware=firmware,
         status_text=status_text,
@@ -469,7 +491,7 @@ def extract_devices_from_html_table(
 
         serial_no = cols[0]
         industry = cols[1] if len(cols) > 1 else "N/A"
-        site = cols[2] if len(cols) > 2 else "N/A"
+        site_type = cols[2] if len(cols) > 2 else "N/A"
         device_type = cols[4] if len(cols) > 4 else "LOGPRO PLUS"
         firmware = cols[5] if len(cols) > 5 else "N/A"
         status_text = next(
@@ -488,7 +510,7 @@ def extract_devices_from_html_table(
             build_device_record(
                 serial_no=serial_no,
                 industry=industry,
-                site=site,
+                site_type=site_type,
                 device_type=device_type,
                 firmware=firmware,
                 status_text=status_text,
@@ -574,11 +596,7 @@ def run_self_analysis(
         fw = d["firmware"] or "Unknown"
         fw_counts[fw] = fw_counts.get(fw, 0) + 1
         if d["disconnected_5h"]:
-            site_label = (
-                f"{d['site']} ({d['industry']})"
-                if d["industry"] != "N/A"
-                else d["site"]
-            )
+            site_label = d["site"]
             site_offline_counts[site_label] = site_offline_counts.get(site_label, 0) + 1
 
     top_sites = sorted(site_offline_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
@@ -599,7 +617,7 @@ def run_self_analysis(
 
 def build_rich_local_summary(analysis: dict[str, Any]) -> str:
     off_lines = [
-        f"- {d['serial_no']} | {d['site']} | FW {d['firmware']} | Last: {d['display_time']}"
+        f"- {d['site']} | {d['serial_no']} | FW {d['firmware']} | {d['status_with_time']}"
         for d in analysis["disconnected_5h_list"][:10]
     ]
     fw_summary = ", ".join(
@@ -665,15 +683,15 @@ def build_project_context(analysis: dict[str, Any]) -> str:
             "serial": d["serial_no"],
             "site": d["site"],
             "industry": d["industry"],
+            "site_type": d["site_type"],
             "type": d["device_type"],
             "fw": d["firmware"],
-            "status": d["conn_label"],
+            "status_summary": d["status_with_time"],
             "online": d["is_connected"],
             "offline_5h": d["disconnected_5h"],
             "offline_hours": round(d["offline_duration"].total_seconds() / 3600, 1)
             if d["offline_duration"]
             else None,
-            "last_seen": d["display_time"],
         }
         for d in analysis["all_devices"][:50]
     ]
@@ -694,7 +712,8 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
     prompt = (
         "Tum ek senior industrial telemetry & IoT monitoring engineer ho jo EnviroFRONT (M2MLogger) "
         "device monitoring project par kaam kar raha hai. Is project ke live data ke basis par "
-        "Hinglish mein crisp, executive aur actionable analysis do:\n"
+        "Hinglish mein crisp, executive aur actionable analysis do. Jab bhi kisi site ka naam likho, "
+        "to INDUSTRYNAME(SITE TYPE) format use karo:\n"
         "1. Overall Health & Risk Level\n"
         "2. Sabse Critical Sites / Devices (>5h offline)\n"
         "3. Firmware / Connectivity Patterns\n"
@@ -709,7 +728,8 @@ def answer_project_question(user_question: str, analysis: dict[str, Any]) -> str
     prompt = (
         "Tum EnviroFRONT (M2MLogger) telemetry monitoring bot aur dashboard ke dedicated AI assistant ho. "
         "User ke message ka jawab sirf is project ke live devices, sites, serials, firmware, timestamps aur "
-        "alerts ke context mein Hinglish mein do.\n\n"
+        "alerts ke context mein Hinglish mein do. Jab bhi kisi site ka zikr ho, INDUSTRYNAME(SITE TYPE) "
+        "format use karo:\n\n"
         f"LIVE PROJECT DATA:\n{context_str}\n\n"
         f"USER MESSAGE:\n{user_question}"
     )
@@ -729,8 +749,8 @@ def commands_menu_html() -> str:
         "• <code>/status</code> — Overview &amp; top offline sites\n"
         "• <code>/online</code> — Connected devices\n"
         "• <code>/offline</code> — Disconnected &gt; 5h\n"
-        "• <code>/allsite</code> — All sites with logger &amp; last connect time\n"
-        "• <code>/site &lt;query&gt;</code> — Filter by site/industry\n"
+        "• <code>/allsite</code> — All sites with status &amp; time\n"
+        "• <code>/site &lt;query&gt;</code> — Filter by site/industry/type\n"
         "• <code>/health</code> — Firmware &amp; parser diagnostics\n"
         "• <code>/ai &lt;msg&gt;</code> — Ask AI about your project\n"
         "• <code>/ai_analyze</code> — Full AI health report\n"
@@ -749,12 +769,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if existing:
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+            "✨ <b>ENVIROFRONT TELEMETRY SUITE</b> ✨\n"
             "<i>Active Session Restored</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▸ <b>Account:</b> <code>{esc(existing.get('username'))}</code>\n"
-            "▸ <b>Session State:</b> <b>AUTHENTICATED</b>\n"
-            "▸ <b>5h Auto-Alert:</b> <b>ACTIVE</b>\n\n"
+            "▸ <b>Session State:</b> 🟢 <b>AUTHENTICATED</b>\n"
+            "▸ <b>5h Auto-Alert:</b> 🔔 <b>ACTIVE (GROUPED)</b>\n\n"
             f"{commands_menu_html()}"
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -763,7 +783,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
     intro = await update.message.reply_text(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+        "✨ <b>ENVIROFRONT TELEMETRY SUITE</b> ✨\n"
         "<i>Initializing Classic Console...</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode=ParseMode.HTML,
@@ -772,15 +792,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         intro,
         [
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+            "✨ <b>ENVIROFRONT TELEMETRY SUITE</b> ✨\n"
             "<i>Loading modules [■□□□□]</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━",
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+            "✨ <b>ENVIROFRONT TELEMETRY SUITE</b> ✨\n"
             "<i>Loading modules [■■■□□]</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "• Auto-login via <code>.ASPXAUTH</code> &amp; CSRF token\n"
-            "• Continuous <b>5-Hour Disconnect</b> alert engine\n"
+            "• Grouped <b>5-Hour Disconnect</b> alert engine\n"
             "• Live <b>Online / Offline / AllSite / Health</b> views\n"
             "• Project-aware <b>/ai</b> assistant &amp; reports\n\n"
             "Kripya apna <b>Login ID / Email</b> bhejein:",
@@ -795,7 +815,7 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
     await update.message.reply_text(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>ENVIROFRONT LOGIN</b>\n"
+        "🔐 <b>ENVIROFRONT LOGIN</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Kripya apna <b>Login ID / Email</b> bhejein:",
         parse_mode=ParseMode.HTML,
@@ -826,7 +846,7 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "<i>Session close ho raha hai [■■□□]</i>",
             "<i>Session close ho raha hai [■■■■]</i>",
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>LOGGED OUT</b>\n"
+            "🚪 <b>LOGGED OUT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Aapka EnviroFRONT session aur auto-alert monitor band kar diya gaya hai.\n"
             "Dobara login ke liye <code>/login</code> ya <code>/start</code> bhejein.",
@@ -855,7 +875,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if analysis["meta"]["server_error_500"]:
             await loader.edit_text(
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<b>SERVER ALERT — HTTP 500</b>\n"
+                "🚨 <b>SERVER ALERT — HTTP 500</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "EnviroFRONT ne <code>500 Internal Server Error</code> return kiya hai.",
                 parse_mode=ParseMode.HTML,
@@ -864,22 +884,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         sites_lines = (
             "\n".join(
-                f"  ▸ <b>{esc(s)}</b> — <code>{c}</code> offline"
+                f"  🔴 <b>{esc(s)}</b> — <code>{c}</code> offline"
                 for s, c in analysis["top_offline_sites"]
             )
             if analysis["top_offline_sites"]
-            else "  ▸ <i>Koi critical offline site nahi</i>"
+            else "  🟢 <i>Koi critical offline site nahi</i>"
         )
 
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>EXECUTIVE SYSTEM STATUS</b>\n"
+            "📊 <b>EXECUTIVE SYSTEM STATUS</b>\n"
             f"<i>{esc(analysis['checked_at_ist'])}</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▸ <b>Total Devices:</b> <code>{analysis['total']}</code>\n"
-            f"▸ <b>Online (Connected):</b> <code>{analysis['connected']}</code>\n"
-            f"▸ <b>Offline (&gt; 5h):</b> <code>{analysis['disconnected_5h_count']}</code>\n"
-            f"▸ <b>Source:</b> <code>{esc(analysis['meta'].get('source'))}</code>\n\n"
+            f"▸ <b>Online:</b> 🟢 <code>{analysis['connected']}</code>\n"
+            f"▸ <b>Offline (&gt; 5h):</b> 🔴 <code>{analysis['disconnected_5h_count']}</code>\n\n"
             "<b>Priority Offline Sites (&gt;5h)</b>\n"
             f"{sites_lines}\n\n"
             "<i>Commands: /online · /offline · /allsite · /site · /health · /ai</i>"
@@ -908,19 +927,19 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         if not online_list:
             await update.message.reply_text(
-                "<i>Koi connected device nahi mila.</i>", parse_mode=ParseMode.HTML
+                "<i>Koi online device nahi mila.</i>", parse_mode=ParseMode.HTML
             )
             return
 
         lines = [
             "━━━━━━━━━━━━━━━━━━━━━━",
-            f"<b>ONLINE DEVICES ({len(online_list)})</b>",
+            f"🟢 <b>ONLINE DEVICES ({len(online_list)})</b>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
-        for d in online_list[:25]:
+        for idx, d in enumerate(online_list[:25], start=1):
             lines.append(
-                f"• <code>{esc(d['serial_no'])}</code> | <b>{esc(d['site'])}</b>\n"
-                f"  <i>FW {esc(d['firmware'])} · Last: {esc(d['display_time'])}</i>"
+                f"{idx}. <b>{esc(d['site'])}</b> | <code>{esc(d['serial_no'])}</code>\n"
+                f"   🟢 <b>{esc(d['status_with_time'])}</b> · <i>FW {esc(d['firmware'])}</i>"
             )
         if len(online_list) > 25:
             lines.append(f"\n<i>...aur {len(online_list) - 25} online devices hain.</i>")
@@ -950,30 +969,25 @@ async def offline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not off_list:
             await update.message.reply_text(
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<b>OFFLINE MONITOR (&gt; 5h)</b>\n"
+                "🟢 <b>OFFLINE MONITOR (&gt; 5h)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>Sabhi devices 5 ghante ke andar active hain.</i>",
+                "<i>Sabhi devices 5 ghante ke andar online hain.</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
 
         lines = [
             "━━━━━━━━━━━━━━━━━━━━━━",
-            f"<b>OFFLINE &gt; 5 HOURS ({len(off_list)})</b>",
+            f"🔴 <b>DISCONNECTED &gt; 5H ({len(off_list)})</b>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
-        for d in off_list[:20]:
-            hrs = (
-                f"{round(d['offline_duration'].total_seconds() / 3600, 1)}h"
-                if d["offline_duration"]
-                else "N/A"
-            )
+        for idx, d in enumerate(off_list[:20], start=1):
             lines.append(
-                f"• <code>{esc(d['serial_no'])}</code> | <b>{esc(d['site'])}</b>\n"
-                f"  <b>Down: {esc(hrs)}</b> · <i>Last: {esc(d['display_time'])}</i>"
+                f"{idx}. <b>{esc(d['site'])}</b> | <code>{esc(d['serial_no'])}</code>\n"
+                f"   🔴 <b>{esc(d['status_with_time'])}</b>"
             )
         if len(off_list) > 20:
-            lines.append(f"\n<i>...aur {len(off_list) - 20} offline devices hain.</i>")
+            lines.append(f"\n<i>...aur {len(off_list) - 20} disconnected devices hain.</i>")
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as exc:
@@ -1018,16 +1032,16 @@ async def allsite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 else f"{d['device_type']} ({d['serial_no']})"
             )
             entry = (
-                f"{idx}. <b>{esc(d['site'])}</b> — <code>{esc(logger_name)}</code> — "
-                f"<b>{esc(d['conn_label'])}</b> — <i>{esc(d['display_time'])}</i>"
+                f"{idx}. {d['badge']} <b>{esc(d['site'])}</b> — "
+                f"<code>{esc(logger_name)}</code> — "
+                f"<b>{esc(d['status_with_time'])}</b>"
             )
             chunk_lines.append(entry)
 
-            # Telegram message length limit (~4096 chars) ke andar chunk bhejein
             if len("\n".join(chunk_lines)) > 3400:
                 header = (
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>ALL SITES ({len(devices)})</b>\n"
+                    f"🏭 <b>ALL SITES ({len(devices)})</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
                     if sent_chunks == 0
                     else ""
@@ -1046,7 +1060,7 @@ async def allsite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if chunk_lines:
             header = (
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>ALL SITES ({len(devices)})</b>\n"
+                f"🏭 <b>ALL SITES ({len(devices)})</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 if sent_chunks == 0
                 else ""
@@ -1078,7 +1092,7 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args or []).strip().lower()
     if not query:
         await update.message.reply_text(
-            "Usage: <code>/site &lt;site ya industry ka naam&gt;</code>\n"
+            "Usage: <code>/site &lt;industry, site type ya serial&gt;</code>\n"
             "Example: <code>/site distillery</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -1091,6 +1105,7 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for d in analysis["all_devices"]
             if query in d["site"].lower()
             or query in d["industry"].lower()
+            or query in d["site_type"].lower()
             or query in d["serial_no"].lower()
         ]
         if not matches:
@@ -1102,13 +1117,13 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         lines = [
             "━━━━━━━━━━━━━━━━━━━━━━",
-            f"<b>SITE FILTER: {esc(query.upper())} ({len(matches)})</b>",
+            f"🔎 <b>SITE FILTER: {esc(query.upper())} ({len(matches)})</b>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
-        for d in matches[:20]:
+        for idx, d in enumerate(matches[:20], start=1):
             lines.append(
-                f"• <code>{esc(d['serial_no'])}</code> [{esc(d['conn_label'])}] — <b>{esc(d['site'])}</b>\n"
-                f"  <i>{esc(d['industry'])} · FW {esc(d['firmware'])} · {esc(d['display_time'])}</i>"
+                f"{idx}. {d['badge']} <b>{esc(d['site'])}</b> | <code>{esc(d['serial_no'])}</code>\n"
+                f"   <b>{esc(d['status_with_time'])}</b> · <i>FW {esc(d['firmware'])}</i>"
             )
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as exc:
@@ -1142,12 +1157,10 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>SYSTEM &amp; PARSER DIAGNOSTICS</b>\n"
+            "🛠️ <b>SYSTEM &amp; PARSER DIAGNOSTICS</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▸ <b>Server HTTP 500:</b> <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
             f"▸ <b>Data Source:</b> <code>{esc(meta.get('source', 'none'))}</code>\n"
-            f"▸ <b>HTML Size:</b> <code>{meta['html_length']}</code> bytes\n"
-            f"▸ <b>Raw &lt;tr&gt; Rows:</b> <code>{meta['tr_total']}</code>\n"
             f"▸ <b>Parsed Devices:</b> <code>{analysis['total']}</code>\n"
             f"▸ <b>Unparsed Timestamps:</b> <code>{meta['unparsed_ts_count']}</code>\n\n"
             "<b>Firmware Distribution</b>\n"
@@ -1179,7 +1192,7 @@ async def debug_rows_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             "Debug info Railway logs mein print kar di gayi hai.\n"
             f"Source: <code>{esc(meta.get('source'))}</code> | Parsed: <code>{analysis['total']}</code>\n"
-            f"Sample: <code>{esc(sample_dev.get('serial_no'))}</code> / <code>{esc(sample_dev.get('site'))}</code>",
+            f"Sample: <b>{esc(sample_dev.get('site'))}</b> / <code>{esc(sample_dev.get('serial_no'))}</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
@@ -1203,7 +1216,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         AI_CHAT_MODE.add(chat_id)
         await update.message.reply_text(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>PROJECT AI MODE ON</b>\n"
+            "🤖 <b>PROJECT AI MODE ON</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Ab aap jo bhi message likhenge, main aapke <b>EnviroFRONT project</b> ke live "
             "data ke hisaab se jawab dunga.\n"
@@ -1235,7 +1248,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await thinking.edit_text(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>PROJECT AI ASSISTANT</b>\n"
+            "🤖 <b>PROJECT AI ASSISTANT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{esc(reply_txt)}",
             parse_mode=ParseMode.HTML,
@@ -1285,7 +1298,7 @@ async def ai_analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>GEMINI AI SELF-ANALYSIS</b>\n"
+            "🧠 <b>GEMINI AI SELF-ANALYSIS</b>\n"
             f"<i>{esc(analysis['checked_at_ist'])}</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{esc(ai_text)}"
@@ -1342,10 +1355,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             }
             await auth_box.edit_text(
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<b>SESSION AUTHENTICATED</b>\n"
+                "🟢 <b>SESSION AUTHENTICATED</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Account: <code>{esc(username)}</code>\n"
-                "5-Hour Disconnect Auto-Alert: <b>ACTIVE</b>\n\n"
+                "5-Hour Disconnect Auto-Alert: <b>ACTIVE (GROUPED)</b>\n\n"
                 f"{commands_menu_html()}",
                 parse_mode=ParseMode.HTML,
             )
@@ -1380,7 +1393,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             await ans_msg.edit_text(
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<b>PROJECT AI ASSISTANT</b>\n"
+                "🤖 <b>PROJECT AI ASSISTANT</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{esc(reply_txt)}",
                 parse_mode=ParseMode.HTML,
@@ -1399,7 +1412,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ==============================================================================
-# BACKGROUND MONITOR (5-HOUR DISCONNECT ALERTS)
+# BACKGROUND MONITOR (SINGLE GROUPED 5-HOUR DISCONNECT ALERTS)
 # ==============================================================================
 async def background_monitor(app) -> None:
     while True:
@@ -1414,30 +1427,46 @@ async def background_monitor(app) -> None:
                 )
                 LAST_SNAPSHOT[chat_id] = analysis
 
+                due_devices: list[dict[str, Any]] = []
                 for dev in analysis["disconnected_5h_list"]:
                     key = f"{chat_id}:{dev['serial_no']}"
                     last_alert = ALERTED_DEVICES.get(key)
                     if not last_alert or (now - last_alert) > ALERT_COOLDOWN:
                         ALERTED_DEVICES[key] = now
-                        hrs = (
-                            f"{round(dev['offline_duration'].total_seconds() / 3600, 1)} hours"
-                            if dev["offline_duration"]
-                            else "Unknown"
+                        due_devices.append(dev)
+
+                if due_devices:
+                    alert_lines: list[str] = []
+                    for idx, dev in enumerate(due_devices, start=1):
+                        line = (
+                            f"{idx}. 🔴 <b>{esc(dev['site'])}</b> | "
+                            f"<code>{esc(dev['serial_no'])}</code> — "
+                            f"<b>{esc(dev['status_with_time'])}</b>"
                         )
-                        alert_msg = (
+                        alert_lines.append(line)
+
+                        if len("\n".join(alert_lines)) > 3400:
+                            header = (
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🚨 <b>DISCONNECT ALERT (&gt; 5H) — {len(due_devices)} DEVICES</b>\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            )
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=header + "\n".join(alert_lines),
+                                parse_mode=ParseMode.HTML,
+                            )
+                            alert_lines = []
+
+                    if alert_lines:
+                        header = (
                             "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            "<b>CRITICAL DISCONNECT (&gt; 5H)</b>\n"
+                            f"🚨 <b>DISCONNECT ALERT (&gt; 5H) — {len(due_devices)} DEVICES</b>\n"
                             "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"▸ <b>Serial:</b> <code>{esc(dev['serial_no'])}</code>\n"
-                            f"▸ <b>Site:</b> <b>{esc(dev['site'])}</b>\n"
-                            f"▸ <b>Industry:</b> {esc(dev['industry'])}\n"
-                            f"▸ <b>Type / FW:</b> <code>{esc(dev['device_type'])}</code> · <code>{esc(dev['firmware'])}</code>\n"
-                            f"▸ <b>Offline For:</b> <b>{esc(hrs)}</b>\n"
-                            f"▸ <b>Last Seen:</b> <code>{esc(dev['display_time'])}</code>"
                         )
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text=alert_msg,
+                            text=header + "\n".join(alert_lines),
                             parse_mode=ParseMode.HTML,
                         )
 
