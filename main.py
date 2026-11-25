@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# DIRECT CONFIGURATION (NO ENV NEEDED)
+# DIRECT CONFIGURATION
 # ==============================================================================
 BOT_TOKEN = "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
 GEMINI_API_KEY = "AQ.Ab8RN6LKHe0Rp-B5loqNfPLVz32jwQgnFCorUoYe2kGX09U4PA"
@@ -37,6 +37,7 @@ ALERT_COOLDOWN = timedelta(hours=6)
 USER_SESSIONS: dict[int, dict[str, Any]] = {}
 ALERTED_DEVICES: dict[str, datetime] = {}
 LAST_SNAPSHOT: dict[int, dict[str, Any]] = {}
+AI_CHAT_MODE: set[int] = set()
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -55,7 +56,7 @@ def esc(text: Any) -> str:
     )
 
 
-async def animate_message(msg, frames: list[str], delay: float = 0.4) -> None:
+async def animate_message(msg, frames: list[str], delay: float = 0.35) -> None:
     for frame in frames:
         try:
             await msg.edit_text(frame, parse_mode=ParseMode.HTML)
@@ -392,6 +393,7 @@ def extract_devices_via_js_ajax(
         "/Scripts/Pages/devices.js?v=1.4.5",
         "/Scripts/Pages/devices.js",
         "/Scripts/datagrid.js",
+        "/Scripts/Pages/utils.js",
     ]
     js_paths.extend(
         re.findall(
@@ -423,6 +425,8 @@ def extract_devices_via_js_ajax(
                             "pae",
                             "control",
                             "api",
+                            "site",
+                            "status",
                         )
                     )
                 ]
@@ -434,7 +438,7 @@ def extract_devices_via_js_ajax(
     combined = "\n".join(blobs)
     candidates = set(
         re.findall(
-            r"""["'](/pae/[^"']{2,100}|/api/[^"']{2,100}|/[A-Za-z0-9_/-]+(?:Device|Grid|Data|List|Get|Load|Table)[A-Za-z0-9_/-]*)["']""",
+            r"""["'](/pae/[^"']{2,100}|/api/[^"']{2,100}|/Services/[^"']{2,100}|/[A-Za-z0-9_/-]+(?:Device|Grid|Data|List|Get|Load|Table|Status)[A-Za-z0-9_/-]*)["']""",
             combined,
             re.IGNORECASE,
         )
@@ -446,10 +450,12 @@ def extract_devices_via_js_ajax(
             "/pae/ControlPanel/LoadDevices",
             "/pae/ControlPanel/GetAllDevices",
             "/pae/ControlPanel/DevicesData",
+            "/pae/SiteStatus",
+            "/pae/LiveMap",
         }
     )
 
-    for path in list(candidates)[:30]:
+    for path in list(candidates)[:35]:
         url = urljoin(BASE_URL, path)
         for method in ("POST", "GET"):
             try:
@@ -488,18 +494,27 @@ def extract_devices_via_js_ajax(
 
                 ctype = r.headers.get("Content-Type", "").lower()
                 txt = r.text.strip()
-                if "json" not in ctype and not txt.startswith(("{", "[")):
-                    continue
-
-                devices = parse_json_payload_devices(txt, now)
-                if devices:
-                    logger.info(
-                        "AJAX matched %s (%s) -> %d devices",
-                        method,
-                        path,
-                        len(devices),
-                    )
-                    return devices
+                if "json" in ctype or txt.startswith(("{", "[")):
+                    devices = parse_json_payload_devices(txt, now)
+                    if devices:
+                        logger.info(
+                            "AJAX JSON matched %s (%s) -> %d devices",
+                            method,
+                            path,
+                            len(devices),
+                        )
+                        return devices
+                elif "html" in ctype and path != "/pae/ControlPanel/Devices":
+                    sub_soup = BeautifulSoup(txt, "html.parser")
+                    sub_devs, _, _ = extract_devices_from_html_table(sub_soup, now)
+                    if len(sub_devs) > 1:
+                        logger.info(
+                            "Subpage table matched %s (%s) -> %d devices",
+                            method,
+                            path,
+                            len(sub_devs),
+                        )
+                        return sub_devs
             except Exception:
                 continue
 
@@ -509,7 +524,7 @@ def extract_devices_via_js_ajax(
 def extract_devices_via_embedded_or_dom(
     soup: BeautifulSoup, raw_html: str, now: datetime
 ) -> list[dict[str, Any]]:
-    # 1) Embedded JSON / script assignments check
+    # 1) Embedded JSON / script objects
     for script in soup.find_all("script"):
         stext = script.string or script.get_text() or ""
         for match in re.finditer(r"(\[[\s\S]{20,80000}?\]|\{[\s\S]{20,80000}?\})", stext):
@@ -521,7 +536,7 @@ def extract_devices_via_embedded_or_dom(
                 if devs:
                     return devs
 
-    # 2) Non-table row containers (e.g., div / row / card / dx-view)
+    # 2) Non-table rows (div / li / cards / grids)
     devices: list[dict[str, Any]] = []
     selectors = [
         "div.row",
@@ -529,6 +544,7 @@ def extract_devices_via_embedded_or_dom(
         "div[class*='grid-row']",
         "li[class*='device']",
         "div[class*='device-item']",
+        "div[class*='card']",
     ]
     seen_texts: set[str] = set()
 
@@ -614,55 +630,55 @@ def fetch_devices_multi_strategy(
     soup = BeautifulSoup(raw_html, "html.parser")
     now = datetime.now(timezone.utc)
 
-    # IF / ELSE STRATEGY 1: Direct HTML <tr> table parsing
+    # IF / ELSE CHAIN FOR ALL DEVICE FETCHING METHODS
     html_devices, tr_total, unparsed_ts = extract_devices_from_html_table(
         soup, now, log_sample=log_sample
     )
     meta["tr_total"] = tr_total
     meta["unparsed_ts_count"] = unparsed_ts
 
-    if html_devices:
+    if len(html_devices) > 1:
         meta["source"] = "html-table"
         return html_devices, meta
-
-    # ELSE STRATEGY 2: JS/AJAX endpoint discovery & JSON parsing
-    ajax_devices = extract_devices_via_js_ajax(session, raw_html, now)
-    if ajax_devices:
-        meta["source"] = "js-ajax-json"
-        return ajax_devices, meta
-
-    # ELSE STRATEGY 3: Embedded script JSON or non-table DOM rows
-    dom_devices = extract_devices_via_embedded_or_dom(soup, raw_html, now)
-    if dom_devices:
-        meta["source"] = "embedded-or-dom"
-        return dom_devices, meta
-
-    # ELSE: Log helpful diagnostic info when all strategies return 0
-    meta["source"] = "0-found"
-    scripts_text = "\n".join(
-        s.get_text(" ", strip=True) for s in soup.find_all("script")
-    )
-    urls_found = set(re.findall(r"""["'](/[^"']{3,100})["']""", raw_html))
-    interesting_urls = [
-        u
-        for u in sorted(urls_found)
-        if any(
-            k in u.lower()
-            for k in (
-                "device",
-                "grid",
-                "data",
-                "list",
-                "get",
-                "load",
-                "pae",
-                "control",
-            )
-        )
-    ]
-    logger.info("Candidate URLs in HTML: %s", interesting_urls[:20])
-    logger.info("Script snippet: %s", " ".join(scripts_text.split())[:600])
-    return [], meta
+    else:
+        ajax_devices = extract_devices_via_js_ajax(session, raw_html, now)
+        if ajax_devices:
+            meta["source"] = "js-ajax-json"
+            return ajax_devices, meta
+        else:
+            dom_devices = extract_devices_via_embedded_or_dom(soup, raw_html, now)
+            if dom_devices:
+                meta["source"] = "embedded-or-dom"
+                return dom_devices, meta
+            else:
+                if html_devices:
+                    meta["source"] = "html-table-single"
+                    return html_devices, meta
+                meta["source"] = "0-found"
+                scripts_text = "\n".join(
+                    s.get_text(" ", strip=True) for s in soup.find_all("script")
+                )
+                urls_found = set(re.findall(r"""["'](/[^"']{3,100})["']""", raw_html))
+                interesting_urls = [
+                    u
+                    for u in sorted(urls_found)
+                    if any(
+                        k in u.lower()
+                        for k in (
+                            "device",
+                            "grid",
+                            "data",
+                            "list",
+                            "get",
+                            "load",
+                            "pae",
+                            "control",
+                        )
+                    )
+                ]
+                logger.info("Candidate URLs in HTML: %s", interesting_urls[:20])
+                logger.info("Script snippet: %s", " ".join(scripts_text.split())[:600])
+                return [], meta
 
 
 def run_self_analysis(
@@ -711,64 +727,28 @@ def run_self_analysis(
     }
 
 
-def generate_ai_analysis(analysis: dict[str, Any]) -> str:
-    compact_offline = [
-        {
-            "serial": d["serial_no"],
-            "site": d["site"],
-            "industry": d["industry"],
-            "fw": d["firmware"],
-            "offline_hours": round(d["offline_duration"].total_seconds() / 3600, 1)
-            if d["offline_duration"]
-            else "Unknown",
-            "last_seen": d["timestamp_raw"],
-        }
-        for d in analysis["disconnected_5h_list"][:15]
-    ]
-
-    prompt = (
-        "Tum ek senior industrial telemetry & IoT monitoring engineer ho. "
-        "Neeche EnviroFRONT (M2MLogger) devices ka self-analysis snapshot diya gaya hai. "
-        "Hinglish mein crisp, executive aur actionable analysis do:\n"
-        "1. Overall Health & Risk Level\n"
-        "2. Sabse Critical Sites / Devices (>5h offline)\n"
-        "3. Firmware / Server / Connectivity Patterns\n"
-        "4. Immediate Action Checklist (short bullets)\n"
-        "Plain text / simple lines rakho (complex markdown symbols mat lagao).\n\n"
-        f"Snapshot: total={analysis['total']}, connected={analysis['connected']}, "
-        f"disconnected_over_5h={analysis['disconnected_5h_count']}, "
-        f"top_offline_sites={analysis['top_offline_sites']}, "
-        f"firmware_breakdown={analysis['firmware_breakdown']}, "
-        f"meta={analysis['meta']}\n"
-        f"Top Offline Devices (>5h): {compact_offline}"
-    )
-
-    fallback_text = (
-        f"Overall Status: Total {analysis['total']} devices | "
-        f"Online {analysis['connected']} | Offline (>5h) {analysis['disconnected_5h_count']}.\n"
-        f"Data Source: {analysis['meta'].get('source')}.\n"
-        "Action: Agar total 0 aa raha hai to /debug_rows chalakar devices.js ka exact AJAX URL check karein."
-    )
-
+def call_gemini_with_fallback(prompt: str, fallback_text: str) -> str:
     if not GEMINI_API_KEY:
         return fallback_text
 
-    # IF / ELSE AI CHAIN: 1) google-genai SDK -> 2) REST X-goog-api-key -> 3) REST ?key= -> 4) Fallback
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        if response and response.text:
-            return response.text
-    except Exception as sdk_exc:
-        logger.warning("Gemini SDK call failed, trying REST fallback: %s", sdk_exc)
+    models_to_try = ("gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash")
 
-    rest_models = ("gemini-flash-latest", "gemini-2.5-flash")
+    # 1) SDK attempt
+    for m_name in models_to_try:
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model=m_name,
+                contents=prompt,
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception:
+            continue
+
+    # 2) REST X-goog-api-key attempt
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    for m_name in rest_models:
+    for m_name in models_to_try:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent",
@@ -792,7 +772,8 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
         except Exception:
             continue
 
-    for m_name in rest_models:
+    # 3) REST ?key= attempt
+    for m_name in models_to_try:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent",
@@ -817,6 +798,75 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
     return fallback_text
 
 
+def build_project_context(analysis: dict[str, Any]) -> str:
+    compact_devices = [
+        {
+            "serial": d["serial_no"],
+            "site": d["site"],
+            "industry": d["industry"],
+            "type": d["device_type"],
+            "fw": d["firmware"],
+            "status": d["status"],
+            "online": d["is_connected"],
+            "offline_5h": d["disconnected_5h"],
+            "offline_hours": round(d["offline_duration"].total_seconds() / 3600, 1)
+            if d["offline_duration"]
+            else None,
+            "last_seen": d["timestamp_raw"],
+        }
+        for d in analysis["all_devices"][:40]
+    ]
+    return (
+        f"Checked At: {analysis['checked_at_ist']}\n"
+        f"Total Devices: {analysis['total']}\n"
+        f"Online Devices: {analysis['connected']}\n"
+        f"Offline (>5h) Count: {analysis['disconnected_5h_count']}\n"
+        f"Top Offline Sites: {analysis['top_offline_sites']}\n"
+        f"Firmware Breakdown: {analysis['firmware_breakdown']}\n"
+        f"Parser/Server Meta: {analysis['meta']}\n"
+        f"Devices Sample (up to 40): {compact_devices}"
+    )
+
+
+def generate_ai_analysis(analysis: dict[str, Any]) -> str:
+    context_str = build_project_context(analysis)
+    prompt = (
+        "Tum ek senior industrial telemetry & IoT monitoring engineer ho jo EnviroFRONT (M2MLogger) "
+        "device monitoring project par kaam kar raha hai. Is project ke live data ke basis par "
+        "Hinglish mein crisp, executive aur actionable analysis do:\n"
+        "1. Overall Health & Risk Level\n"
+        "2. Sabse Critical Sites / Devices (>5h offline)\n"
+        "3. Firmware / Server / Parser / Connectivity Patterns\n"
+        "4. Immediate Action Checklist (short bullets)\n"
+        "Plain text / simple lines rakho.\n\n"
+        f"{context_str}"
+    )
+    fallback = (
+        f"Project Snapshot: Total={analysis['total']} | Online={analysis['connected']} | "
+        f"Offline(>5h)={analysis['disconnected_5h_count']} | Source={analysis['meta'].get('source')}."
+    )
+    return call_gemini_with_fallback(prompt, fallback)
+
+
+def answer_project_question(user_question: str, analysis: dict[str, Any]) -> str:
+    context_str = build_project_context(analysis)
+    prompt = (
+        "Tum EnviroFRONT (M2MLogger) telemetry monitoring bot aur dashboard ke dedicated AI assistant ho. "
+        "User ka sawaal sirf is project ke live data, devices, sites, firmware, offline alerts aur "
+        "parser/API diagnostics ke context mein samjho aur Hinglish mein seedha, helpful jawab do. "
+        "Agar koi device/site data mein abhi nahi hai (jaise 0 devices parsed), to wahi fact saaf batao "
+        "aur agla practical step suggest karo.\n\n"
+        f"LIVE PROJECT DATA:\n{context_str}\n\n"
+        f"USER MESSAGE:\n{user_question}"
+    )
+    fallback = (
+        f"Project Data ({analysis['checked_at_ist']}): Total={analysis['total']}, "
+        f"Online={analysis['connected']}, Offline(>5h)={analysis['disconnected_5h_count']}, "
+        f"Source={analysis['meta'].get('source')}."
+    )
+    return call_gemini_with_fallback(prompt, fallback)
+
+
 def require_auth(chat_id: int) -> dict[str, Any] | None:
     sess_data = USER_SESSIONS.get(chat_id)
     if not sess_data or sess_data.get("step") != "authenticated":
@@ -832,7 +882,8 @@ def commands_menu_html() -> str:
         "• <code>/offline</code> — Disconnected &gt; 5h\n"
         "• <code>/site &lt;query&gt;</code> — Filter by site/industry\n"
         "• <code>/health</code> — Firmware &amp; parser diagnostics\n"
-        "• <code>/ai_analyze</code> — Gemini AI report\n"
+        "• <code>/ai &lt;msg&gt;</code> — Ask AI about your project\n"
+        "• <code>/ai_analyze</code> — Full AI health report\n"
         "• <code>/login</code> — Switch / re-login account\n"
         "• <code>/logout</code> — End active session"
     )
@@ -881,7 +932,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• Auto-login via <code>.ASPXAUTH</code> &amp; CSRF token\n"
             "• Continuous <b>5-Hour Disconnect</b> alert engine\n"
             "• Live <b>Online / Offline / Site / Health</b> views\n"
-            "• <b>Gemini AI</b> self-analysis &amp; root-cause summary\n\n"
+            "• Project-aware <b>/ai</b> assistant &amp; reports\n\n"
             "Kripya apna <b>Login ID / Email</b> bhejein:",
         ],
         delay=0.35,
@@ -890,6 +941,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    AI_CHAT_MODE.discard(chat_id)
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
     await update.message.reply_text(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -902,6 +954,7 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    AI_CHAT_MODE.discard(chat_id)
     sess_data = USER_SESSIONS.pop(chat_id, None)
     LAST_SNAPSHOT.pop(chat_id, None)
 
@@ -975,10 +1028,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▸ <b>Total Devices:</b> <code>{analysis['total']}</code>\n"
             f"▸ <b>Online (Connected):</b> <code>{analysis['connected']}</code>\n"
-            f"▸ <b>Offline (&gt; 5h):</b> <code>{analysis['disconnected_5h_count']}</code>\n\n"
+            f"▸ <b>Offline (&gt; 5h):</b> <code>{analysis['disconnected_5h_count']}</code>\n"
+            f"▸ <b>Source:</b> <code>{esc(analysis['meta'].get('source'))}</code>\n\n"
             "<b>Priority Offline Sites (&gt;5h)</b>\n"
             f"{sites_lines}\n\n"
-            "<i>Commands: /online · /offline · /site · /health · /ai_analyze · /logout</i>"
+            "<i>Commands: /online · /offline · /site · /health · /ai · /ai_analyze</i>"
         )
         await loader.edit_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
@@ -1201,6 +1255,74 @@ async def debug_rows_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text(
+            "Pehle <code>/login</code> ya <code>/start</code> se login karein.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    question = " ".join(context.args or []).strip()
+    if not question:
+        AI_CHAT_MODE.add(chat_id)
+        await update.message.reply_text(
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>PROJECT AI MODE ON</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Ab aap jo bhi message likhenge, main aapke <b>EnviroFRONT project</b> ke live "
+            "data ke hisaab se jawab dunga.\n"
+            "Example: <code>kaunsi site 5h se offline hai?</code>\n"
+            "Normal mode mein jaane ke liye <code>/exit_ai</code> likhein.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    thinking = await update.message.reply_text(
+        "<i>Project data padh kar jawab ban raha hai...</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    await animate_message(
+        thinking,
+        [
+            "<i>Reading EnviroFRONT snapshot [■□□]</i>",
+            "<i>Generating project answer [■■■]</i>",
+        ],
+        delay=0.3,
+    )
+
+    try:
+        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+            run_self_analysis, sess_data["session"]
+        )
+        LAST_SNAPSHOT[chat_id] = analysis
+        reply_txt = await asyncio.to_thread(
+            answer_project_question, question, analysis
+        )
+        await thinking.edit_text(
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>PROJECT AI ASSISTANT</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{esc(reply_txt)}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        await thinking.edit_text(
+            f"<b>AI Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML
+        )
+
+
+async def exit_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    AI_CHAT_MODE.discard(chat_id)
+    await update.message.reply_text(
+        "<i>Project AI chat mode band kar diya gaya hai.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def ai_analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     sess_data = require_auth(chat_id)
@@ -1218,7 +1340,7 @@ async def ai_analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_box,
         [
             "<i>Scanning devices &amp; sites [■□□]</i>",
-            "<i>Running Gemini AI diagnostics [■■□]</i>",
+            "<i>Running AI diagnostics [■■□]</i>",
             "<i>Compiling classic report [■■■]</i>",
         ],
         delay=0.35,
@@ -1248,21 +1370,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = (update.message.text or "").strip()
     state = USER_SESSIONS.get(chat_id)
 
-    if not state:
-        await update.message.reply_text(
-            "Login ke liye <code>/login</code> ya <code>/start</code> bhejein.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if state.get("step") == "awaiting_username":
+    if state and state.get("step") == "awaiting_username":
         state["username"] = text
         state["step"] = "awaiting_password"
         await update.message.reply_text(
             "Ab apna <b>Password</b> bhejein:", parse_mode=ParseMode.HTML
         )
+        return
 
-    elif state.get("step") == "awaiting_password":
+    if state and state.get("step") == "awaiting_password":
         username = state["username"]
         password = text
 
@@ -1307,6 +1423,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "<b>Login fail ho gaya.</b> Kripya dobara apna <b>Login ID / Email</b> bhejein:",
                 parse_mode=ParseMode.HTML,
             )
+        return
+
+    # Agar /ai chat mode ON hai to message ko project-aware AI se answer karein
+    if chat_id in AI_CHAT_MODE:
+        sess_data = require_auth(chat_id)
+        if not sess_data:
+            AI_CHAT_MODE.discard(chat_id)
+            await update.message.reply_text(
+                "Pehle <code>/login</code> se login karein.", parse_mode=ParseMode.HTML
+            )
+            return
+
+        ans_msg = await update.message.reply_text(
+            "<i>Project data ke hisaab se soch raha hoon...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+                run_self_analysis, sess_data["session"]
+            )
+            LAST_SNAPSHOT[chat_id] = analysis
+            reply_txt = await asyncio.to_thread(
+                answer_project_question, text, analysis
+            )
+            await ans_msg.edit_text(
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<b>PROJECT AI ASSISTANT</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{esc(reply_txt)}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            await ans_msg.edit_text(
+                f"<b>AI Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML
+            )
+        return
+
+    if not state:
+        await update.message.reply_text(
+            "Login ke liye <code>/login</code> ya <code>/start</code> bhejein.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ==============================================================================
@@ -1385,6 +1543,8 @@ def main() -> None:
     app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("debug_rows", debug_rows_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("exit_ai", exit_ai_cmd))
     app.add_handler(CommandHandler("ai_analyze", ai_analyze_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
