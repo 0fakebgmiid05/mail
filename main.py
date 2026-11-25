@@ -21,8 +21,8 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE")
-GEMINI_API_KEY = os.getenv("AQ.Ab8RN6I_tfcLUOolcVJFPaJHlKqj3Fdv6izB2vvGx8fC4sjLow")  # Optional: AI analysis ke liye
+BOT_TOKEN = ("9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE")
+GEMINI_API_KEY = ("AQ.Ab8RN6I_tfcLUOolcVJFPaJHlKqj3Fdv6izB2vvGx8fC4sjLow")  # Optional: AI analysis ke liye
 
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
