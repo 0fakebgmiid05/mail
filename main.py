@@ -132,6 +132,16 @@ def parse_timestamp(raw: str) -> datetime | None:
     cleaned = " ".join((raw or "").strip().split())
     if not cleaned:
         return None
+
+    # ASP.NET /Date(1795607005920+0000)/ or /Date(1795607005920)/
+    ms_match = re.search(r"/Date\((\-?\d+)(?:[+\-]\d{4})?\)/", cleaned)
+    if ms_match:
+        try:
+            ms = int(ms_match.group(1))
+            return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        except Exception:
+            return None
+
     formats = (
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %I:%M:%S %p",
@@ -148,6 +158,12 @@ def parse_timestamp(raw: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def format_display_time(dt_utc: datetime | None, fallback_raw: str) -> str:
+    if dt_utc:
+        return dt_utc.astimezone(IST).strftime("%d-%b-%Y %I:%M:%S %p IST")
+    return (fallback_raw or "N/A").strip() or "N/A"
 
 
 def build_device_record(
@@ -168,16 +184,31 @@ def build_device_record(
     st_clean = (status_text or "").strip()
     ts_clean = (ts_raw or "").strip()
 
-    is_connected = (
-        "connected" in st_clean.lower()
-        and "disconnected" not in st_clean.lower()
-    )
     last_seen = parse_timestamp(ts_clean)
     offline_td = (now - last_seen) if last_seen else None
+
+    st_lower = st_clean.lower()
+    explicit_disconnected = "disconnected" in st_lower or "offline" in st_lower
+    explicit_connected = (
+        ("connected" in st_lower and not explicit_disconnected)
+        or st_lower in ("online", "true", "1", "active")
+    )
+
+    if explicit_disconnected:
+        is_connected = False
+    elif explicit_connected:
+        is_connected = True
+    elif offline_td is not None:
+        is_connected = offline_td <= DISCONNECT_THRESHOLD
+    else:
+        is_connected = False
+
     is_offline_5h = bool(
-        (offline_td and offline_td > DISCONNECT_THRESHOLD)
+        (offline_td is not None and offline_td > DISCONNECT_THRESHOLD)
         or (not is_connected and offline_td is None)
     )
+
+    display_ts = format_display_time(last_seen, ts_clean)
 
     return {
         "serial_no": s_clean,
@@ -186,8 +217,10 @@ def build_device_record(
         "device_type": type_clean,
         "firmware": fw_clean,
         "status": st_clean or ("Connected" if is_connected else "Disconnected"),
+        "conn_label": "CONNECT" if is_connected else "DISCONNECT",
         "is_connected": is_connected,
         "timestamp_raw": ts_clean or "N/A",
+        "display_time": display_ts,
         "last_seen": last_seen,
         "offline_duration": offline_td,
         "disconnected_5h": is_offline_5h,
@@ -268,7 +301,6 @@ def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
                 val = str(flat[cl]).strip()
                 if val != "":
                     return val
-        # Partial key match fallback
         for c in candidates:
             cl = c.lower()
             for fk, fv in flat.items():
@@ -301,6 +333,8 @@ def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
         "sector",
     )
     device_type = pick(
+        "devicename",
+        "device_name",
         "devicetype",
         "device_type",
         "type.name",
@@ -389,7 +423,6 @@ def extract_devices_from_ws(
                     all_parsed.append(dev)
                     page_added += 1
 
-            # Agar rows page_size se kam aayi hain to aage aur pages nahi hain
             if len(raw_rows) < page_size or page_added == 0:
                 break
         except Exception as exc:
@@ -493,21 +526,24 @@ def fetch_devices_multi_strategy(
     soup = BeautifulSoup(raw_html, "html.parser")
     now = datetime.now(timezone.utc)
 
-    _, tr_total, unparsed_ts = extract_devices_from_html_table(
+    _, tr_total, _ = extract_devices_from_html_table(
         soup, now, log_sample=log_sample
     )
     meta["tr_total"] = tr_total
-    meta["unparsed_ts_count"] = unparsed_ts
 
-    # Strategy 1: Direct WS Devices JSON endpoint (/Services/EF/WS/Devices)
     ws_devices = extract_devices_from_ws(session, now, log_sample=log_sample)
     if ws_devices:
+        meta["unparsed_ts_count"] = sum(
+            1 for d in ws_devices if d["last_seen"] is None
+        )
         meta["source"] = "ws-devices-json"
         return ws_devices, meta
 
-    # Strategy 2: HTML Table fallback
-    html_devices, _, _ = extract_devices_from_html_table(soup, now, log_sample=False)
+    html_devices, _, unparsed_ts = extract_devices_from_html_table(
+        soup, now, log_sample=False
+    )
     if len(html_devices) > 1:
+        meta["unparsed_ts_count"] = unparsed_ts
         meta["source"] = "html-table"
         return html_devices, meta
 
@@ -563,7 +599,7 @@ def run_self_analysis(
 
 def build_rich_local_summary(analysis: dict[str, Any]) -> str:
     off_lines = [
-        f"- {d['serial_no']} | {d['site']} | FW {d['firmware']} | Last: {d['timestamp_raw']}"
+        f"- {d['serial_no']} | {d['site']} | FW {d['firmware']} | Last: {d['display_time']}"
         for d in analysis["disconnected_5h_list"][:10]
     ]
     fw_summary = ", ".join(
@@ -572,7 +608,11 @@ def build_rich_local_summary(analysis: dict[str, Any]) -> str:
     return (
         f"Total Devices: {analysis['total']} | Online: {analysis['connected']} | Offline (>5h): {analysis['disconnected_5h_count']}\n"
         f"Firmware: {fw_summary}\n"
-        + ("Offline (>5h) Devices:\n" + "\n".join(off_lines) if off_lines else "Koi device >5h offline nahi hai.")
+        + (
+            "Offline (>5h) Devices:\n" + "\n".join(off_lines)
+            if off_lines
+            else "Koi device >5h offline nahi hai."
+        )
     )
 
 
@@ -627,13 +667,13 @@ def build_project_context(analysis: dict[str, Any]) -> str:
             "industry": d["industry"],
             "type": d["device_type"],
             "fw": d["firmware"],
-            "status": d["status"],
+            "status": d["conn_label"],
             "online": d["is_connected"],
             "offline_5h": d["disconnected_5h"],
             "offline_hours": round(d["offline_duration"].total_seconds() / 3600, 1)
             if d["offline_duration"]
             else None,
-            "last_seen": d["timestamp_raw"],
+            "last_seen": d["display_time"],
         }
         for d in analysis["all_devices"][:50]
     ]
@@ -689,6 +729,7 @@ def commands_menu_html() -> str:
         "• <code>/status</code> — Overview &amp; top offline sites\n"
         "• <code>/online</code> — Connected devices\n"
         "• <code>/offline</code> — Disconnected &gt; 5h\n"
+        "• <code>/allsite</code> — All sites with logger &amp; last connect time\n"
         "• <code>/site &lt;query&gt;</code> — Filter by site/industry\n"
         "• <code>/health</code> — Firmware &amp; parser diagnostics\n"
         "• <code>/ai &lt;msg&gt;</code> — Ask AI about your project\n"
@@ -740,7 +781,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "• Auto-login via <code>.ASPXAUTH</code> &amp; CSRF token\n"
             "• Continuous <b>5-Hour Disconnect</b> alert engine\n"
-            "• Live <b>Online / Offline / Site / Health</b> views\n"
+            "• Live <b>Online / Offline / AllSite / Health</b> views\n"
             "• Project-aware <b>/ai</b> assistant &amp; reports\n\n"
             "Kripya apna <b>Login ID / Email</b> bhejein:",
         ],
@@ -841,7 +882,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"▸ <b>Source:</b> <code>{esc(analysis['meta'].get('source'))}</code>\n\n"
             "<b>Priority Offline Sites (&gt;5h)</b>\n"
             f"{sites_lines}\n\n"
-            "<i>Commands: /online · /offline · /site · /health · /ai · /ai_analyze</i>"
+            "<i>Commands: /online · /offline · /allsite · /site · /health · /ai</i>"
         )
         await loader.edit_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
@@ -879,7 +920,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         for d in online_list[:25]:
             lines.append(
                 f"• <code>{esc(d['serial_no'])}</code> | <b>{esc(d['site'])}</b>\n"
-                f"  <i>FW {esc(d['firmware'])} · Last: {esc(d['timestamp_raw'])}</i>"
+                f"  <i>FW {esc(d['firmware'])} · Last: {esc(d['display_time'])}</i>"
             )
         if len(online_list) > 25:
             lines.append(f"\n<i>...aur {len(online_list) - 25} online devices hain.</i>")
@@ -929,7 +970,7 @@ async def offline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             lines.append(
                 f"• <code>{esc(d['serial_no'])}</code> | <b>{esc(d['site'])}</b>\n"
-                f"  <b>Down: {esc(hrs)}</b> · <i>Last: {esc(d['timestamp_raw'])}</i>"
+                f"  <b>Down: {esc(hrs)}</b> · <i>Last: {esc(d['display_time'])}</i>"
             )
         if len(off_list) > 20:
             lines.append(f"\n<i>...aur {len(off_list) - 20} offline devices hain.</i>")
@@ -938,6 +979,89 @@ async def offline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:
         await update.message.reply_text(
             f"<b>Offline List Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML
+        )
+
+
+async def allsite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text(
+            "Pehle <code>/login</code> ya <code>/start</code> se login karein.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    loader = await update.message.reply_text(
+        "<i>Saari sites aur data loggers load ho rahe hain...</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        LAST_SNAPSHOT[chat_id] = analysis
+        devices = analysis["all_devices"]
+
+        if not devices:
+            await loader.edit_text(
+                "<i>Koi site ya data logger nahi mila.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        chunk_lines: list[str] = []
+        sent_chunks = 0
+
+        for idx, d in enumerate(devices, start=1):
+            logger_name = (
+                d["serial_no"]
+                if d["device_type"] == "LOGPRO PLUS"
+                else f"{d['device_type']} ({d['serial_no']})"
+            )
+            entry = (
+                f"{idx}. <b>{esc(d['site'])}</b> — <code>{esc(logger_name)}</code> — "
+                f"<b>{esc(d['conn_label'])}</b> — <i>{esc(d['display_time'])}</i>"
+            )
+            chunk_lines.append(entry)
+
+            # Telegram message length limit (~4096 chars) ke andar chunk bhejein
+            if len("\n".join(chunk_lines)) > 3400:
+                header = (
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>ALL SITES ({len(devices)})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    if sent_chunks == 0
+                    else ""
+                )
+                if sent_chunks == 0:
+                    await loader.edit_text(
+                        header + "\n".join(chunk_lines), parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await update.message.reply_text(
+                        "\n".join(chunk_lines), parse_mode=ParseMode.HTML
+                    )
+                sent_chunks += 1
+                chunk_lines = []
+
+        if chunk_lines:
+            header = (
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>ALL SITES ({len(devices)})</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                if sent_chunks == 0
+                else ""
+            )
+            if sent_chunks == 0:
+                await loader.edit_text(
+                    header + "\n".join(chunk_lines), parse_mode=ParseMode.HTML
+                )
+            else:
+                await update.message.reply_text(
+                    "\n".join(chunk_lines), parse_mode=ParseMode.HTML
+                )
+    except Exception as exc:
+        await loader.edit_text(
+            f"<b>AllSite Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML
         )
 
 
@@ -982,10 +1106,9 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
         for d in matches[:20]:
-            state_tag = "ONLINE" if d["is_connected"] else "OFFLINE"
             lines.append(
-                f"• <code>{esc(d['serial_no'])}</code> [{esc(state_tag)}] — <b>{esc(d['site'])}</b>\n"
-                f"  <i>{esc(d['industry'])} · FW {esc(d['firmware'])} · {esc(d['timestamp_raw'])}</i>"
+                f"• <code>{esc(d['serial_no'])}</code> [{esc(d['conn_label'])}] — <b>{esc(d['site'])}</b>\n"
+                f"  <i>{esc(d['industry'])} · FW {esc(d['firmware'])} · {esc(d['display_time'])}</i>"
             )
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as exc:
@@ -1310,7 +1433,7 @@ async def background_monitor(app) -> None:
                             f"▸ <b>Industry:</b> {esc(dev['industry'])}\n"
                             f"▸ <b>Type / FW:</b> <code>{esc(dev['device_type'])}</code> · <code>{esc(dev['firmware'])}</code>\n"
                             f"▸ <b>Offline For:</b> <b>{esc(hrs)}</b>\n"
-                            f"▸ <b>Last Seen:</b> <code>{esc(dev['timestamp_raw'])}</code>"
+                            f"▸ <b>Last Seen:</b> <code>{esc(dev['display_time'])}</code>"
                         )
                         await app.bot.send_message(
                             chat_id=chat_id,
@@ -1348,6 +1471,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("online", online_cmd))
     app.add_handler(CommandHandler("offline", offline_cmd))
+    app.add_handler(CommandHandler("allsite", allsite_cmd))
     app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("debug_rows", debug_rows_cmd))
