@@ -10,7 +10,14 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from google import genai
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -59,7 +66,16 @@ def esc(text: Any) -> str:
     )
 
 
-def main_panel_keyboard() -> InlineKeyboardMarkup:
+def is_unassigned_value(val: str) -> bool:
+    v = (val or "").strip().lower()
+    return v in ("", "n/a", "na", "none", "null", "unassigned", "-")
+
+
+def is_unassigned_device(industry: str, site: str) -> bool:
+    return is_unassigned_value(industry) and is_unassigned_value(site)
+
+
+def main_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -71,18 +87,22 @@ def main_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔴 Offline >5h", callback_data="act:offline"),
             ],
             [
+                InlineKeyboardButton("📌 Unassigned N/A", callback_data="act:unassigned"),
                 InlineKeyboardButton("🩺 Health", callback_data="act:health"),
-                InlineKeyboardButton("🤖 AI Chat", callback_data="act:ai_mode"),
             ],
             [
+                InlineKeyboardButton("🤖 AI Chat", callback_data="act:ai_mode"),
                 InlineKeyboardButton("🧠 AI Report", callback_data="act:ai_analyze"),
+            ],
+            [
+                InlineKeyboardButton("📋 Summary", callback_data="act:summary"),
                 InlineKeyboardButton("🚪 Logout", callback_data="act:logout"),
             ],
         ]
     )
 
 
-def guest_panel_keyboard() -> InlineKeyboardMarkup:
+def guest_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔐 Login EnviroFRONT", callback_data="act:login")],
@@ -90,11 +110,49 @@ def guest_panel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def animate_message(msg, frames: list[str], delay: float = 0.35) -> None:
-    for frame in frames:
+def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("📊 Status"),
+                KeyboardButton("🌐 All Sites"),
+            ],
+            [
+                KeyboardButton("🟢 Online"),
+                KeyboardButton("🔴 Offline >5h"),
+            ],
+            [
+                KeyboardButton("📌 Unassigned N/A"),
+                KeyboardButton("🩺 Health"),
+            ],
+            [
+                KeyboardButton("🤖 AI Chat"),
+                KeyboardButton("🧠 AI Report"),
+            ],
+            [
+                KeyboardButton("📋 Summary"),
+                KeyboardButton("🚪 Logout"),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+async def animate_message(
+    msg, frames: list[str], delay: float = 0.35, final_markup=None
+) -> None:
+    total = len(frames)
+    for idx, frame in enumerate(frames):
+        is_last = idx == total - 1
         try:
-            await msg.edit_text(frame, parse_mode=ParseMode.HTML)
-            await asyncio.sleep(delay)
+            await msg.edit_text(
+                frame,
+                parse_mode=ParseMode.HTML,
+                reply_markup=final_markup if is_last else None,
+            )
+            if not is_last:
+                await asyncio.sleep(delay)
         except Exception:
             break
 
@@ -111,7 +169,7 @@ def extract_verification_token(html: str) -> str | None:
     return match.group(1) if match else None
 
 
-def login_envirofront(username: str, password: str) -> requests.Session | None:
+def login_envirofront(username: str, password: str) -> tuple[requests.Session | None, str]:
     session = requests.Session()
     session.headers.update(
         {
@@ -121,6 +179,7 @@ def login_envirofront(username: str, password: str) -> requests.Session | None:
             ),
             "Referer": LOGIN_URL,
             "Origin": BASE_URL,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     )
 
@@ -144,20 +203,37 @@ def login_envirofront(username: str, password: str) -> requests.Session | None:
             allow_redirects=False,
         )
 
-        has_auth_cookie = ".ASPXAUTH" in session.cookies.get_dict()
+        cookies_dict = session.cookies.get_dict()
+        has_auth_cookie = any(
+            k.upper().startswith(".ASPXAUTH") or "AUTH" in k.upper()
+            for k in cookies_dict
+        )
         loc = post_resp.headers.get("Location", "")
 
-        if post_resp.status_code == 302 and (
-            has_auth_cookie or "/pae/ControlPanel/Devices" in loc
+        if post_resp.status_code in (301, 302, 303) and (
+            has_auth_cookie or "/pae/ControlPanel/Devices" in loc or loc
         ):
             target = urljoin(BASE_URL, loc or "/pae/ControlPanel/Devices")
-            verify = session.get(target, timeout=25)
+            verify = session.get(target, timeout=25, allow_redirects=True)
+            if (
+                verify.ok
+                and "Forgot Password?" not in verify.text
+                and "UserName" not in verify.text
+            ):
+                return session, "OK"
+            return None, "Login page wapas aaya — ID ya Password galat ho sakta hai."
+
+        if post_resp.status_code == 200 and has_auth_cookie:
+            verify = session.get(DEVICES_URL, timeout=25, allow_redirects=True)
             if verify.ok and "Forgot Password?" not in verify.text:
-                return session
+                return session, "OK"
+
+        return None, f"Auth reject hua (HTTP {post_resp.status_code}). Credentials check karein."
+    except requests.Timeout:
+        return None, "EnviroFRONT server timeout ho gaya. Dobara try karein."
     except Exception as exc:
         logger.error("Login exception: %s", exc)
-
-    return None
+        return None, f"Network/Login error: {exc}"
 
 
 def parse_timestamp(raw: str) -> datetime | None:
@@ -198,19 +274,22 @@ def format_display_time(dt_utc: datetime | None, fallback_raw: str) -> str:
 
 
 def format_industry_with_type(industry: str, site_type: str) -> str:
-    ind = (industry or "N/A").strip() or "N/A"
-    stype = (site_type or "N/A").strip() or "N/A"
-    if ind != "N/A" and stype != "N/A":
-        return f"<b>{esc(ind)}</b> <code>({esc(stype)})</code>"
-    if ind != "N/A":
-        return f"<b>{esc(ind)}</b>"
-    return f"<b>{esc(stype)}</b>"
+    ind_unassigned = is_unassigned_value(industry)
+    type_unassigned = is_unassigned_value(site_type)
+
+    if ind_unassigned and type_unassigned:
+        return "<code>SITE ASSIGN NAHI HAI (N/A)</code>"
+    if ind_unassigned:
+        return f"<code>SITE ASSIGN NAHI HAI ({esc(site_type.strip())})</code>"
+    if type_unassigned:
+        return f"<code>{esc(industry.strip())}</code>"
+    return f"<code>{esc(industry.strip())} ({esc(site_type.strip())})</code>"
 
 
 def format_status_with_time(is_connected: bool, display_time: str) -> str:
     if is_connected:
-        return f"🟢 <b>ONLINE</b> <code>({esc(display_time)})</code>"
-    return f"🔴 <b>DISCONNECTED</b> <code>({esc(display_time)})</code>"
+        return f"🟢 <code>ONLINE ({esc(display_time)})</code>"
+    return f"🔴 <code>DISCONNECTED ({esc(display_time)})</code>"
 
 
 def build_device_record(
@@ -224,8 +303,8 @@ def build_device_record(
     now: datetime,
 ) -> dict[str, Any]:
     s_clean = (serial_no or "N/A").strip() or "N/A"
-    ind_clean = (industry or "N/A").strip() or "N/A"
-    site_clean = (site or "N/A").strip() or "N/A"
+    ind_clean = "N/A" if is_unassigned_value(industry) else industry.strip()
+    site_clean = "N/A" if is_unassigned_value(site) else site.strip()
     type_clean = (device_type or "LOGPRO PLUS").strip() or "LOGPRO PLUS"
     fw_clean = (firmware or "N/A").strip() or "N/A"
     st_clean = (status_text or "").strip()
@@ -256,6 +335,7 @@ def build_device_record(
     )
 
     display_ts = format_display_time(last_seen, ts_clean)
+    unassigned_flag = is_unassigned_device(ind_clean, site_clean)
 
     return {
         "serial_no": s_clean,
@@ -271,6 +351,7 @@ def build_device_record(
         "last_seen": last_seen,
         "offline_duration": offline_td,
         "disconnected_5h": is_offline_5h,
+        "is_unassigned": unassigned_flag,
     }
 
 
@@ -380,12 +461,12 @@ def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
         "sector",
     )
     device_type = pick(
-        "devicename",
-        "device_name",
         "devicetype",
         "device_type",
         "type.name",
         "type",
+        "devicename",
+        "device_name",
         default="LOGPRO PLUS",
     )
     firmware = pick(
@@ -458,9 +539,6 @@ def extract_devices_from_ws(
             if not raw_rows:
                 break
 
-            if log_sample and page == 1:
-                logger.info("WS first item keys/sample: %s", str(raw_rows[0])[:500])
-
             page_added = 0
             for item in raw_rows:
                 dev = parse_ws_device_item(item, now)
@@ -483,12 +561,6 @@ def extract_devices_from_html_table(
     soup: BeautifulSoup, now: datetime, log_sample: bool = False
 ) -> tuple[list[dict[str, Any]], int, int]:
     all_trs = soup.select("tr")
-    if log_sample:
-        logger.info("Total <tr> in HTML: %d", len(all_trs))
-        for idx, tr in enumerate(all_trs[:5]):
-            snippet = " | ".join(tr.get_text(" ", strip=True).split())[:260]
-            logger.info("Sample TR[%d]: %s", idx, snippet)
-
     devices: list[dict[str, Any]] = []
     unparsed_ts = 0
 
@@ -603,7 +675,8 @@ def run_self_analysis(
 ) -> dict[str, Any]:
     devices, meta = fetch_devices_multi_strategy(session, log_sample=log_sample)
 
-    total = len(devices)
+    assigned_devices = [d for d in devices if not d["is_unassigned"]]
+    unassigned_list = [d for d in devices if d["is_unassigned"]]
     online_list = [d for d in devices if d["is_connected"]]
     offline_5h_list = [d for d in devices if d["disconnected_5h"]]
 
@@ -616,28 +689,40 @@ def run_self_analysis(
 
     site_offline_counts: dict[str, int] = {}
     fw_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
 
     for d in devices:
         fw = d["firmware"] or "Unknown"
         fw_counts[fw] = fw_counts.get(fw, 0) + 1
-        if d["disconnected_5h"]:
-            ind = d["industry"] if d["industry"] != "N/A" else d["site"]
-            stype = d["site"] if d["industry"] != "N/A" else "N/A"
-            site_label = f"{ind} ({stype})" if stype != "N/A" else ind
+
+        dtype = d["device_type"] or "Unknown"
+        type_counts[dtype] = type_counts.get(dtype, 0) + 1
+
+        if d["disconnected_5h"] and not d["is_unassigned"]:
+            site_label = (
+                f"{d['industry']} ({d['site']})"
+                if d["site"] != "N/A"
+                else d["industry"]
+            )
             site_offline_counts[site_label] = site_offline_counts.get(site_label, 0) + 1
 
     top_sites = sorted(site_offline_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
     return {
         "checked_at_ist": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
-        "total": total,
+        "total": len(devices),
+        "assigned_count": len(assigned_devices),
         "connected": len(online_list),
         "disconnected_5h_count": len(offline_5h_list),
+        "unassigned_count": len(unassigned_list),
         "all_devices": devices,
+        "assigned_devices": assigned_devices,
         "online_list": online_list,
         "disconnected_5h_list": offline_5h_list,
+        "unassigned_list": unassigned_list,
         "top_offline_sites": top_sites,
         "firmware_breakdown": fw_counts,
+        "device_type_breakdown": type_counts,
         "meta": meta,
     }
 
@@ -650,8 +735,14 @@ def build_rich_local_summary(analysis: dict[str, Any]) -> str:
     fw_summary = ", ".join(
         f"{k}: {v}" for k, v in analysis["firmware_breakdown"].items()
     ) or "N/A"
+    type_summary = ", ".join(
+        f"{k}: {v}" for k, v in analysis["device_type_breakdown"].items()
+    ) or "N/A"
     return (
-        f"Total: {analysis['total']} | Online: {analysis['connected']} | Disconnected (>5h): {analysis['disconnected_5h_count']}\n"
+        f"Total: {analysis['total']} | Assigned Sites: {analysis['assigned_count']} | "
+        f"Unassigned (N/A): {analysis['unassigned_count']} | Online: {analysis['connected']} | "
+        f"Disconnected (>5h): {analysis['disconnected_5h_count']}\n"
+        f"Device Types: {type_summary}\n"
         f"Firmware: {fw_summary}\n"
         + (
             "Disconnected (>5h):\n" + "\n".join(off_lines)
@@ -710,7 +801,8 @@ def build_project_context(analysis: dict[str, Any]) -> str:
             "serial": d["serial_no"],
             "industry": d["industry"],
             "site_type": d["site"],
-            "type": d["device_type"],
+            "unassigned": d["is_unassigned"],
+            "device_type": d["device_type"],
             "fw": d["firmware"],
             "status": d["conn_label"],
             "online": d["is_connected"],
@@ -725,9 +817,12 @@ def build_project_context(analysis: dict[str, Any]) -> str:
     return (
         f"Checked At: {analysis['checked_at_ist']}\n"
         f"Total Devices: {analysis['total']}\n"
+        f"Assigned Sites Count: {analysis['assigned_count']}\n"
+        f"Unassigned (N/A) Count: {analysis['unassigned_count']}\n"
         f"Online Devices: {analysis['connected']}\n"
         f"Offline (>5h) Count: {analysis['disconnected_5h_count']}\n"
         f"Top Offline Sites: {analysis['top_offline_sites']}\n"
+        f"Device Type Breakdown: {analysis['device_type_breakdown']}\n"
         f"Firmware Breakdown: {analysis['firmware_breakdown']}\n"
         f"Parser/Server Meta: {analysis['meta']}\n"
         f"Devices (up to 50): {compact_devices}"
@@ -742,7 +837,7 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
         "Hinglish mein crisp, executive aur actionable analysis do:\n"
         "1. Overall Health & Risk Level\n"
         "2. Sabse Critical Industries / Sites (>5h offline)\n"
-        "3. Firmware / Connectivity Patterns\n"
+        "3. Unassigned (N/A) Devices, Device Types & Firmware Patterns\n"
         "4. Immediate Action Checklist\n\n"
         f"{context_str}"
     )
@@ -754,7 +849,7 @@ def answer_project_question(user_question: str, analysis: dict[str, Any]) -> str
     prompt = (
         "Tum EnviroFRONT (M2MLogger) telemetry monitoring bot aur dashboard ke dedicated AI assistant ho. "
         "User ke message ka jawab sirf is project ke live devices, industries, site types, serials, firmware, "
-        "timestamps aur alerts ke context mein Hinglish mein do.\n\n"
+        "device types, unassigned (N/A) devices, timestamps aur alerts ke context mein Hinglish mein do.\n\n"
         f"LIVE PROJECT DATA:\n{context_str}\n\n"
         f"USER MESSAGE:\n{user_question}"
     )
@@ -769,9 +864,9 @@ def require_auth(chat_id: int) -> dict[str, Any] | None:
 
 
 # ==============================================================================
-# ACTION RUNNERS (SHARED BY COMMANDS & BUTTONS)
+# ACTION RUNNERS (DM + ALL GROUPS)
 # ==============================================================================
-async def send_start_view(chat_id: int, bot, send_fn) -> None:
+async def send_start_view(chat_id: int, send_fn) -> None:
     existing = require_auth(chat_id)
     if existing:
         msg = (
@@ -781,10 +876,19 @@ async def send_start_view(chat_id: int, bot, send_fn) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 <b>Account:</b> <code>{esc(existing.get('username'))}</code>\n"
             "🟢 <b>Session:</b> <b>AUTHENTICATED</b>\n"
-            "🔔 <b>5h Auto-Alert:</b> <b>ACTIVE (Single Grouped Msg)</b>\n\n"
-            "<i>Neeche diye gaye buttons se direct action karein:</i>"
+            "🔔 <b>5h Auto-Alert:</b> <b>ACTIVE (1 Grouped Msg)</b>\n\n"
+            "<i>Buttons ya 4-dot command menu se chalayein:</i>"
         )
-        await send_fn(msg, parse_mode=ParseMode.HTML, reply_markup=main_panel_keyboard())
+        await send_fn(
+            msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
+        )
+        await send_fn(
+            "🎛️ <b>Quick Controls Ready</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bottom_reply_keyboard(),
+        )
         return
 
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
@@ -794,6 +898,7 @@ async def send_start_view(chat_id: int, bot, send_fn) -> None:
         "<i>Initializing Console...</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode=ParseMode.HTML,
+        reply_markup=guest_inline_keyboard(),
     )
     await animate_message(
         intro,
@@ -809,6 +914,7 @@ async def send_start_view(chat_id: int, bot, send_fn) -> None:
             "🔐 Kripya apna <b>Login ID / Email</b> bhejein:",
         ],
         delay=0.35,
+        final_markup=guest_inline_keyboard(),
     )
 
 
@@ -821,7 +927,7 @@ async def send_login_prompt(chat_id: int, send_fn) -> None:
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Kripya apna <b>Login ID / Email</b> bhejein:",
         parse_mode=ParseMode.HTML,
-        reply_markup=guest_panel_keyboard(),
+        reply_markup=guest_inline_keyboard(),
     )
 
 
@@ -849,22 +955,12 @@ async def send_logout_action(chat_id: int, send_fn) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🚪 <b>LOGGED OUT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Session aur alerts band kar diye gaye hain.",
-        ],
-        delay=0.3,
-    )
-    try:
-        await status_msg.edit_text(
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🚪 <b>LOGGED OUT</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Session aur alerts band kar diye gaye hain.\n"
             "Dobara login ke liye neeche button dabayein:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
-        )
-    except Exception:
-        pass
+        ],
+        delay=0.3,
+        final_markup=guest_inline_keyboard(),
+    )
 
 
 async def send_status_action(chat_id: int, send_fn) -> None:
@@ -873,7 +969,7 @@ async def send_status_action(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
@@ -891,17 +987,17 @@ async def send_status_action(chat_id: int, send_fn) -> None:
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "EnviroFRONT ne <code>500 Internal Server Error</code> return kiya hai.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
             return
 
         sites_lines = (
             "\n".join(
-                f"  {i}. 🔴 <b>{esc(s)}</b> — <code>{c}</code> disconnected"
+                f"  {i}. <code>{esc(s)} — {c} disconnected</code>"
                 for i, (s, c) in enumerate(analysis["top_offline_sites"], start=1)
             )
             if analysis["top_offline_sites"]
-            else "  ✨ <i>Koi critical offline site nahi</i>"
+            else "  ✨ <code>Koi critical offline site nahi</code>"
         )
 
         msg = (
@@ -910,19 +1006,58 @@ async def send_status_action(chat_id: int, send_fn) -> None:
             f"🕒 <i>{esc(analysis['checked_at_ist'])}</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📦 <b>Total Devices:</b> <code>{analysis['total']}</code>\n"
+            f"🏭 <b>Assigned Sites:</b> <code>{analysis['assigned_count']}</code>\n"
+            f"📌 <b>Unassigned (N/A):</b> <code>{analysis['unassigned_count']}</code>\n"
             f"🟢 <b>Online:</b> <code>{analysis['connected']}</code>\n"
             f"🔴 <b>Disconnected (&gt;5h):</b> <code>{analysis['disconnected_5h_count']}</code>\n\n"
             "<b>Priority Offline (&gt;5h)</b>\n"
             f"{sites_lines}"
         )
         await loader.edit_text(
-            msg, parse_mode=ParseMode.HTML, reply_markup=main_panel_keyboard()
+            msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
         )
     except Exception as exc:
         await loader.edit_text(
             f"❌ <b>Status Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
+        )
+
+
+async def send_summary_action(chat_id: int, send_fn) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await send_fn(
+            "🔒 Pehle login karein:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=guest_inline_keyboard(),
+        )
+        return
+
+    try:
+        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+            run_self_analysis, sess_data["session"]
+        )
+        LAST_SNAPSHOT[chat_id] = analysis
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📋 <b>QUICK TELEMETRY SUMMARY</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<code>Total       : {analysis['total']}</code>\n"
+            f"<code>Assigned    : {analysis['assigned_count']}</code>\n"
+            f"<code>Unassigned  : {analysis['unassigned_count']}</code>\n"
+            f"<code>Online      : {analysis['connected']}</code>\n"
+            f"<code>Offline >5h : {analysis['disconnected_5h_count']}</code>\n"
+            f"<code>Checked     : {esc(analysis['checked_at_ist'])}</code>"
+        )
+        await send_fn(
+            msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
+        )
+    except Exception as exc:
+        await send_fn(
+            f"❌ <b>Summary Error:</b> <code>{esc(exc)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
         )
 
 
@@ -932,7 +1067,7 @@ async def send_online_action(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
@@ -943,9 +1078,9 @@ async def send_online_action(chat_id: int, send_fn) -> None:
 
         if not online_list:
             await send_fn(
-                "🟡 <i>Koi online device nahi mila.</i>",
+                "🟡 <code>Koi online device nahi mila.</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
             return
 
@@ -961,18 +1096,18 @@ async def send_online_action(chat_id: int, send_fn) -> None:
                 f"   {format_status_with_time(True, d['display_time'])}"
             )
         if len(online_list) > 25:
-            lines.append(f"\n<i>...aur {len(online_list) - 25} online devices hain.</i>")
+            lines.append(f"\n<code>...aur {len(online_list) - 25} online devices hain.</code>")
 
         await send_fn(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
     except Exception as exc:
         await send_fn(
             f"❌ <b>Online Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
 
 
@@ -982,7 +1117,7 @@ async def send_offline_action(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
@@ -996,9 +1131,9 @@ async def send_offline_action(chat_id: int, send_fn) -> None:
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "🟢 <b>OFFLINE MONITOR (&gt;5h)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>Sabhi devices 5 ghante ke andar active hain.</i>",
+                "<code>Sabhi devices 5 ghante ke andar active hain.</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
             return
 
@@ -1014,18 +1149,93 @@ async def send_offline_action(chat_id: int, send_fn) -> None:
                 f"   {format_status_with_time(False, d['display_time'])}"
             )
         if len(off_list) > 25:
-            lines.append(f"\n<i>...aur {len(off_list) - 25} disconnected devices hain.</i>")
+            lines.append(f"\n<code>...aur {len(off_list) - 25} disconnected devices hain.</code>")
 
         await send_fn(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
     except Exception as exc:
         await send_fn(
             f"❌ <b>Offline Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
+        )
+
+
+async def send_unassigned_action(chat_id: int, send_fn) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await send_fn(
+            "🔒 Pehle login karein:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=guest_inline_keyboard(),
+        )
+        return
+
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        LAST_SNAPSHOT[chat_id] = analysis
+        unassigned_list = analysis["unassigned_list"]
+
+        if not unassigned_list:
+            await send_fn(
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📌 <b>UNASSIGNED SITES (N/A)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<code>Koi N/A unassigned device nahi mila.</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_inline_keyboard(),
+            )
+            return
+
+        formatted_entries: list[str] = []
+        for idx, d in enumerate(unassigned_list, start=1):
+            formatted_entries.append(
+                f"{idx}. <code>{esc(d['serial_no'])} | Type: {esc(d['site'])} | {esc(d['device_type'])}</code>\n"
+                f"   <code>In par abhi site assign nahi hai</code> — "
+                f"{format_status_with_time(d['is_connected'], d['display_time'])}"
+            )
+
+        chunk_lines: list[str] = []
+        sent_chunks = 0
+        for line in formatted_entries:
+            chunk_lines.append(line)
+            if len("\n".join(chunk_lines)) > 3300:
+                header = (
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 <b>UNASSIGNED N/A — SITE ASSIGN NAHI HAI ({len(unassigned_list)})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    if sent_chunks == 0
+                    else ""
+                )
+                await send_fn(
+                    header + "\n".join(chunk_lines),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_inline_keyboard() if sent_chunks == 0 else None,
+                )
+                sent_chunks += 1
+                chunk_lines = []
+
+        if chunk_lines:
+            header = (
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>UNASSIGNED N/A — SITE ASSIGN NAHI HAI ({len(unassigned_list)})</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                if sent_chunks == 0
+                else ""
+            )
+            await send_fn(
+                header + "\n".join(chunk_lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_inline_keyboard(),
+            )
+    except Exception as exc:
+        await send_fn(
+            f"❌ <b>Unassigned Error:</b> <code>{esc(exc)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
         )
 
 
@@ -1035,47 +1245,49 @@ async def send_allsite_action(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
     loader = await send_fn(
-        "<i>🌐 Saari industries &amp; data loggers load ho rahe hain...</i>",
+        "<i>🌐 Assigned sites load ho rahi hain...</i>",
         parse_mode=ParseMode.HTML,
     )
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
-        devices = analysis["all_devices"]
+        assigned_devs = analysis["assigned_devices"]
 
-        if not devices:
+        if not assigned_devs:
             await loader.edit_text(
-                "<i>Koi device nahi mila.</i>",
+                "<code>Koi assigned site nahi mili.</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
             return
 
-        chunk_lines: list[str] = []
-        sent_chunks = 0
-
-        for idx, d in enumerate(devices, start=1):
+        formatted_entries: list[str] = []
+        for idx, d in enumerate(assigned_devs, start=1):
             logger_name = (
                 d["serial_no"]
                 if d["device_type"] == "LOGPRO PLUS"
                 else f"{d['device_type']} ({d['serial_no']})"
             )
-            entry = (
+            formatted_entries.append(
                 f"{idx}. {format_industry_with_type(d['industry'], d['site'])} — "
                 f"<code>{esc(logger_name)}</code> — "
                 f"{format_status_with_time(d['is_connected'], d['display_time'])}"
             )
-            chunk_lines.append(entry)
 
+        chunk_lines: list[str] = []
+        sent_chunks = 0
+
+        for line in formatted_entries:
+            chunk_lines.append(line)
             if len("\n".join(chunk_lines)) > 3300:
                 header = (
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🌐 <b>ALL SITES ({len(devices)})</b>\n"
+                    f"🌐 <b>ALL ASSIGNED SITES ({len(assigned_devs)})</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
                     if sent_chunks == 0
                     else ""
@@ -1092,7 +1304,7 @@ async def send_allsite_action(chat_id: int, send_fn) -> None:
         if chunk_lines:
             header = (
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌐 <b>ALL SITES ({len(devices)})</b>\n"
+                f"🌐 <b>ALL ASSIGNED SITES ({len(assigned_devs)})</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 if sent_chunks == 0
                 else ""
@@ -1101,19 +1313,19 @@ async def send_allsite_action(chat_id: int, send_fn) -> None:
                 await loader.edit_text(
                     header + "\n".join(chunk_lines),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=main_panel_keyboard(),
+                    reply_markup=main_inline_keyboard(),
                 )
             else:
                 await send_fn(
                     "\n".join(chunk_lines),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=main_panel_keyboard(),
+                    reply_markup=main_inline_keyboard(),
                 )
     except Exception as exc:
         await loader.edit_text(
             f"❌ <b>AllSite Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
 
 
@@ -1123,21 +1335,33 @@ async def send_health_action(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        LAST_SNAPSHOT[chat_id] = analysis
         meta = analysis["meta"]
+
+        type_lines = (
+            "\n".join(
+                f"  <code>{esc(dt)} : {cnt} devices</code>"
+                for dt, cnt in sorted(
+                    analysis["device_type_breakdown"].items(), key=lambda x: -x[1]
+                )
+            )
+            or "  <code>No device type data</code>"
+        )
+
         fw_lines = (
             "\n".join(
-                f"  🔹 FW <code>{esc(fw)}</code>: <b>{cnt}</b>"
+                f"  <code>FW {esc(fw)} : {cnt} devices</code>"
                 for fw, cnt in sorted(
                     analysis["firmware_breakdown"].items(), key=lambda x: -x[1]
                 )
             )
-            or "  <i>No firmware data</i>"
+            or "  <code>No firmware data</code>"
         )
 
         msg = (
@@ -1146,19 +1370,23 @@ async def send_health_action(chat_id: int, send_fn) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▸ <b>Server HTTP 500:</b> <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
             f"▸ <b>Source:</b> <code>{esc(meta.get('source', 'none'))}</code>\n"
-            f"▸ <b>Parsed Devices:</b> <code>{analysis['total']}</code>\n"
+            f"▸ <b>Total Parsed:</b> <code>{analysis['total']}</code>\n"
+            f"▸ <b>Assigned Sites:</b> <code>{analysis['assigned_count']}</code>\n"
+            f"▸ <b>Unassigned (N/A):</b> <code>{analysis['unassigned_count']}</code>\n"
             f"▸ <b>Unparsed TS:</b> <code>{meta['unparsed_ts_count']}</code>\n\n"
+            "<b>Device Type Distribution</b>\n"
+            f"{type_lines}\n\n"
             "<b>Firmware Distribution</b>\n"
             f"{fw_lines}"
         )
         await send_fn(
-            msg, parse_mode=ParseMode.HTML, reply_markup=main_panel_keyboard()
+            msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
         )
     except Exception as exc:
         await send_fn(
             f"❌ <b>Health Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
 
 
@@ -1168,7 +1396,7 @@ async def send_ai_mode_prompt(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
@@ -1180,7 +1408,7 @@ async def send_ai_mode_prompt(chat_id: int, send_fn) -> None:
         "Ab apna sawaal type karein—AI aapke EnviroFRONT project ke live data ke hisaab se jawab dega.\n"
         "Bahar jaane ke liye <code>/exit_ai</code> bhejein.",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_panel_keyboard(),
+        reply_markup=main_inline_keyboard(),
     )
 
 
@@ -1190,7 +1418,7 @@ async def send_ai_report_action(chat_id: int, send_fn) -> None:
         await send_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
@@ -1216,67 +1444,82 @@ async def send_ai_report_action(chat_id: int, send_fn) -> None:
             "🧠 <b>AI SELF-ANALYSIS REPORT</b>\n"
             f"🕒 <i>{esc(analysis['checked_at_ist'])}</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{esc(ai_text)}"
+            f"<code>{esc(ai_text)}</code>"
         )
         await status_box.edit_text(
-            msg, parse_mode=ParseMode.HTML, reply_markup=main_panel_keyboard()
+            msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
         )
     except Exception as exc:
         await status_box.edit_text(
             f"❌ <b>AI Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
 
 
 # ==============================================================================
 # COMMAND & CALLBACK HANDLERS
 # ==============================================================================
+def get_reply_fn(update: Update):
+    if update.effective_message:
+        return update.effective_message.reply_text
+    raise RuntimeError("No effective message found")
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_start_view(update.effective_chat.id, context.bot, update.message.reply_text)
+    await send_start_view(update.effective_chat.id, get_reply_fn(update))
 
 
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_login_prompt(update.effective_chat.id, update.message.reply_text)
+    await send_login_prompt(update.effective_chat.id, get_reply_fn(update))
 
 
 async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_logout_action(update.effective_chat.id, update.message.reply_text)
+    await send_logout_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_status_action(update.effective_chat.id, update.message.reply_text)
+    await send_status_action(update.effective_chat.id, get_reply_fn(update))
+
+
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_summary_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_online_action(update.effective_chat.id, update.message.reply_text)
+    await send_online_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def offline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_offline_action(update.effective_chat.id, update.message.reply_text)
+    await send_offline_action(update.effective_chat.id, get_reply_fn(update))
+
+
+async def unassigned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_unassigned_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def allsite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_allsite_action(update.effective_chat.id, update.message.reply_text)
+    await send_allsite_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    reply_fn = get_reply_fn(update)
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await update.message.reply_text(
+        await reply_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
     query = " ".join(context.args or []).strip().lower()
     if not query:
-        await update.message.reply_text(
+        await reply_fn(
             "Usage: <code>/site &lt;industry ya type ya serial&gt;</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
         return
 
@@ -1288,12 +1531,13 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if query in d["site"].lower()
             or query in d["industry"].lower()
             or query in d["serial_no"].lower()
+            or query in d["device_type"].lower()
         ]
         if not matches:
-            await update.message.reply_text(
-                f"<code>{esc(query)}</code> se match karne wala koi device nahi mila.",
+            await reply_fn(
+                f"<code>{esc(query)} se match karne wala koi device nahi mila.</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
             return
 
@@ -1305,43 +1549,44 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for idx, d in enumerate(matches[:20], start=1):
             lines.append(
                 f"{idx}. {format_industry_with_type(d['industry'], d['site'])} | "
-                f"<code>{esc(d['serial_no'])}</code>\n"
+                f"<code>{esc(d['serial_no'])} ({esc(d['device_type'])})</code>\n"
                 f"   {format_status_with_time(d['is_connected'], d['display_time'])}"
             )
-        await update.message.reply_text(
+        await reply_fn(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
     except Exception as exc:
-        await update.message.reply_text(
+        await reply_fn(
             f"❌ <b>Site Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
 
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_health_action(update.effective_chat.id, update.message.reply_text)
+    await send_health_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    reply_fn = get_reply_fn(update)
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await update.message.reply_text(
+        await reply_fn(
             "🔒 Pehle login karein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
         return
 
     question = " ".join(context.args or []).strip()
     if not question:
-        await send_ai_mode_prompt(chat_id, update.message.reply_text)
+        await send_ai_mode_prompt(chat_id, reply_fn)
         return
 
-    thinking = await update.message.reply_text(
+    thinking = await reply_fn(
         "<i>🤖 Project data ke hisaab se jawab ban raha hai...</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -1357,34 +1602,34 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🤖 <b>PROJECT AI ASSISTANT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{esc(reply_txt)}",
+            f"<code>{esc(reply_txt)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
     except Exception as exc:
         await thinking.edit_text(
             f"❌ <b>AI Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_panel_keyboard(),
+            reply_markup=main_inline_keyboard(),
         )
 
 
 async def exit_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     AI_CHAT_MODE.discard(update.effective_chat.id)
-    await update.message.reply_text(
-        "<i>AI mode band kar diya gaya hai.</i>",
+    await get_reply_fn(update)(
+        "<code>AI mode band kar diya gaya hai.</code>",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_panel_keyboard(),
+        reply_markup=main_inline_keyboard(),
     )
 
 
 async def ai_analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_ai_report_action(update.effective_chat.id, update.message.reply_text)
+    await send_ai_report_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query:
+    if not query or not query.message:
         return
     await query.answer()
     chat_id = query.message.chat.id
@@ -1404,10 +1649,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_logout_action(chat_id, send_via_chat)
     elif data == "act:status":
         await send_status_action(chat_id, send_via_chat)
+    elif data == "act:summary":
+        await send_summary_action(chat_id, send_via_chat)
     elif data == "act:online":
         await send_online_action(chat_id, send_via_chat)
     elif data == "act:offline":
         await send_offline_action(chat_id, send_via_chat)
+    elif data == "act:unassigned":
+        await send_unassigned_action(chat_id, send_via_chat)
     elif data == "act:allsite":
         await send_allsite_action(chat_id, send_via_chat)
     elif data == "act:health":
@@ -1418,15 +1667,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_ai_report_action(chat_id, send_via_chat)
 
 
+REPLY_BUTTON_MAP: dict[str, str] = {
+    "📊 status": "status",
+    "🌐 all sites": "allsite",
+    "🟢 online": "online",
+    "🔴 offline >5h": "offline",
+    "📌 unassigned n/a": "unassigned",
+    "🩺 health": "health",
+    "🤖 ai chat": "ai_mode",
+    "🧠 ai report": "ai_analyze",
+    "📋 summary": "summary",
+    "🚪 logout": "logout",
+}
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
     chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
+    chat_type = update.effective_chat.type
+    text = (update.effective_message.text or "").strip()
+    reply_fn = update.effective_message.reply_text
     state = USER_SESSIONS.get(chat_id)
 
     if state and state.get("step") == "awaiting_username":
         state["username"] = text
         state["step"] = "awaiting_password"
-        await update.message.reply_text(
+        await reply_fn(
             "🔑 Ab apna <b>Password</b> bhejein:", parse_mode=ParseMode.HTML
         )
         return
@@ -1436,11 +1703,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         password = text
 
         try:
-            await update.message.delete()
+            await update.effective_message.delete()
         except Exception:
             pass
 
-        auth_box = await update.message.reply_text(
+        auth_box = await reply_fn(
             "<i>🔐 Session verify ho raha hai...</i>",
             parse_mode=ParseMode.HTML,
         )
@@ -1450,10 +1717,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "<i>Verifying .ASPXAUTH &amp; CSRF [■■□]</i>",
                 "<i>Handshaking with EnviroFRONT [■■■]</i>",
             ],
-            delay=0.35,
+            delay=0.3,
         )
 
-        session = await asyncio.to_thread(login_envirofront, username, password)
+        session, reason = await asyncio.to_thread(
+            login_envirofront, username, password
+        )
 
         if session:
             USER_SESSIONS[chat_id] = {
@@ -1468,28 +1737,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"👤 <b>Account:</b> <code>{esc(username)}</code>\n"
                 "🔔 <b>5h Auto-Alert:</b> <b>ACTIVE (1 Grouped Msg)</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
+            )
+            await reply_fn(
+                "🎛️ <b>Panel Buttons Active</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bottom_reply_keyboard(),
             )
         else:
             USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
             await auth_box.edit_text(
-                "❌ <b>Login fail ho gaya.</b> Dobara apna <b>Login ID / Email</b> bhejein:",
+                f"❌ <b>Login fail:</b> <code>{esc(reason)}</code>\n\n"
+                "Dobara apna <b>Login ID / Email</b> bhejein:",
                 parse_mode=ParseMode.HTML,
+                reply_markup=guest_inline_keyboard(),
             )
+        return
+
+    mapped_action = REPLY_BUTTON_MAP.get(text.lower())
+    if mapped_action:
+        if mapped_action == "status":
+            await send_status_action(chat_id, reply_fn)
+        elif mapped_action == "allsite":
+            await send_allsite_action(chat_id, reply_fn)
+        elif mapped_action == "online":
+            await send_online_action(chat_id, reply_fn)
+        elif mapped_action == "offline":
+            await send_offline_action(chat_id, reply_fn)
+        elif mapped_action == "unassigned":
+            await send_unassigned_action(chat_id, reply_fn)
+        elif mapped_action == "health":
+            await send_health_action(chat_id, reply_fn)
+        elif mapped_action == "ai_mode":
+            await send_ai_mode_prompt(chat_id, reply_fn)
+        elif mapped_action == "ai_analyze":
+            await send_ai_report_action(chat_id, reply_fn)
+        elif mapped_action == "summary":
+            await send_summary_action(chat_id, reply_fn)
+        elif mapped_action == "logout":
+            await send_logout_action(chat_id, reply_fn)
         return
 
     if chat_id in AI_CHAT_MODE:
         sess_data = require_auth(chat_id)
         if not sess_data:
             AI_CHAT_MODE.discard(chat_id)
-            await update.message.reply_text(
+            await reply_fn(
                 "🔒 Pehle login karein:",
                 parse_mode=ParseMode.HTML,
-                reply_markup=guest_panel_keyboard(),
+                reply_markup=guest_inline_keyboard(),
             )
             return
 
-        ans_msg = await update.message.reply_text(
+        ans_msg = await reply_fn(
             "<i>🤖 Project data ke hisaab se jawab ban raha hai...</i>",
             parse_mode=ParseMode.HTML,
         )
@@ -1505,23 +1805,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "🤖 <b>PROJECT AI ASSISTANT</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{esc(reply_txt)}",
+                f"<code>{esc(reply_txt)}</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
         except Exception as exc:
             await ans_msg.edit_text(
                 f"❌ <b>AI Error:</b> <code>{esc(exc)}</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_panel_keyboard(),
+                reply_markup=main_inline_keyboard(),
             )
         return
 
-    if not state:
-        await update.message.reply_text(
+    if chat_type == "private" and not state:
+        await reply_fn(
             "🔒 Login ke liye button dabayein:",
             parse_mode=ParseMode.HTML,
-            reply_markup=guest_panel_keyboard(),
+            reply_markup=guest_inline_keyboard(),
         )
 
 
@@ -1567,7 +1867,7 @@ async def background_monitor(app) -> None:
                                 chat_id=chat_id,
                                 text=header + "\n".join(chunk),
                                 parse_mode=ParseMode.HTML,
-                                reply_markup=main_panel_keyboard(),
+                                reply_markup=main_inline_keyboard(),
                             )
                             chunk = [row]
                         else:
@@ -1578,7 +1878,7 @@ async def background_monitor(app) -> None:
                             chat_id=chat_id,
                             text=header + "\n".join(chunk),
                             parse_mode=ParseMode.HTML,
-                            reply_markup=main_panel_keyboard(),
+                            reply_markup=main_inline_keyboard(),
                         )
 
                 active_serials = {
@@ -1597,6 +1897,27 @@ async def background_monitor(app) -> None:
 
 
 async def post_init(app) -> None:
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Start & panel buttons"),
+                BotCommand("login", "Login to EnviroFRONT"),
+                BotCommand("status", "Executive telemetry status"),
+                BotCommand("allsite", "All assigned sites"),
+                BotCommand("unassigned", "Unassigned N/A sites"),
+                BotCommand("online", "Online devices list"),
+                BotCommand("offline", "Disconnected (>5h) list"),
+                BotCommand("summary", "Quick telemetry summary"),
+                BotCommand("health", "Device types & firmware health"),
+                BotCommand("site", "Search by industry/type/serial"),
+                BotCommand("ai", "Ask AI about live project"),
+                BotCommand("ai_analyze", "Full AI analysis report"),
+                BotCommand("logout", "Logout session"),
+            ]
+        )
+    except Exception as exc:
+        logger.warning("Failed to set bot commands: %s", exc)
+
     app.create_task(background_monitor(app))
 
 
@@ -1609,8 +1930,10 @@ def main() -> None:
     app.add_handler(CommandHandler("login", login_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("online", online_cmd))
     app.add_handler(CommandHandler("offline", offline_cmd))
+    app.add_handler(CommandHandler("unassigned", unassigned_cmd))
     app.add_handler(CommandHandler("allsite", allsite_cmd))
     app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
@@ -1620,7 +1943,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("EnviroFRONT Classic Premium Bot starting...")
+    logger.info("EnviroFRONT Telemetry Bot starting...")
     app.run_polling()
 
 
