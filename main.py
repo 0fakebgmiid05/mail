@@ -8,9 +8,9 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from google import genai
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -19,28 +19,46 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
+# ==============================================================================
+# CONFIGURATION (Aapka token neeche set hai; revoke karne par naya daal dein)
+# ==============================================================================
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
+).strip()
 
-BOT_TOKEN = ("9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE")
-GEMINI_API_KEY = ("AQ.Ab8RN6I_tfcLUOolcVJFPaJHlKqj3Fdv6izB2vvGx8fC4sjLow")  # Optional: AI analysis ke liye
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
 
+IST = timezone(timedelta(hours=5, minutes=30))
 DISCONNECT_THRESHOLD = timedelta(hours=5)
-CHECK_INTERVAL_SECONDS = 30  # Har 5 minute mein background analysis
-ALERT_COOLDOWN = timedelta(hours=3)
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+ALERT_COOLDOWN = timedelta(hours=int(os.getenv("ALERT_COOLDOWN_HOURS", "6")))
 
 USER_SESSIONS: dict[int, dict[str, Any]] = {}
 ALERTED_DEVICES: dict[str, datetime] = {}
 LAST_SNAPSHOT: dict[int, dict[str, Any]] = {}
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("EnviroBot")
+logger = logging.getLogger("EnviroFRONT.Bot")
+
+
+def esc(text: Any) -> str:
+    """HTML mode ke liye safe escaping."""
+    s = "" if text is None else str(text)
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def extract_verification_token(html: str) -> str | None:
@@ -68,44 +86,46 @@ def login_envirofront(username: str, password: str) -> requests.Session | None:
         }
     )
 
-    get_resp = session.get(LOGIN_URL, timeout=25)
-    get_resp.raise_for_status()
-    token = extract_verification_token(get_resp.text)
+    try:
+        get_resp = session.get(LOGIN_URL, timeout=25)
+        get_resp.raise_for_status()
+        token = extract_verification_token(get_resp.text)
 
-    # Apne login form ke <input name="..."> ke hisab se keys verify karein
-    payload: dict[str, str] = {
-        "UserName": username,
-        "Password": password,
-        "RememberMe": "false",
-    }
-    if token:
-        payload["__RequestVerificationToken"] = token
+        payload: dict[str, str] = {
+            "UserName": username,
+            "Password": password,
+            "RememberMe": "false",
+        }
+        if token:
+            payload["__RequestVerificationToken"] = token
 
-    post_resp = session.post(
-        LOGIN_URL,
-        data=payload,
-        timeout=25,
-        allow_redirects=False,
-    )
+        post_resp = session.post(
+            LOGIN_URL,
+            data=payload,
+            timeout=25,
+            allow_redirects=False,
+        )
 
-    has_auth_cookie = ".ASPXAUTH" in session.cookies.get_dict()
-    loc = post_resp.headers.get("Location", "")
+        has_auth_cookie = ".ASPXAUTH" in session.cookies.get_dict()
+        loc = post_resp.headers.get("Location", "")
 
-    if post_resp.status_code == 302 and (
-        has_auth_cookie or "/pae/ControlPanel/Devices" in loc
-    ):
-        verify = session.get(urljoin(BASE_URL, loc or "/pae/ControlPanel/Devices"), timeout=25)
-        if verify.ok and "Forgot Password?" not in verify.text:
-            return session
+        if post_resp.status_code == 302 and (
+            has_auth_cookie or "/pae/ControlPanel/Devices" in loc
+        ):
+            target = urljoin(BASE_URL, loc or "/pae/ControlPanel/Devices")
+            verify = session.get(target, timeout=25)
+            if verify.ok and "Forgot Password?" not in verify.text:
+                return session
+    except Exception as exc:
+        logger.error("Login exception: %s", exc)
 
     return None
 
 
 def parse_timestamp(raw: str) -> datetime | None:
-    cleaned = " ".join(raw.strip().split())
+    cleaned = " ".join((raw or "").strip().split())
     if not cleaned:
         return None
-    # Screenshot mein '25-Nov-2026 14:32:39' format dikha hai
     formats = (
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %I:%M:%S %p",
@@ -115,45 +135,83 @@ def parse_timestamp(raw: str) -> datetime | None:
     )
     for fmt in formats:
         try:
-            # Server time agar IST hai to +05:30 adjust karein; yahan naive -> UTC ya IST map kar sakte hain
             dt = datetime.strptime(cleaned, fmt)
-            ist = timezone(timedelta(hours=5, minutes=30))
-            return dt.replace(tzinfo=ist).astimezone(timezone.utc)
+            return dt.replace(tzinfo=IST).astimezone(timezone.utc)
         except ValueError:
             continue
     return None
 
 
-def parse_devices_page(html: str) -> list[dict[str, Any]]:
-    """
-    Devices table rows ko parse karta hai.
-    Agar pagination/AJAX endpoint alag ho to yahan extend karein.
-    """
-    if "500 - Internal server error" in html.lower() or "internal server error" in html.lower():
-        raise RuntimeError("EnviroFRONT server returned 500 Internal Server Error on Devices page.")
+def parse_devices_page(html: str, log_sample: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta: dict[str, Any] = {
+        "server_error_500": False,
+        "html_length": len(html or ""),
+        "tr_total": 0,
+        "unparsed_ts_count": 0,
+    }
+
+    if not html or "500 - internal server error" in html.lower() or "internal server error" in html.lower():
+        meta["server_error_500"] = True
+        return [], meta
 
     soup = BeautifulSoup(html, "html.parser")
+    all_trs = soup.select("tr")
+    meta["tr_total"] = len(all_trs)
+
+    if log_sample:
+        logger.info("HTML length=%d | Total <tr>=%d", len(html), len(all_trs))
+        for idx, tr in enumerate(all_trs[:5]):
+            snippet = " | ".join(tr.get_text(" ", strip=True).split())[:260]
+            logger.info("Sample TR[%d]: %s", idx, snippet)
+
     now = datetime.now(timezone.utc)
     devices: list[dict[str, Any]] = []
 
-    for row in soup.select("table tbody tr"):
-        cols = [c.get_text(" ", strip=True) for c in row.find_all("td")]
-        if len(cols) < 7:
+    for tr in all_trs:
+        tds = tr.find_all("td")
+        cells = tds if tds else tr.find_all(["div", "span"], recursive=False)
+        cols = [" ".join(c.get_text(" ", strip=True).split()) for c in cells]
+        cols = [c for c in cols if c != ""]
+
+        if len(cols) < 4:
             continue
 
-        # Typical order from screenshot:
-        # [Serial No, Industry, Site, Link, Device Type, Firmware, Status, Meta, Timestamp]
+        row_text = " ".join(cols)
+        has_status = ("connected" in row_text.lower()) or ("disconnected" in row_text.lower())
+        ts_match = re.search(
+            r"\b\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}(?:\s*(?:AM|PM))?\b",
+            row_text,
+            re.IGNORECASE,
+        )
+
+        if not has_status and not ts_match:
+            continue
+
         serial_no = cols[0]
-        industry = cols[1]
-        site = cols[2]
-        device_type = cols[4] if len(cols) > 4 else "N/A"
+        industry = cols[1] if len(cols) > 1 else "N/A"
+        site = cols[2] if len(cols) > 2 else "N/A"
+        device_type = cols[4] if len(cols) > 4 else "LOGPRO PLUS"
         firmware = cols[5] if len(cols) > 5 else "N/A"
-        status_text = cols[6] if len(cols) > 6 else ""
-        ts_raw = cols[-1]
+
+        status_text = next(
+            (c for c in cols if "disconnected" in c.lower() or "connected" in c.lower()),
+            cols[6] if len(cols) > 6 else "Unknown",
+        )
+        is_connected = (
+            "connected" in status_text.lower()
+            and "disconnected" not in status_text.lower()
+        )
+
+        ts_raw = ts_match.group(0) if ts_match else cols[-1]
         last_seen = parse_timestamp(ts_raw)
+        if not last_seen:
+            meta["unparsed_ts_count"] += 1
 
         offline_td = (now - last_seen) if last_seen else None
-        is_offline_5h = bool(offline_td and offline_td > DISCONNECT_THRESHOLD)
+        is_offline_5h = bool(
+            (offline_td and offline_td > DISCONNECT_THRESHOLD)
+            or (not is_connected and offline_td is None)
+        )
 
         devices.append(
             {
@@ -163,6 +221,7 @@ def parse_devices_page(html: str) -> list[dict[str, Any]]:
                 "device_type": device_type,
                 "firmware": firmware,
                 "status": status_text,
+                "is_connected": is_connected,
                 "timestamp_raw": ts_raw,
                 "last_seen": last_seen,
                 "offline_duration": offline_td,
@@ -170,47 +229,56 @@ def parse_devices_page(html: str) -> list[dict[str, Any]]:
             }
         )
 
-    return devices
+    return devices, meta
 
 
-def run_self_analysis(session: requests.Session) -> dict[str, Any]:
+def run_self_analysis(session: requests.Session, log_sample: bool = False) -> dict[str, Any]:
     resp = session.get(DEVICES_URL, timeout=25)
     resp.raise_for_status()
-    devices = parse_devices_page(resp.text)
+    devices, meta = parse_devices_page(resp.text, log_sample=log_sample)
 
     total = len(devices)
-    connected = sum(1 for d in devices if "connected" in d["status"].lower() and "dis" not in d["status"].lower())
-    disconnected_5h = [d for d in devices if d["disconnected_5h"]]
-    disconnected_5h.sort(
-        key=lambda x: x["offline_duration"].total_seconds() if x["offline_duration"] else 0,
+    online_list = [d for d in devices if d["is_connected"]]
+    offline_5h_list = [d for d in devices if d["disconnected_5h"]]
+
+    offline_5h_list.sort(
+        key=lambda x: x["offline_duration"].total_seconds() if x["offline_duration"] else 99999999,
         reverse=True,
     )
 
     site_offline_counts: dict[str, int] = {}
     fw_counts: dict[str, int] = {}
+
     for d in devices:
         fw = d["firmware"] or "Unknown"
         fw_counts[fw] = fw_counts.get(fw, 0) + 1
         if d["disconnected_5h"]:
-            site = d["site"] or "Unknown Site"
-            site_offline_counts[site] = site_offline_counts.get(site, 0) + 1
+            site_label = f"{d['site']} ({d['industry']})" if d["industry"] != "N/A" else d["site"]
+            site_offline_counts[site_label] = site_offline_counts.get(site_label, 0) + 1
 
     top_sites = sorted(site_offline_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
     return {
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checked_at_ist": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
         "total": total,
-        "connected": connected,
-        "disconnected_5h_count": len(disconnected_5h),
-        "disconnected_5h_list": disconnected_5h,
+        "connected": len(online_list),
+        "disconnected_5h_count": len(offline_5h_list),
+        "all_devices": devices,
+        "online_list": online_list,
+        "disconnected_5h_list": offline_5h_list,
         "top_offline_sites": top_sites,
         "firmware_breakdown": fw_counts,
+        "meta": meta,
     }
 
 
 def generate_ai_analysis(analysis: dict[str, Any]) -> str:
     if not GEMINI_API_KEY:
-        return "GEMINI_API_KEY set nahi hai—sirf rule-based self-analysis chal rahi hai."
+        return (
+            "<i>Gemini API key set nahi hai.</i>\n"
+            "Rule-based self-analysis ke mutabik "
+            f"<b>{analysis['disconnected_5h_count']}</b> devices 5+ hours se offline hain."
+        )
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     compact_offline = [
@@ -221,103 +289,315 @@ def generate_ai_analysis(analysis: dict[str, Any]) -> str:
             "fw": d["firmware"],
             "offline_hours": round(d["offline_duration"].total_seconds() / 3600, 1)
             if d["offline_duration"]
-            else None,
+            else "Unknown",
             "last_seen": d["timestamp_raw"],
         }
         for d in analysis["disconnected_5h_list"][:15]
     ]
 
     prompt = (
-        "Tum ek industrial telemetry & IoT monitoring analyst ho. "
-        "Neeche EnviroFRONT devices ka analysis data diya gaya hai. "
-        "Hinglish mein concise, actionable root-cause analysis aur priority action items likho "
-        "(jaise kaun si site/device sabse critical hai, firmware/connectivity patterns kya dikh rahe hain):\n\n"
-        f"Summary: total={analysis['total']}, connected={analysis['connected']}, "
+        "Tum ek senior industrial telemetry & IoT monitoring engineer ho. "
+        "Neeche EnviroFRONT (M2MLogger) devices ka self-analysis snapshot diya gaya hai. "
+        "Hinglish mein crisp, executive aur actionable analysis do:\n"
+        "1. Overall Health & Risk Level\n"
+        "2. Sabse Critical Sites / Devices (>5h offline)\n"
+        "3. Firmware / Server / Connectivity Patterns\n"
+        "4. Immediate Action Checklist (short bullets)\n"
+        "Plain text / simple lines rakho (complex markdown symbols mat lagao).\n\n"
+        f"Snapshot: total={analysis['total']}, connected={analysis['connected']}, "
         f"disconnected_over_5h={analysis['disconnected_5h_count']}, "
         f"top_offline_sites={analysis['top_offline_sites']}, "
-        f"firmware_breakdown={analysis['firmware_breakdown']}\n"
-        f"Top Disconnected Devices (>5h): {compact_offline}"
+        f"firmware_breakdown={analysis['firmware_breakdown']}, "
+        f"meta={analysis['meta']}\n"
+        f"Top Offline Devices (>5h): {compact_offline}"
     )
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
     )
-    return response.text or "AI analysis empty aaya."
+    return response.text or "AI analysis se koi response nahi aaya."
 
 
+def require_auth(chat_id: int) -> dict[str, Any] | None:
+    sess_data = USER_SESSIONS.get(chat_id)
+    if not sess_data or sess_data.get("step") != "authenticated":
+        return None
+    return sess_data
+
+
+# ==============================================================================
+# COMMAND HANDLERS (CLASSIC PREMIUM FORMATTING)
+# ==============================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-    await update.message.reply_text(
-        "EnviroFRONT Advanced Bot mein swagat hai.\n"
-        "Kripya apna **Login ID / Email** bhejein:"
+
+    msg = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+        "<i>Classic Command &amp; AI Monitor</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "• Auto-login via <code>.ASPXAUTH</code> &amp; CSRF token\n"
+        "• Continuous <b>5-Hour Disconnect</b> alert engine\n"
+        "• Live <b>Online / Offline / Site / Health</b> views\n"
+        "• <b>Gemini AI</b> self-analysis &amp; root-cause summary\n\n"
+        "Kripya apna <b>Login ID / Email</b> bhejein:"
     )
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    sess_data = USER_SESSIONS.get(chat_id)
-    if not sess_data or sess_data.get("step") != "authenticated":
-        await update.message.reply_text("Pehle /start se login karein.")
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
         return
 
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
-        sites_str = "\n".join(f"• {s}: {c} offline (>5h)" for s, c in analysis["top_offline_sites"]) or "None"
-        await update.message.reply_text(
-            f"**EnviroFRONT Status**\n"
-            f"Total Devices: `{analysis['total']}`\n"
-            f"Connected: `{analysis['connected']}`\n"
-            f"Disconnected (>5h): `{analysis['disconnected_5h_count']}`\n\n"
-            f"**Top Offline Sites (>5h):**\n{sites_str}",
-            parse_mode="Markdown",
+
+        if analysis["meta"]["server_error_500"]:
+            await update.message.reply_text(
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<b>SERVER ALERT — HTTP 500</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "EnviroFRONT ne <code>500 Internal Server Error</code> return kiya hai.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        sites_lines = (
+            "\n".join(
+                f"  ▸ <b>{esc(s)}</b> — <code>{c}</code> offline"
+                for s, c in analysis["top_offline_sites"]
+            )
+            if analysis["top_offline_sites"]
+            else "  ▸ <i>Koi critical offline site nahi</i>"
         )
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>EXECUTIVE SYSTEM STATUS</b>\n"
+            f"<i>{esc(analysis['checked_at_ist'])}</i>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"▸ <b>Total Devices:</b> <code>{analysis['total']}</code>\n"
+            f"▸ <b>Online (Connected):</b> <code>{analysis['connected']}</code>\n"
+            f"▸ <b>Offline (&gt; 5h):</b> <code>{analysis['disconnected_5h_count']}</code>\n\n"
+            "<b>Priority Offline Sites (&gt;5h)</b>\n"
+            f"{sites_lines}\n\n"
+            "<i>Commands: /online · /offline · /site · /health · /ai_analyze</i>"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
-        await update.message.reply_text(f"Analysis error: {exc}")
+        await update.message.reply_text(f"<b>Status Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
+
+
+async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        LAST_SNAPSHOT[chat_id] = analysis
+        online_list = analysis["online_list"]
+
+        if not online_list:
+            await update.message.reply_text("<i>Koi connected device nahi mila.</i>", parse_mode=ParseMode.HTML)
+            return
+
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"<b>ONLINE DEVICES ({len(online_list)})</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for d in online_list[:25]:
+            lines.append(
+                f"• <code>{esc(d['serial_no'])}</code> | <b>{esc(d['site'])}</b>\n"
+                f"  <i>FW {esc(d['firmware'])} · Last: {esc(d['timestamp_raw'])}</i>"
+            )
+        if len(online_list) > 25:
+            lines.append(f"\n<i>...aur {len(online_list) - 25} online devices hain.</i>")
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await update.message.reply_text(f"<b>Online List Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
 
 
 async def offline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    sess_data = USER_SESSIONS.get(chat_id)
-    if not sess_data or sess_data.get("step") != "authenticated":
-        await update.message.reply_text("Pehle /start se login karein.")
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
         return
 
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        LAST_SNAPSHOT[chat_id] = analysis
         off_list = analysis["disconnected_5h_list"]
+
         if not off_list:
-            await update.message.reply_text("Koi bhi device 5 ghante se zyada offline nahi hai.")
+            await update.message.reply_text(
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<b>OFFLINE MONITOR (&gt; 5h)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>Sabhi devices 5 ghante ke andar active hain.</i>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        lines = [f"**Disconnected > 5 Hours ({len(off_list)}):**"]
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"<b>OFFLINE &gt; 5 HOURS ({len(off_list)})</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
         for d in off_list[:20]:
-            hrs = round(d["offline_duration"].total_seconds() / 3600, 1)
-            lines.append(
-                f"• `{d['serial_no']}` | {d['site']} | **{hrs}h** | Last: `{d['timestamp_raw']}`"
+            hrs = (
+                f"{round(d['offline_duration'].total_seconds() / 3600, 1)}h"
+                if d["offline_duration"]
+                else "N/A"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            lines.append(
+                f"• <code>{esc(d['serial_no'])}</code> | <b>{esc(d['site'])}</b>\n"
+                f"  <b>Down: {esc(hrs)}</b> · <i>Last: {esc(d['timestamp_raw'])}</i>"
+            )
+        if len(off_list) > 20:
+            lines.append(f"\n<i>...aur {len(off_list) - 20} offline devices hain.</i>")
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as exc:
-        await update.message.reply_text(f"Error: {exc}")
+        await update.message.reply_text(f"<b>Offline List Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
+
+
+async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
+        return
+
+    query = " ".join(context.args or []).strip().lower()
+    if not query:
+        await update.message.reply_text(
+            "Usage: <code>/site &lt;site ya industry ka naam&gt;</code>\n"
+            "Example: <code>/site distillery</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        matches = [
+            d
+            for d in analysis["all_devices"]
+            if query in d["site"].lower()
+            or query in d["industry"].lower()
+            or query in d["serial_no"].lower()
+        ]
+        if not matches:
+            await update.message.reply_text(
+                f"<code>{esc(query)}</code> se match karne wala koi device nahi mila.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"<b>SITE FILTER: {esc(query.upper())} ({len(matches)})</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for d in matches[:20]:
+            state_tag = "ONLINE" if d["is_connected"] else "OFFLINE"
+            lines.append(
+                f"• <code>{esc(d['serial_no'])}</code> [{esc(state_tag)}] — <b>{esc(d['site'])}</b>\n"
+                f"  <i>{esc(d['industry'])} · FW {esc(d['firmware'])} · {esc(d['timestamp_raw'])}</i>"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await update.message.reply_text(f"<b>Site Search Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        meta = analysis["meta"]
+        fw_lines = "\n".join(
+            f"  ▸ Firmware <code>{esc(fw)}</code>: <b>{cnt}</b> devices"
+            for fw, cnt in sorted(analysis["firmware_breakdown"].items(), key=lambda x: -x[1])
+        ) or "  ▸ <i>No firmware data</i>"
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>SYSTEM &amp; PARSER DIAGNOSTICS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"▸ <b>Server HTTP 500:</b> <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
+            f"▸ <b>HTML Size:</b> <code>{meta['html_length']}</code> bytes\n"
+            f"▸ <b>Raw &lt;tr&gt; Rows:</b> <code>{meta['tr_total']}</code>\n"
+            f"▸ <b>Parsed Devices:</b> <code>{analysis['total']}</code>\n"
+            f"▸ <b>Unparsed Timestamps:</b> <code>{meta['unparsed_ts_count']}</code>\n\n"
+            "<b>Firmware Distribution</b>\n"
+            f"{fw_lines}"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await update.message.reply_text(f"<b>Health Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
+
+
+async def debug_rows_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"], True)
+        meta = analysis["meta"]
+        await update.message.reply_text(
+            "Debug rows Railway logs mein print kar diye gaye hain.\n"
+            f"TR count: <code>{meta['tr_total']}</code> | Parsed: <code>{analysis['total']}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"<b>Debug Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
 
 
 async def ai_analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    sess_data = USER_SESSIONS.get(chat_id)
-    if not sess_data or sess_data.get("step") != "authenticated":
-        await update.message.reply_text("Pehle /start se login karein.")
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await update.message.reply_text("Pehle <code>/start</code> se login karein.", parse_mode=ParseMode.HTML)
         return
 
-    await update.message.reply_text("Data analyze karke AI report taiyar ki ja rahi hai...")
+    await update.message.reply_text(
+        "<i>Self-analysis &amp; Gemini AI report taiyar ki ja rahi hai...</i>",
+        parse_mode=ParseMode.HTML,
+    )
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
         ai_text = await asyncio.to_thread(generate_ai_analysis, analysis)
-        await update.message.reply_text(ai_text)
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>GEMINI AI SELF-ANALYSIS</b>\n"
+            f"<i>{esc(analysis['checked_at_ist'])}</i>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{esc(ai_text)}"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
-        await update.message.reply_text(f"AI analysis error: {exc}")
+        await update.message.reply_text(f"<b>AI Analysis Error:</b> <code>{esc(exc)}</code>", parse_mode=ParseMode.HTML)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -326,13 +606,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state = USER_SESSIONS.get(chat_id)
 
     if not state:
-        await update.message.reply_text("Login shuru karne ke liye /start bhejein.")
+        await update.message.reply_text("Login shuru karne ke liye <code>/start</code> bhejein.", parse_mode=ParseMode.HTML)
         return
 
     if state.get("step") == "awaiting_username":
         state["username"] = text
         state["step"] = "awaiting_password"
-        await update.message.reply_text("Ab apna **Password** bhejein:")
+        await update.message.reply_text("Ab apna <b>Password</b> bhejein:", parse_mode=ParseMode.HTML)
 
     elif state.get("step") == "awaiting_password":
         username = state["username"]
@@ -343,7 +623,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
 
-        await update.message.reply_text("EnviroFRONT mein login verify ho raha hai...")
+        await update.message.reply_text("<i>EnviroFRONT session verify ho raha hai...</i>", parse_mode=ParseMode.HTML)
         session = await asyncio.to_thread(login_envirofront, username, password)
 
         if session:
@@ -353,17 +633,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "session": session,
             }
             await update.message.reply_text(
-                f"Login safal ({username}).\n"
-                "Auto-analysis & 5-hour disconnect alert active hai.\n"
-                "Commands: /status, /offline, /ai_analyze"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<b>SESSION AUTHENTICATED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Account: <code>{esc(username)}</code>\n"
+                "5-Hour Disconnect Auto-Alert: <b>ACTIVE</b>\n\n"
+                "<b>Available Commands</b>\n"
+                "• <code>/status</code> — Overview &amp; top offline sites\n"
+                "• <code>/online</code> — Connected devices\n"
+                "• <code>/offline</code> — Disconnected &gt; 5h\n"
+                "• <code>/site &lt;query&gt;</code> — Filter by site/industry\n"
+                "• <code>/health</code> — Firmware &amp; parser diagnostics\n"
+                "• <code>/ai_analyze</code> — Gemini AI report",
+                parse_mode=ParseMode.HTML,
             )
         else:
             USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
             await update.message.reply_text(
-                "Login fail ho gaya. Dobara apni **Login ID / Email** bhejein:"
+                "<b>Login fail ho gaya.</b> Kripya dobara apna <b>Login ID / Email</b> bhejein:",
+                parse_mode=ParseMode.HTML,
             )
 
 
+# ==============================================================================
+# BACKGROUND MONITOR (5-HOUR DISCONNECT ALERTS)
+# ==============================================================================
 async def background_monitor(app) -> None:
     while True:
         now = datetime.now(timezone.utc)
@@ -380,18 +674,26 @@ async def background_monitor(app) -> None:
                     last_alert = ALERTED_DEVICES.get(key)
                     if not last_alert or (now - last_alert) > ALERT_COOLDOWN:
                         ALERTED_DEVICES[key] = now
-                        hrs = round(dev["offline_duration"].total_seconds() / 3600, 1)
+                        hrs = (
+                            f"{round(dev['offline_duration'].total_seconds() / 3600, 1)} hours"
+                            if dev["offline_duration"]
+                            else "Unknown"
+                        )
+                        alert_msg = (
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            "<b>CRITICAL DISCONNECT (&gt; 5H)</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"▸ <b>Serial:</b> <code>{esc(dev['serial_no'])}</code>\n"
+                            f"▸ <b>Site:</b> <b>{esc(dev['site'])}</b>\n"
+                            f"▸ <b>Industry:</b> {esc(dev['industry'])}\n"
+                            f"▸ <b>Type / FW:</b> <code>{esc(dev['device_type'])}</code> · <code>{esc(dev['firmware'])}</code>\n"
+                            f"▸ <b>Offline For:</b> <b>{esc(hrs)}</b>\n"
+                            f"▸ <b>Last Seen:</b> <code>{esc(dev['timestamp_raw'])}</code>"
+                        )
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text=(
-                                "🚨 **Device Disconnect Alert (>5 Hours)**\n"
-                                f"Serial: `{dev['serial_no']}`\n"
-                                f"Site: **{dev['site']}** ({dev['industry']})\n"
-                                f"Type/FW: `{dev['device_type']}` | FW `{dev['firmware']}`\n"
-                                f"Disconnected For: **{hrs} hours**\n"
-                                f"Last Timestamp: `{dev['timestamp_raw']}`"
-                            ),
-                            parse_mode="Markdown",
+                            text=alert_msg,
+                            parse_mode=ParseMode.HTML,
                         )
 
                 active_serials = {d["serial_no"] for d in analysis["disconnected_5h_list"]}
@@ -412,12 +714,21 @@ async def post_init(app) -> None:
 
 
 def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        raise RuntimeError("BOT_TOKEN missing hai.")
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("online", online_cmd))
     app.add_handler(CommandHandler("offline", offline_cmd))
+    app.add_handler(CommandHandler("site", site_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
+    app.add_handler(CommandHandler("debug_rows", debug_rows_cmd))
     app.add_handler(CommandHandler("ai_analyze", ai_analyze_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("EnviroFRONT Classic Premium Bot starting...")
     app.run_polling()
 
 
