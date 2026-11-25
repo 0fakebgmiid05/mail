@@ -28,8 +28,7 @@ BOT_TOKEN = (
     or "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
 ).strip()
 
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-
+GEMINI_API_KEY = "AQ.Ab8RN6I9cos8rT2ACgxwY70oDOEiigJFEL7O1CBnpwQ0l9VQgA"
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
@@ -235,7 +234,25 @@ def parse_devices_page(html: str, log_sample: bool = False) -> tuple[list[dict[s
 def run_self_analysis(session: requests.Session, log_sample: bool = False) -> dict[str, Any]:
     resp = session.get(DEVICES_URL, timeout=25)
     resp.raise_for_status()
+
+    # --- YAHAN PURANI 4 LINES KO IS CODE SE REPLACE KAREIN ---
+    soup = BeautifulSoup(resp.text, "html.parser")
     devices, meta = parse_devices_page(resp.text, log_sample=log_sample)
+
+    if len(devices) == 0 and not meta["server_error_500"]:
+        devices = discover_and_fetch_ajax_devices(session, resp.text)
+
+    if len(devices) == 0 and not meta["server_error_500"]:
+        scripts_text = "\n".join(s.get_text(" ", strip=True) for s in soup.find_all("script"))
+        urls_found = set(re.findall(r"""["'](/[^"']{3,100})["']""", resp.text))
+        interesting_urls = [
+            u
+            for u in sorted(urls_found)
+            if any(k in u.lower() for k in ("device", "grid", "data", "list", "get", "load", "pae", "control"))
+        ]
+        logger.info("Candidate URLs in HTML: %s", interesting_urls[:20])
+        logger.info("Script snippet: %s", " ".join(scripts_text.split())[:600])
+    # ----------------------------------------------------------
 
     total = len(devices)
     online_list = [d for d in devices if d["is_connected"]]
@@ -245,6 +262,7 @@ def run_self_analysis(session: requests.Session, log_sample: bool = False) -> di
         key=lambda x: x["offline_duration"].total_seconds() if x["offline_duration"] else 99999999,
         reverse=True,
     )
+    # ... baaki niche ka code jaisa tha waisa hi rahega ...
 
     site_offline_counts: dict[str, int] = {}
     fw_counts: dict[str, int] = {}
