@@ -256,8 +256,45 @@ def sc(text: str) -> str:
 
 
 def esc(val: Any) -> str:
-    # Escape <, >, & and quotes so Telegram HTML never hits an invalid tag
-    return html.escape(str(val or ""), quote=True)
+    s = str(val or "")
+    # Neutralize stray angle brackets that could look like broken HTML tags
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    return html.escape(s, quote=True)
+
+
+def strip_html_tags(text: str) -> str:
+    txt = re.sub(r"<[^>]+>", "", str(text or ""))
+    return html.unescape(txt)
+
+
+async def safe_send_html(
+    bot,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+) -> None:
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except Exception as exc:
+        logger.warning("HTML send fallback triggered: %s", exc)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=strip_html_tags(text),
+            reply_markup=reply_markup,
+        )
+
+
+async def safe_edit_html(msg_obj, text: str) -> None:
+    try:
+        await msg_obj.edit_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.warning("HTML edit fallback triggered: %s", exc)
+        await msg_obj.edit_text(strip_html_tags(text))
 
 
 def clean_ai_text(text: str) -> str:
@@ -366,7 +403,7 @@ def guest_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 # ==============================================================================
-# PORTAL LOGIN, PARSING & LIVE DASHBOARD / INSTRUMENT SCRAPER
+# PORTAL LOGIN, MULTI-METHOD PARSING & LIVE DASHBOARD / INSTRUMENT SCRAPER
 # ==============================================================================
 def login_envirofront(
     username: str, password: str
@@ -379,7 +416,7 @@ def login_envirofront(
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": f"{BASE_URL}/",
         }
@@ -639,6 +676,185 @@ def normalize_device_record(
     }
 
 
+def _dict_to_device(
+    item: dict[str, Any], now_utc: datetime, site_id_map: dict[str, str]
+) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    low_map = {str(k).lower(): v for k, v in item.items()}
+
+    def pick(*keys: str) -> str:
+        for k in keys:
+            v = item.get(k)
+            if v is None:
+                v = low_map.get(k.lower())
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+        return ""
+
+    serial = pick(
+        "SerialNo",
+        "serial_no",
+        "Serial",
+        "DeviceSerial",
+        "SerialNumber",
+        "IMEI",
+        "LoggerId",
+        "DeviceId",
+    )
+    if not serial:
+        return None
+
+    sid = pick("SiteId", "siteId", "Site_Id", "site_id", "ID") or site_id_map.get(
+        serial, ""
+    )
+    ind = pick(
+        "IndustryName",
+        "Industry",
+        "ClientName",
+        "CompanyName",
+        "SiteName",
+        "Name",
+    ) or "N/A"
+    stype = pick("SiteType", "Site", "Category", "Location") or "N/A"
+    dtype = pick("DeviceType", "Model", "Type", "LoggerType") or "N/A"
+    fw = pick("Firmware", "FirmwareVersion", "FW", "Version") or "N/A"
+    raw_ts = pick(
+        "LastSeen",
+        "LastDataTime",
+        "LastCommunication",
+        "UpdatedOn",
+        "LastUpdate",
+        "LastPacketTime",
+        "DateTime",
+    )
+    raw_st = pick(
+        "Status",
+        "ConnectionStatus",
+        "IsConnected",
+        "Online",
+        "IsOnline",
+    )
+    return normalize_device_record(
+        serial_no=serial,
+        industry=ind,
+        site_type=stype,
+        device_type=dtype,
+        firmware=fw,
+        raw_status=raw_st,
+        raw_last_seen=raw_ts,
+        now_utc=now_utc,
+        site_id=sid,
+    )
+
+
+def _extract_list_from_json_payload(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        if data and all(isinstance(x, list) for x in data):
+            # Convert array-of-arrays rows into dict rows
+            out_rows: list[dict[str, Any]] = []
+            for arr in data:
+                if len(arr) >= 2:
+                    out_rows.append(
+                        {
+                            "SerialNo": str(arr[0]),
+                            "IndustryName": str(arr[1]) if len(arr) > 1 else "N/A",
+                            "SiteType": str(arr[2]) if len(arr) > 2 else "N/A",
+                            "DeviceType": str(arr[3]) if len(arr) > 3 else "N/A",
+                            "Firmware": str(arr[4]) if len(arr) > 4 else "N/A",
+                            "LastSeen": str(arr[-1]),
+                        }
+                    )
+            return out_rows
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in (
+            "data",
+            "rows",
+            "devices",
+            "Devices",
+            "items",
+            "Items",
+            "result",
+            "Result",
+            "aaData",
+        ):
+            val = data.get(key)
+            if isinstance(val, list) and val:
+                sub = _extract_list_from_json_payload(val)
+                if sub:
+                    return sub
+            if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                try:
+                    parsed = json.loads(val)
+                    sub = _extract_list_from_json_payload(parsed)
+                    if sub:
+                        return sub
+                except Exception:
+                    pass
+    return []
+
+
+def extract_devices_from_ws(
+    session: requests.Session,
+    now_utc: datetime,
+    site_id_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    # Method 1A: GET WS_DEVICES_URL
+    # Method 1B: POST WS_DEVICES_URL (for ASP.NET ASHX / DataTables handlers)
+    for method in ("GET", "POST"):
+        try:
+            if method == "GET":
+                r = session.get(
+                    WS_DEVICES_URL,
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": DEVICES_URL,
+                    },
+                    timeout=20,
+                )
+            else:
+                r = session.post(
+                    WS_DEVICES_URL,
+                    data={"draw": "1", "start": "0", "length": "500"},
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": DEVICES_URL,
+                    },
+                    timeout=20,
+                )
+            if not r.ok:
+                continue
+            txt = (r.text or "").strip()
+            if not txt or txt.startswith("<"):
+                continue
+            if txt.startswith('{"d":') or txt.startswith("{'d':"):
+                try:
+                    outer = json.loads(txt)
+                    if isinstance(outer, dict) and "d" in outer:
+                        txt = (
+                            outer["d"]
+                            if isinstance(outer["d"], str)
+                            else json.dumps(outer["d"])
+                        )
+                except Exception:
+                    pass
+            data = json.loads(txt)
+            rows = _extract_list_from_json_payload(data)
+            if not rows:
+                continue
+            out: list[dict[str, Any]] = []
+            for item in rows:
+                rec = _dict_to_device(item, now_utc, site_id_map)
+                if rec:
+                    out.append(rec)
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
 def extract_devices_from_html_table(
     soup: BeautifulSoup, now_utc: datetime
 ) -> tuple[list[dict[str, Any]], int, int]:
@@ -710,132 +926,6 @@ def extract_devices_from_html_table(
     return devices, tr_total, unparsed_ts
 
 
-def _extract_list_from_json_payload(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        for key in (
-            "data",
-            "rows",
-            "devices",
-            "Devices",
-            "items",
-            "Items",
-            "result",
-            "Result",
-        ):
-            val = data.get(key)
-            if isinstance(val, list) and val:
-                return [x for x in val if isinstance(x, dict)]
-            if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                try:
-                    parsed = json.loads(val)
-                    sub = _extract_list_from_json_payload(parsed)
-                    if sub:
-                        return sub
-                except Exception:
-                    pass
-    return []
-
-
-def extract_devices_from_ws(
-    session: requests.Session, now_utc: datetime
-) -> list[dict[str, Any]]:
-    try:
-        r = session.get(
-            WS_DEVICES_URL,
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": DEVICES_URL,
-            },
-            timeout=20,
-        )
-        if not r.ok:
-            return []
-        txt = (r.text or "").strip()
-        if not txt or txt.startswith("<"):
-            return []
-        data = json.loads(txt)
-        rows = _extract_list_from_json_payload(data)
-        if not rows:
-            return []
-
-        out: list[dict[str, Any]] = []
-        for item in rows:
-            serial = str(
-                item.get("SerialNo")
-                or item.get("serial_no")
-                or item.get("Serial")
-                or item.get("DeviceSerial")
-                or item.get("IMEI")
-                or item.get("LoggerId")
-                or "N/A"
-            )
-            sid = str(
-                item.get("SiteId")
-                or item.get("siteId")
-                or item.get("Site_Id")
-                or item.get("site_id")
-                or ""
-            )
-            ind = str(
-                item.get("IndustryName")
-                or item.get("Industry")
-                or item.get("ClientName")
-                or item.get("CompanyName")
-                or "N/A"
-            )
-            stype = str(
-                item.get("SiteType")
-                or item.get("SiteName")
-                or item.get("Site")
-                or "N/A"
-            )
-            dtype = str(
-                item.get("DeviceType")
-                or item.get("Model")
-                or item.get("Type")
-                or "N/A"
-            )
-            fw = str(
-                item.get("Firmware")
-                or item.get("FirmwareVersion")
-                or item.get("FW")
-                or "N/A"
-            )
-            raw_ts = str(
-                item.get("LastSeen")
-                or item.get("LastDataTime")
-                or item.get("LastCommunication")
-                or item.get("UpdatedOn")
-                or item.get("LastUpdate")
-                or ""
-            )
-            raw_st = str(
-                item.get("Status")
-                or item.get("ConnectionStatus")
-                or item.get("IsConnected")
-                or item.get("Online")
-                or ""
-            )
-            out.append(
-                normalize_device_record(
-                    serial_no=serial,
-                    industry=ind,
-                    site_type=stype,
-                    device_type=dtype,
-                    firmware=fw,
-                    raw_status=raw_st,
-                    raw_last_seen=raw_ts,
-                    now_utc=now_utc,
-                    site_id=sid,
-                )
-            )
-        return out
-    except Exception:
-        return []
-
-
 def extract_devices_from_embedded_scripts(
     raw_html: str, now_utc: datetime, site_id_map: dict[str, str]
 ) -> list[dict[str, Any]]:
@@ -848,76 +938,43 @@ def extract_devices_from_embedded_scripts(
     ):
         try:
             obj = json.loads(m.group(0))
-            if not isinstance(obj, dict):
-                continue
-            serial = str(
-                obj.get("SerialNo")
-                or obj.get("serial_no")
-                or obj.get("Serial")
-                or obj.get("DeviceSerial")
-                or ""
-            ).strip()
-            if not serial or serial in seen_serials:
-                continue
-            seen_serials.add(serial)
-            sid = str(
-                obj.get("SiteId")
-                or obj.get("siteId")
-                or site_id_map.get(serial)
-                or ""
-            )
-            ind = str(
-                obj.get("IndustryName")
-                or obj.get("Industry")
-                or obj.get("ClientName")
-                or "N/A"
-            )
-            stype = str(
-                obj.get("SiteType")
-                or obj.get("SiteName")
-                or obj.get("Site")
-                or "N/A"
-            )
-            dtype = str(
-                obj.get("DeviceType")
-                or obj.get("Model")
-                or obj.get("Type")
-                or "N/A"
-            )
-            fw = str(
-                obj.get("Firmware")
-                or obj.get("FirmwareVersion")
-                or obj.get("FW")
-                or "N/A"
-            )
-            raw_ts = str(
-                obj.get("LastSeen")
-                or obj.get("LastDataTime")
-                or obj.get("LastCommunication")
-                or obj.get("UpdatedOn")
-                or ""
-            )
-            raw_st = str(
-                obj.get("Status")
-                or obj.get("ConnectionStatus")
-                or obj.get("IsConnected")
-                or ""
-            )
-            found.append(
-                normalize_device_record(
-                    serial_no=serial,
-                    industry=ind,
-                    site_type=stype,
-                    device_type=dtype,
-                    firmware=fw,
-                    raw_status=raw_st,
-                    raw_last_seen=raw_ts,
-                    now_utc=now_utc,
-                    site_id=sid,
-                )
-            )
+            rec = _dict_to_device(obj, now_utc, site_id_map)
+            if rec and rec["serial_no"] not in seen_serials:
+                seen_serials.add(rec["serial_no"])
+                found.append(rec)
         except Exception:
             continue
+    return found
+
+
+def extract_devices_from_dashboard_links(
+    soup: BeautifulSoup, now_utc: datetime
+) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = str(a["href"])
+        m = re.search(r"/pae/Site/(\d+)/Dashboard", href, re.IGNORECASE)
+        if not m:
+            continue
+        sid = m.group(1)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        txt = " ".join(a.get_text(" ", strip=True).split()) or f"Site {sid}"
+        found.append(
+            normalize_device_record(
+                serial_no=f"SITE-{sid}",
+                industry=txt,
+                site_type="Dashboard Site",
+                device_type="Enviro Logger",
+                firmware="N/A",
+                raw_status="",
+                raw_last_seen="",
+                now_utc=now_utc,
+                site_id=sid,
+            )
+        )
     return found
 
 
@@ -1142,26 +1199,21 @@ def fetch_devices_multi_strategy(
     _, tr_total, _ = extract_devices_from_html_table(soup, now)
     meta["tr_total"] = tr_total
 
-    ws_devices = extract_devices_from_ws(session, now)
+    # Method 1: WS_DEVICES_URL (GET/POST JSON)
+    ws_devices = extract_devices_from_ws(session, now, site_id_map)
     if ws_devices:
         for d in ws_devices:
-            if not d.get("site_id"):
-                d["site_id"] = (
-                    site_id_map.get(d["serial_no"])
-                    or site_id_map.get(d["industry"].lower())
-                    or site_id_map.get(d["site"].lower())
-                    or ""
+            if d.get("site_id") and not d.get("dashboard_url"):
+                d["dashboard_url"] = (
+                    f"{BASE_URL}/pae/Site/{d['site_id']}/Dashboard"
                 )
-                if d["site_id"]:
-                    d["dashboard_url"] = (
-                        f"{BASE_URL}/pae/Site/{d['site_id']}/Dashboard"
-                    )
         meta["unparsed_ts_count"] = sum(
             1 for d in ws_devices if d["last_seen"] is None
         )
         meta["source"] = "ws-devices-json"
         return ws_devices, meta
 
+    # Method 2: HTML Table rows on DEVICES_URL
     html_devices, _, unparsed_ts = extract_devices_from_html_table(soup, now)
     if html_devices:
         for d in html_devices:
@@ -1175,6 +1227,7 @@ def fetch_devices_multi_strategy(
         meta["source"] = "html-table"
         return html_devices, meta
 
+    # Method 3: Embedded JSON inside <script> tags
     script_devices = extract_devices_from_embedded_scripts(
         raw_html, now, site_id_map
     )
@@ -1189,6 +1242,58 @@ def fetch_devices_multi_strategy(
         )
         meta["source"] = "embedded-json"
         return script_devices, meta
+
+    # Method 4: Fallback endpoint scan + dashboard links
+    fallback_endpoints = [
+        f"{BASE_URL}/pae/ControlPanel/GetDevices",
+        f"{BASE_URL}/pae/ControlPanel/DevicesList",
+        f"{BASE_URL}/pae/Device/Devices",
+        f"{BASE_URL}/api/Devices",
+    ]
+    for ep in fallback_endpoints:
+        try:
+            r_ep = session.get(
+                ep,
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": DEVICES_URL,
+                },
+                timeout=15,
+            )
+            if not r_ep.ok:
+                continue
+            ep_txt = (r_ep.text or "").strip()
+            if ep_txt and not ep_txt.startswith("<"):
+                parsed_ep = json.loads(ep_txt)
+                rows_ep = _extract_list_from_json_payload(parsed_ep)
+                ep_devs = [
+                    rec
+                    for item in rows_ep
+                    if (rec := _dict_to_device(item, now, site_id_map))
+                ]
+                if ep_devs:
+                    meta["source"] = f"fallback-json:{ep.split('/')[-1]}"
+                    meta["unparsed_ts_count"] = sum(
+                        1 for d in ep_devs if d["last_seen"] is None
+                    )
+                    return ep_devs, meta
+            elif ep_txt:
+                soup_ep = BeautifulSoup(ep_txt, "html.parser")
+                ep_tbl, _, ep_unp = extract_devices_from_html_table(
+                    soup_ep, now
+                )
+                if ep_tbl:
+                    meta["source"] = f"fallback-html:{ep.split('/')[-1]}"
+                    meta["unparsed_ts_count"] = ep_unp
+                    return ep_tbl, meta
+        except Exception:
+            continue
+
+    link_devs = extract_devices_from_dashboard_links(soup, now)
+    if link_devs:
+        meta["source"] = "dashboard-links"
+        meta["unparsed_ts_count"] = len(link_devs)
+        return link_devs, meta
 
     meta["source"] = "0-found"
     return [], meta
@@ -1555,22 +1660,22 @@ async def check_access(chat_id: int, user_id: int | None, bot) -> bool:
     if is_admin(user_id):
         return True
     if not BOT_ENABLED:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="╔══════════════════════╗\n║  • <b>BOT CURRENTLY OFF</b>   ║\n╚══════════════════════╝\n▸ Admin ne bot ko temporary OFF kiya hua hai.",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "╔══════════════════════╗\n║  • <b>BOT CURRENTLY OFF</b>   ║\n╚══════════════════════╝\n▸ Admin ne bot ko temporary OFF kiya hua hai.",
         )
         return False
     if MAINTENANCE_MODE:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
+        await safe_send_html(
+            bot,
+            chat_id,
+            (
                 "╔══════════════════════╗\n"
                 f"║  ◈ <b>{sc('MAINTENANCE MODE')}</b>  ║\n"
                 "╚══════════════════════╝\n"
                 f"▸ {esc(MAINTENANCE_MSG)}"
             ),
-            parse_mode=ParseMode.HTML,
         )
         return False
     return True
@@ -1594,25 +1699,22 @@ async def send_start_view(chat_id: int, bot) -> None:
             "  ▸ Next/Prev ke liye <code>/next</code> aur <code>/prev</code> ya buttons use karein.\n"
             "  ▸ Dashboard ke liye: <code>/dash &lt;no ya serial ya naam&gt;</code>"
         )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=msg,
-            parse_mode=ParseMode.HTML,
-            reply_markup=bottom_reply_keyboard(),
+        await safe_send_html(
+            bot, chat_id, msg, reply_markup=bottom_reply_keyboard()
         )
         return
 
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
+    await safe_send_html(
+        bot,
+        chat_id,
+        (
             "╔══════════════════════╗\n"
             f"║  ◈ <b>{esc(CLIENT_NAME)}</b>\n"
             f"║  <i>{sc('TELEMETRY COMMAND')}</i>\n"
             "╚══════════════════════╝\n\n"
             "  ▸ Kripya apna <b>Login ID / Email</b> bhejein:"
         ),
-        parse_mode=ParseMode.HTML,
         reply_markup=guest_reply_keyboard(),
     )
 
@@ -1648,12 +1750,7 @@ async def send_help_view(chat_id: int, bot) -> None:
         if require_auth(chat_id)
         else guest_reply_keyboard()
     )
-    await bot.send_message(
-        chat_id=chat_id,
-        text=help_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
+    await safe_send_html(bot, chat_id, help_text, reply_markup=kb)
 
 
 async def send_admin_panel(chat_id: int, bot) -> None:
@@ -1672,26 +1769,23 @@ async def send_admin_panel(chat_id: int, bot) -> None:
         "  • <code>/maint_on [msg]</code> | <code>/maint_off</code>\n"
         "  • <code>/bot_on</code> | <code>/bot_off</code>"
     )
-    await bot.send_message(
-        chat_id=chat_id,
-        text=msg,
-        parse_mode=ParseMode.HTML,
-        reply_markup=bottom_reply_keyboard(),
+    await safe_send_html(
+        bot, chat_id, msg, reply_markup=bottom_reply_keyboard()
     )
 
 
 async def send_login_prompt(chat_id: int, bot) -> None:
     AI_CHAT_MODE.discard(chat_id)
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
+    await safe_send_html(
+        bot,
+        chat_id,
+        (
             "╔══════════════════════╗\n"
             f"║  ◈ <b>{sc('PORTAL LOGIN')}</b>\n"
             "╚══════════════════════╝\n"
             "  ▸ Kripya apna <b>Login ID / Email</b> bhejein:"
         ),
-        parse_mode=ParseMode.HTML,
         reply_markup=guest_reply_keyboard(),
     )
 
@@ -1709,15 +1803,15 @@ async def send_logout_action(chat_id: int, bot) -> None:
         except Exception:
             pass
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
+    await safe_send_html(
+        bot,
+        chat_id,
+        (
             "╔══════════════════════╗\n"
             f"║  ◈ <b>{sc('LOGGED OUT')}</b>\n"
             "╚══════════════════════╝\n"
             "  ▸ Session aur alerts band kar diye gaye hain."
         ),
-        parse_mode=ParseMode.HTML,
         reply_markup=guest_reply_keyboard(),
     )
 
@@ -1725,18 +1819,17 @@ async def send_logout_action(chat_id: int, bot) -> None:
 async def send_status_action(chat_id: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="<i>◈ Fetching live telemetry status...</i>",
-        parse_mode=ParseMode.HTML,
+        text="◈ Fetching live telemetry status...",
     )
     try:
         analysis = await asyncio.to_thread(
@@ -1746,12 +1839,12 @@ async def send_status_action(chat_id: int, bot) -> None:
         save_snapshot_db(chat_id, analysis)
 
         if analysis["meta"]["server_error_500"]:
-            await loader.edit_text(
+            await safe_edit_html(
+                loader,
                 "╔══════════════════════╗\n"
                 "║  • <b>SERVER HTTP 500</b>   ║\n"
                 "╚══════════════════════╝\n"
                 "  ▸ Portal ne <code>500 Internal Server Error</code> diya hai.",
-                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -1772,6 +1865,7 @@ async def send_status_action(chat_id: int, bot) -> None:
             f"║  ◈ <b>{esc(CLIENT_NAME)} — {sc('STATUS')}</b>\n"
             "╚══════════════════════╝\n"
             f"  ▸ Time         : <i>{esc(analysis['checked_at_ist'])}</i>\n"
+            f"  ▸ Source       : <code>{esc(analysis['meta'].get('source', 'none'))}</code>\n"
             f"  ▸ Total        : <b>{analysis['total']}</b>\n"
             f"  ▸ Assigned     : <b>{analysis['assigned_count']}</b> | Unassigned: <b>{analysis['unassigned_count']}</b>\n"
             f"  ▸ Connected    : ∙ <b>{analysis['connected']}</b>\n"
@@ -1782,21 +1876,21 @@ async def send_status_action(chat_id: int, bot) -> None:
             f"<b>◈ {sc('Top Disconnected Sites')}</b>\n"
             f"{sites_lines}"
         )
-        await loader.edit_text(msg, parse_mode=ParseMode.HTML)
+        await safe_edit_html(loader, msg)
     except Exception as exc:
-        await loader.edit_text(
+        await safe_edit_html(
+            loader,
             f"  • <b>Status Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
         )
 
 
 async def send_aging_menu(chat_id: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -1819,7 +1913,7 @@ async def send_aging_menu(chat_id: int, bot) -> None:
         f"  ▸ <code>&gt; 1 Year (365d+)  : {ages.get('gt1y', 0)}</code> → <code>/age gt1y</code>\n\n"
         "  ▸ Bucket dekhne ke liye command bhejein (jaise <code>/age 1d</code>)."
     )
-    await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
+    await safe_send_html(bot, chat_id, msg)
 
 
 async def send_aging_bucket_page(
@@ -1827,10 +1921,10 @@ async def send_aging_bucket_page(
 ) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -1848,15 +1942,15 @@ async def send_aging_bucket_page(
         )
 
         if not matched:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
+            await safe_send_html(
+                bot,
+                chat_id,
+                (
                     "╔══════════════════════╗\n"
                     f"║  ◈ <b>{esc(title)}</b>\n"
                     "╚══════════════════════╝\n"
                     "  ▸ <code>Is range mein koi disconnected site nahi hai.</code>"
                 ),
-                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -1884,24 +1978,22 @@ async def send_aging_bucket_page(
         lines.append(
             f"\n  ▸ Navigation: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
         )
-        await bot.send_message(
-            chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML
-        )
+        await safe_send_html(bot, chat_id, "\n".join(lines))
     except Exception as exc:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • <b>Bucket Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • <b>Bucket Error:</b> <code>{esc(exc)}</code>",
         )
 
 
 async def send_allsite_page(chat_id: int, page: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -1914,10 +2006,10 @@ async def send_allsite_page(chat_id: int, page: int, bot) -> None:
         assigned_devs = analysis["assigned_devices"]
 
         if not assigned_devs:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="  ▸ <code>Koi assigned site nahi mili.</code>",
-                parse_mode=ParseMode.HTML,
+            await safe_send_html(
+                bot,
+                chat_id,
+                "  ▸ <code>Koi assigned site nahi mili.</code>",
             )
             return
 
@@ -1945,14 +2037,12 @@ async def send_allsite_page(chat_id: int, page: int, bot) -> None:
         lines.append(
             "\n  ▸ Dashboard: <code>/dash &lt;no/serial/name&gt;</code> | Pages: <code>/prev</code> / <code>/next</code>"
         )
-        await bot.send_message(
-            chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML
-        )
+        await safe_send_html(bot, chat_id, "\n".join(lines))
     except Exception as exc:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • <b>All Sites Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • <b>All Sites Error:</b> <code>{esc(exc)}</code>",
         )
 
 
@@ -1961,10 +2051,10 @@ async def send_site_dashboard_by_target(
 ) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Session expire ho gaya hai, dobara login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Session expire ho gaya hai, dobara login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -1999,20 +2089,19 @@ async def send_site_dashboard_by_target(
                 break
 
     if not dev:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
+        await safe_send_html(
+            bot,
+            chat_id,
+            (
                 f"  • <b>Reason:</b> Site '<code>{esc(t or 'empty')}</code>' nahi mili. "
                 "Pehle <code>/allsite</code> check karein ya <code>/dash &lt;number/serial/name&gt;</code> bhejein."
             ),
-            parse_mode=ParseMode.HTML,
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text=f"<i>◈ Opening dashboard: {esc(dev['industry'])}...</i>",
-        parse_mode=ParseMode.HTML,
+        text=f"◈ Opening dashboard: {dev['industry']}...",
     )
 
     try:
@@ -2074,7 +2163,7 @@ async def send_site_dashboard_by_target(
             f"  ▸ Firmware  : <code>{esc(dev['firmware'])}</code>{url_line}"
         )
 
-    await loader.edit_text(header + body, parse_mode=ParseMode.HTML)
+    await safe_edit_html(loader, header + body)
 
 
 async def send_instruments_view(
@@ -2082,10 +2171,10 @@ async def send_instruments_view(
 ) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -2108,10 +2197,10 @@ async def send_instruments_view(
         ]
 
     if not devs:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  ▸ <code>'{esc(query or 'sites')}' ke liye koi site nahi mili.</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  ▸ <code>'{esc(query or 'sites')}' ke liye koi site nahi mili.</code>",
         )
         return
 
@@ -2129,8 +2218,7 @@ async def send_instruments_view(
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="<i>◈ Fetching tank & instrument readings (mm, litr)...</i>",
-        parse_mode=ParseMode.HTML,
+        text="◈ Fetching tank & instrument readings (mm, litr)...",
     )
 
     blocks: list[str] = [
@@ -2167,16 +2255,16 @@ async def send_instruments_view(
     blocks.append(
         f"\n  ▸ Pages: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
     )
-    await loader.edit_text("\n".join(blocks), parse_mode=ParseMode.HTML)
+    await safe_edit_html(loader, "\n".join(blocks))
 
 
 async def send_online_page(chat_id: int, page: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -2189,10 +2277,10 @@ async def send_online_page(chat_id: int, page: int, bot) -> None:
         online_list = analysis["online_list"]
 
         if not online_list:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="  ▸ <code>Koi connected device nahi mila.</code>",
-                parse_mode=ParseMode.HTML,
+            await safe_send_html(
+                bot,
+                chat_id,
+                "  ▸ <code>Koi connected device nahi mila.</code>",
             )
             return
 
@@ -2219,24 +2307,22 @@ async def send_online_page(chat_id: int, page: int, bot) -> None:
         lines.append(
             f"\n  ▸ Pages: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
         )
-        await bot.send_message(
-            chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML
-        )
+        await safe_send_html(bot, chat_id, "\n".join(lines))
     except Exception as exc:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • <b>Online Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • <b>Online Error:</b> <code>{esc(exc)}</code>",
         )
 
 
 async def send_unassigned_page(chat_id: int, page: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -2249,10 +2335,10 @@ async def send_unassigned_page(chat_id: int, page: int, bot) -> None:
         unassigned_list = analysis["unassigned_list"]
 
         if not unassigned_list:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="  ▸ <code>Koi N/A unassigned device nahi mila.</code>",
-                parse_mode=ParseMode.HTML,
+            await safe_send_html(
+                bot,
+                chat_id,
+                "  ▸ <code>Koi N/A unassigned device nahi mila.</code>",
             )
             return
 
@@ -2279,41 +2365,39 @@ async def send_unassigned_page(chat_id: int, page: int, bot) -> None:
         lines.append(
             f"\n  ▸ Pages: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
         )
-        await bot.send_message(
-            chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML
-        )
+        await safe_send_html(bot, chat_id, "\n".join(lines))
     except Exception as exc:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • <b>Unassigned Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • <b>Unassigned Error:</b> <code>{esc(exc)}</code>",
         )
 
 
 async def step_pagination(chat_id: int, delta: int, bot) -> None:
     st = LAST_PAGE_STATE.get(chat_id)
     if not st:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  • <b>Reason:</b> Koi active paginated list nahi hai. Pehle <code>/allsite</code>, <code>/online</code>, <code>/unassigned</code>, ya <code>/instruments</code> chalayein.",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  • <b>Reason:</b> Koi active paginated list nahi hai. Pehle <code>/allsite</code>, <code>/online</code>, <code>/unassigned</code>, ya <code>/instruments</code> chalayein.",
         )
         return
 
     next_p = int(st.get("page", 0)) + delta
     total_p = int(st.get("total_pages", 1))
     if next_p < 0:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  • Aap pehle hi <b>Page 1</b> par hain.",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  • Aap pehle hi <b>Page 1</b> par hain.",
         )
         return
     if next_p >= total_p:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • Aap aakhri <b>Page {total_p}</b> par hain.",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • Aap aakhri <b>Page {total_p}</b> par hain.",
         )
         return
 
@@ -2337,10 +2421,10 @@ async def step_pagination(chat_id: int, delta: int, bot) -> None:
 async def send_health_action(chat_id: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
@@ -2378,36 +2462,36 @@ async def send_health_action(chat_id: int, bot) -> None:
             "╚══════════════════════╝\n"
             f"  ▸ Client      : <code>{esc(CLIENT_NAME)}</code>\n"
             f"  ▸ Source      : <code>{esc(meta.get('source', 'none'))}</code>\n"
+            f"  ▸ HTML Len    : <code>{meta.get('html_length', 0)}</code> | TRs: <code>{meta.get('tr_total', 0)}</code>\n"
             f"  ▸ Sync Rate   : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
             f"  ▸ HTTP 500    : <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
             f"  ▸ Total / N/A : <b>{analysis['total']} / {analysis['unassigned_count']}</b>\n\n"
             f"<b>◈ {sc('Device Types')}</b>\n{type_lines}\n\n"
             f"<b>◈ {sc('Firmware')}</b>\n{fw_lines}"
         )
-        await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
+        await safe_send_html(bot, chat_id, msg)
     except Exception as exc:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • <b>Health Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • <b>Health Error:</b> <code>{esc(exc)}</code>",
         )
 
 
 async def send_export_csv_action(chat_id: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="<i>◈ Generating CSV report...</i>",
-        parse_mode=ParseMode.HTML,
+        text="◈ Generating CSV report...",
     )
     try:
         analysis = await asyncio.to_thread(
@@ -2422,18 +2506,17 @@ async def send_export_csv_action(chat_id: int, bot) -> None:
             document=io.BytesIO(csv_bytes),
             filename=fname,
             caption=(
-                f"<b>{esc(CLIENT_NAME)} — {sc('CSV EXPORT')}</b>\n"
-                f"▸ Total: <b>{analysis['total']}</b> | "
-                f"Assigned: <b>{analysis['assigned_count']}</b> | "
-                f"Unassigned: <b>{analysis['unassigned_count']}</b>"
+                f"{CLIENT_NAME} — {sc('CSV EXPORT')}\n"
+                f"▸ Total: {analysis['total']} | "
+                f"Assigned: {analysis['assigned_count']} | "
+                f"Unassigned: {analysis['unassigned_count']}"
             ),
-            parse_mode=ParseMode.HTML,
         )
         await loader.delete()
     except Exception as exc:
-        await loader.edit_text(
+        await safe_edit_html(
+            loader,
             f"  • <b>CSV Export Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
         )
 
 
@@ -2442,20 +2525,20 @@ async def send_site_search_action(
 ) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
 
     q = (query or "").strip().lower()
     if not q:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Use: <code>/site &lt;industry / site / serial&gt;</code>",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Use: <code>/site &lt;industry / site / serial&gt;</code>",
         )
         return
 
@@ -2472,10 +2555,10 @@ async def send_site_search_action(
         or q in str(d.get("site_id", "")).lower()
     ]
     if not matches:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"  • '<code>{esc(query)}</code>' ke liye koi match nahi mila.",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • '<code>{esc(query)}</code>' ke liye koi match nahi mila.",
         )
         return
 
@@ -2486,26 +2569,23 @@ async def send_site_search_action(
     ]
     for i, d in enumerate(matches[:10], start=1):
         lines.append(format_premium_device_block(d, i))
-    await bot.send_message(
-        chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML
-    )
+    await safe_send_html(bot, chat_id, "\n".join(lines))
 
 
 async def send_ai_analyze_action(chat_id: int, bot) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="<i>◈ Groq AI live telemetry &amp; dashboard readings analyze kar raha hai...</i>",
-        parse_mode=ParseMode.HTML,
+        text="◈ Groq AI live telemetry & dashboard readings analyze kar raha hai...",
     )
     try:
         analysis = await asyncio.to_thread(
@@ -2524,11 +2604,11 @@ async def send_ai_analyze_action(chat_id: int, bot) -> None:
             f"  ▸ Time: <i>{esc(analysis['checked_at_ist'])}</i>\n\n"
             f"{clean_ai_text(report_txt)}"
         )
-        await loader.edit_text(msg, parse_mode=ParseMode.HTML)
+        await safe_edit_html(loader, msg)
     except Exception as exc:
-        await loader.edit_text(
+        await safe_edit_html(
+            loader,
             f"  • <b>AI Analyze Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
         )
 
 
@@ -2537,18 +2617,17 @@ async def send_ai_answer_action(
 ) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
             reply_markup=guest_reply_keyboard(),
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="<i>◈ Groq AI live data check karke jawab de raha hai...</i>",
-        parse_mode=ParseMode.HTML,
+        text="◈ Groq AI live data check karke jawab de raha hai...",
     )
     try:
         analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
@@ -2564,11 +2643,11 @@ async def send_ai_answer_action(
             "╚══════════════════════╝\n"
             f"{clean_ai_text(ans)}"
         )
-        await loader.edit_text(msg, parse_mode=ParseMode.HTML)
+        await safe_edit_html(loader, msg)
     except Exception as exc:
-        await loader.edit_text(
+        await safe_edit_html(
+            loader,
             f"  • <b>Groq AI Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
         )
 
 
@@ -2724,9 +2803,10 @@ async def cmd_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     bucket = context.args[0].strip().lower()
     if bucket not in AGING_RANGE_CONFIG:
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            chat_id,
             "  ▸ Use: <code>/age 1d</code>, <code>/age 1w</code>, <code>/age 24d</code>, <code>/age 11m</code>, <code>/age 1y</code>, ya <code>/age gt1y</code>",
-            parse_mode=ParseMode.HTML,
         )
         return
     await send_aging_bucket_page(chat_id, bucket, 0, context.bot)
@@ -2800,18 +2880,20 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(chat_id, update.effective_user.id, context.bot):
         return
     if not require_auth(chat_id):
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            parse_mode=ParseMode.HTML,
             reply_markup=guest_reply_keyboard(),
         )
         return
     q = " ".join(context.args).strip() if context.args else ""
     if not q:
         AI_CHAT_MODE.add(chat_id)
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            chat_id,
             "  ▸ <b>Groq AI Mode ON</b> — Apna sawal bhejein (jaise tank level, mm, litr, offline sites). Band karne ke liye <code>/exit_ai</code> bhejein.",
-            parse_mode=ParseMode.HTML,
         )
         return
     await send_ai_answer_action(chat_id, q, context.bot)
@@ -2824,9 +2906,10 @@ async def cmd_exit_ai(
         return
     chat_id = update.effective_chat.id
     AI_CHAT_MODE.discard(chat_id)
-    await update.message.reply_text(
+    await safe_send_html(
+        context.bot,
+        chat_id,
         "  ▸ <b>Groq AI Mode OFF</b>.",
-        parse_mode=ParseMode.HTML,
         reply_markup=bottom_reply_keyboard(),
     )
 
@@ -2856,8 +2939,8 @@ async def cmd_bot_on(
         return
     BOT_ENABLED = True
     save_setting_db("bot_enabled", "1")
-    await update.message.reply_text(
-        "  ∙ <b>Bot ON kar diya gaya hai.</b>", parse_mode=ParseMode.HTML
+    await safe_send_html(
+        context.bot, update.effective_chat.id, "  ∙ <b>Bot ON kar diya gaya hai.</b>"
     )
 
 
@@ -2872,8 +2955,8 @@ async def cmd_bot_off(
         return
     BOT_ENABLED = False
     save_setting_db("bot_enabled", "0")
-    await update.message.reply_text(
-        "  • <b>Bot OFF kar diya gaya hai.</b>", parse_mode=ParseMode.HTML
+    await safe_send_html(
+        context.bot, update.effective_chat.id, "  • <b>Bot OFF kar diya gaya hai.</b>"
     )
 
 
@@ -2891,9 +2974,10 @@ async def cmd_maint_on(
         MAINTENANCE_MSG = " ".join(context.args).strip()
     save_setting_db("maint_mode", "1")
     save_setting_db("maint_msg", MAINTENANCE_MSG)
-    await update.message.reply_text(
+    await safe_send_html(
+        context.bot,
+        update.effective_chat.id,
         f"  ◈ <b>Maintenance Mode ON:</b> <code>{esc(MAINTENANCE_MSG)}</code>",
-        parse_mode=ParseMode.HTML,
     )
 
 
@@ -2908,8 +2992,8 @@ async def cmd_maint_off(
         return
     MAINTENANCE_MODE = False
     save_setting_db("maint_mode", "0")
-    await update.message.reply_text(
-        "  ∙ <b>Maintenance Mode OFF.</b>", parse_mode=ParseMode.HTML
+    await safe_send_html(
+        context.bot, update.effective_chat.id, "  ∙ <b>Maintenance Mode OFF.</b>"
     )
 
 
@@ -2923,9 +3007,10 @@ async def cmd_set_refresh(
         await update.message.reply_text("  • Admin access required.")
         return
     if not context.args:
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            update.effective_chat.id,
             "  ▸ Use: <code>/set_refresh 30</code> (15 se 3600 seconds)",
-            parse_mode=ParseMode.HTML,
         )
         return
     try:
@@ -2934,13 +3019,16 @@ async def cmd_set_refresh(
             raise ValueError()
         REFRESH_INTERVAL_SEC = sec
         save_setting_db("refresh_sec", str(sec))
-        await update.message.reply_text(
-            f"  ∙ <b>Sync Rate set to {sec}s.</b>", parse_mode=ParseMode.HTML
+        await safe_send_html(
+            context.bot,
+            update.effective_chat.id,
+            f"  ∙ <b>Sync Rate set to {sec}s.</b>",
         )
     except ValueError:
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            update.effective_chat.id,
             "  • 15 se 3600 ke beech valid seconds dein.",
-            parse_mode=ParseMode.HTML,
         )
 
 
@@ -2958,16 +3046,18 @@ async def cmd_set_notif(
         "compact",
         "alerts_only",
     ):
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            update.effective_chat.id,
             "  ▸ Use: <code>/set_notif detailed | compact | alerts_only</code>",
-            parse_mode=ParseMode.HTML,
         )
         return
     NOTIF_STYLE = context.args[0].lower()
     save_setting_db("notif_style", NOTIF_STYLE)
-    await update.message.reply_text(
+    await safe_send_html(
+        context.bot,
+        update.effective_chat.id,
         f"  ∙ <b>Notification Style set to:</b> <code>{esc(NOTIF_STYLE)}</code>",
-        parse_mode=ParseMode.HTML,
     )
 
 
@@ -2998,8 +3088,8 @@ async def handle_text_message(
             "step": "awaiting_password",
             "username": raw_text,
         }
-        await update.message.reply_text(
-            "  ▸ Ab apna <b>Password</b> bhejein:", parse_mode=ParseMode.HTML
+        await safe_send_html(
+            context.bot, chat_id, "  ▸ Ab apna <b>Password</b> bhejein:"
         )
         return
 
@@ -3011,19 +3101,21 @@ async def handle_text_message(
         except Exception:
             pass
 
-        wait_msg = await update.message.reply_text(
-            "<i>◈ EnviroFRONT portal par login ho raha hai...</i>",
-            parse_mode=ParseMode.HTML,
-        )
+        wait_msg = await bot.send_message(
+            chat_id=chat_id,
+            text="◈ EnviroFRONT portal par login ho raha hai...",
+        ) if (bot := context.bot) else None
+
         session, err = await asyncio.to_thread(
             login_envirofront, username, password
         )
         if not session:
             USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-            await wait_msg.edit_text(
-                f"  • <b>Login Failed:</b> <code>{esc(err)}</code>\n  ▸ Dobara <b>Login ID / Email</b> bhejein:",
-                parse_mode=ParseMode.HTML,
-            )
+            if wait_msg:
+                await safe_edit_html(
+                    wait_msg,
+                    f"  • <b>Login Failed:</b> <code>{esc(err)}</code>\n  ▸ Dobara <b>Login ID / Email</b> bhejein:",
+                )
             return
 
         USER_SESSIONS[chat_id] = {
@@ -3031,19 +3123,21 @@ async def handle_text_message(
             "username": username,
             "session": session,
         }
-        await wait_msg.edit_text(
-            "╔══════════════════════╗\n"
-            f"║  ∙ <b>{esc(CLIENT_NAME)}</b>\n"
-            f"║  <i>{sc('AUTHENTICATED')}</i>\n"
-            "╚══════════════════════╝\n"
-            f"  ▸ Account   : <code>{esc(username)}</code>\n"
-            f"  ▸ Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
-            f"  ▸ Alerts    : <code>2h → 10h → 1d (1-Time)</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        await update.message.reply_text(
+        if wait_msg:
+            await safe_edit_html(
+                wait_msg,
+                "╔══════════════════════╗\n"
+                f"║  ∙ <b>{esc(CLIENT_NAME)}</b>\n"
+                f"║  <i>{sc('AUTHENTICATED')}</i>\n"
+                "╚══════════════════════╝\n"
+                f"  ▸ Account   : <code>{esc(username)}</code>\n"
+                f"  ▸ Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+                f"  ▸ Alerts    : <code>2h → 10h → 1d (1-Time)</code>",
+            )
+        await safe_send_html(
+            context.bot,
+            chat_id,
             f"◈ <b>{esc(CLIENT_NAME)} — {sc('PANEL ACTIVE')}</b>",
-            parse_mode=ParseMode.HTML,
             reply_markup=bottom_reply_keyboard(),
         )
         return
@@ -3098,16 +3192,18 @@ async def handle_text_message(
         return
     if action == "aichat":
         if not require_auth(chat_id):
-            await update.message.reply_text(
+            await safe_send_html(
+                context.bot,
+                chat_id,
                 "  ▸ Pehle login karein (<code>/login</code>):",
-                parse_mode=ParseMode.HTML,
                 reply_markup=guest_reply_keyboard(),
             )
             return
         AI_CHAT_MODE.add(chat_id)
-        await update.message.reply_text(
+        await safe_send_html(
+            context.bot,
+            chat_id,
             "  ▸ <b>Groq AI Chat ON</b> — Apna sawal bhejein. Band karne ke liye <code>/exit_ai</code> bhejein.",
-            parse_mode=ParseMode.HTML,
         )
         return
     if action == "aireport":
@@ -3127,9 +3223,10 @@ async def handle_text_message(
         await send_ai_answer_action(chat_id, raw_text, context.bot)
         return
 
-    await update.message.reply_text(
+    await safe_send_html(
+        context.bot,
+        chat_id,
         "  ▸ Command ya button use karein. Poori list ke liye <code>/help</code> bhejein.",
-        parse_mode=ParseMode.HTML,
         reply_markup=(
             bottom_reply_keyboard()
             if require_auth(chat_id)
@@ -3199,21 +3296,18 @@ async def background_monitor_loop(app) -> None:
                         if prev_conn_map.get(serial) is False:
                             clear_stage_alerts_for_device(chat_id, serial)
                             if NOTIF_STYLE != "alerts_only":
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=(
-                                            "╔══════════════════════╗\n"
-                                            f"║  ∙ <b>{sc('SITE RECOVERED')}</b>     ║\n"
-                                            "╚══════════════════════╝\n"
-                                            f"  ▸ Site   : <b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>\n"
-                                            f"  ▸ Serial : <b>{esc(serial)}</b>\n"
-                                            f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
-                                        ),
-                                        parse_mode=ParseMode.HTML,
-                                    )
-                                except Exception:
-                                    pass
+                                await safe_send_html(
+                                    app.bot,
+                                    chat_id,
+                                    (
+                                        "╔══════════════════════╗\n"
+                                        f"║  ∙ <b>{sc('SITE RECOVERED')}</b>     ║\n"
+                                        "╚══════════════════════╝\n"
+                                        f"  ▸ Site   : <b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>\n"
+                                        f"  ▸ Serial : <b>{esc(serial)}</b>\n"
+                                        f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
+                                    ),
+                                )
                         continue
 
                     if off_hrs is None:
@@ -3230,22 +3324,19 @@ async def background_monitor_loop(app) -> None:
                                 dev.get("last_seen"),
                                 dev.get("offline_duration"),
                             )
-                            try:
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=(
-                                        "╔══════════════════════╗\n"
-                                        f"║  • <b>{esc(stage_badge)} ALERT</b>  ║\n"
-                                        "╚══════════════════════╝\n"
-                                        f"  ▸ Site   : <b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>\n"
-                                        f"  ▸ Serial : <b>{esc(serial)}</b>\n"
-                                        f"  ▸ Status : <code>{esc(off_str)}</code>\n"
-                                        f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
-                                    ),
-                                    parse_mode=ParseMode.HTML,
-                                )
-                            except Exception:
-                                pass
+                            await safe_send_html(
+                                app.bot,
+                                chat_id,
+                                (
+                                    "╔══════════════════════╗\n"
+                                    f"║  • <b>{esc(stage_badge)} ALERT</b>  ║\n"
+                                    "╚══════════════════════╝\n"
+                                    f"  ▸ Site   : <b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>\n"
+                                    f"  ▸ Serial : <b>{esc(serial)}</b>\n"
+                                    f"  ▸ Status : <code>{esc(off_str)}</code>\n"
+                                    f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
+                                ),
+                            )
         except asyncio.CancelledError:
             break
         except Exception as exc:
