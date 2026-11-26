@@ -10,7 +10,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -44,18 +44,45 @@ ADMIN_TG_ID: int = int(
 CLIENT_NAME: str = os.getenv("CLIENT_NAME", "BAAGI JAAT").strip() or "BAAGI JAAT"
 DB_PATH: str = os.getenv("BOT_DB_PATH", "baagijaat_telemetry.db").strip()
 
-# Authentic M2M Logger / EnviroFRONT URLs
+# Authentic EnviroFRONT / M2M Logger Endpoints
 BASE_URL: str = (
     os.getenv("ENVIRO_BASE_URL", "https://envirofront.m2mlogger.com")
     .strip()
     .rstrip("/")
 )
+UAC: str = os.getenv("ENVIRO_UAC", "pae").strip() or "pae"
 LOGIN_URL: str = os.getenv("ENVIRO_LOGIN_URL", f"{BASE_URL}/").strip()
-DEVICES_URL: str = (
-    os.getenv("ENVIRO_DEVICES_URL", f"{BASE_URL}/pae/ControlPanel/Devices").strip()
+DEVICES_PAGE_URL: str = (
+    os.getenv("ENVIRO_DEVICES_PAGE_URL", f"{BASE_URL}/{UAC}/ControlPanel/Devices")
+    .strip()
 )
-WS_DEVICES_URL: str = (
-    os.getenv("ENVIRO_WS_URL", f"{BASE_URL}/ws/Devices.ashx").strip()
+DEVICES_WS_URL: str = (
+    os.getenv("ENVIRO_DEVICES_WS_URL", f"{BASE_URL}/Services/EF/WS/Devices")
+    .strip()
+)
+SITE_NAME_WS_BASE: str = (
+    os.getenv("ENVIRO_SITE_NAME_WS_BASE", f"{BASE_URL}/Services/EF/WS/Site/Name")
+    .strip()
+    .rstrip("/")
+)
+DASHBOARD_WS_URL: str = (
+    os.getenv(
+        "ENVIRO_DASHBOARD_WS_URL", f"{BASE_URL}/Services/EF/WS/Sites/Dashboard"
+    )
+    .strip()
+)
+VAT_CODES_WS_BASE: str = (
+    os.getenv(
+        "ENVIRO_VAT_CODES_WS_BASE", f"{BASE_URL}/Services/EF/WS/Site/VatCodes"
+    )
+    .strip()
+    .rstrip("/")
+)
+EXCISE_REQ_WS_URL: str = (
+    os.getenv(
+        "ENVIRO_EXCISE_REQ_WS_URL", f"{BASE_URL}/Services/EF/WS/UpExcise/Request"
+    )
+    .strip()
 )
 
 GROQ_CHAT_URL: str = "https://api.groq.com/openai/v1/chat/completions"
@@ -79,6 +106,17 @@ LAST_PAGE_STATE: dict[int, dict[str, Any]] = {}
 SENT_STAGE_ALERTS: set[str] = set()
 AI_CHAT_MODE: set[int] = set()
 DASHBOARD_CACHE: dict[str, dict[str, Any]] = {}
+SITE_NAME_CACHE: dict[str, str] = {}
+VAT_CODE_CACHE: dict[str, list[str]] = {}
+API_REPORT_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _ts_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def today_ist_report_date() -> str:
+    return datetime.now(IST).strftime("%d-%b-%Y")
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -257,7 +295,6 @@ def sc(text: str) -> str:
 
 def esc(val: Any) -> str:
     s = str(val or "")
-    # Neutralize stray angle brackets that could look like broken HTML tags
     s = s.replace("<", "&lt;").replace(">", "&gt;")
     return html.escape(s, quote=True)
 
@@ -353,12 +390,17 @@ def format_premium_device_block(
         )
     )
     prefix = f"#{index} " if index is not None else ""
-    sid = f" [ID:{esc(dev['site_id'])}]" if dev.get("site_id") else ""
+    sid = f" [Site:{esc(dev['site_id'])}]" if dev.get("site_id") else ""
+    scode = (
+        f" | Code: <code>{esc(dev['site_code'])}</code>"
+        if dev.get("site_code")
+        else ""
+    )
 
     if NOTIF_STYLE == "compact":
         return (
             f"▸ {prefix}<b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>{sid}\n"
-            f"  Serial: <b>{esc(dev.get('serial_no', 'N/A'))}</b> | {dot} <b>{conn_word}</b> | "
+            f"  Serial: <b>{esc(dev.get('serial_no', 'N/A'))}</b> | {dot} <b>{conn_word}</b>{scode} | "
             f"<code>{esc(dev.get('display_time', 'N/A'))}</code> / <code>{esc(off_info)}</code>"
         )
 
@@ -366,7 +408,7 @@ def format_premium_device_block(
         f"╔══════════════════════╗\n"
         f"║  {dot} {prefix}<b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>{sid}\n"
         f"╚══════════════════════╝\n"
-        f"  ▸ Serial : <b>{esc(dev.get('serial_no', 'N/A'))}</b>\n"
+        f"  ▸ Serial : <b>{esc(dev.get('serial_no', 'N/A'))}</b>{scode}\n"
         f"  ▸ Status : {dot} <b>{conn_word}</b>\n"
         f"  ▸ Device : <code>{esc(dev.get('device_type', 'N/A'))}</code> | FW: <code>{esc(dev.get('firmware', 'N/A'))}</code>\n"
         f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code> / <code>{esc(off_info)}</code>"
@@ -403,8 +445,17 @@ def guest_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 # ==============================================================================
-# PORTAL LOGIN, MULTI-METHOD PARSING & LIVE DASHBOARD / INSTRUMENT SCRAPER
+# PORTAL LOGIN & REAL ENVIROFRONT API CLIENTS
 # ==============================================================================
+def _ajax_headers(referer: str) -> dict[str, str]:
+    return {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "text/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": referer,
+    }
+
+
 def login_envirofront(
     username: str, password: str
 ) -> tuple[requests.Session | None, str]:
@@ -414,7 +465,7 @@ def login_envirofront(
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Chrome/158.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
@@ -503,7 +554,7 @@ def login_envirofront(
         return None, "Galat username ya password."
 
     try:
-        r_chk = sess.get(DEVICES_URL, timeout=20, allow_redirects=True)
+        r_chk = sess.get(DEVICES_PAGE_URL, timeout=20, allow_redirects=True)
         if "account/login" in r_chk.url.lower():
             return None, "Session verify nahi hua (redirect to login)."
     except Exception as exc:
@@ -575,44 +626,9 @@ def classify_connection(
             return True, "CONNECTED", round(hours, 2), delta
         return False, "DISCONNECTED", round(hours, 2), delta
 
-    if any(k in st_low for k in ("online", "connected", "active", "live")):
+    if any(k in st_low for k in ("online", "connected", "active", "live", "true")):
         return True, "CONNECTED", None, None
     return False, "DISCONNECTED", None, None
-
-
-def extract_site_id_map_from_html(
-    soup: BeautifulSoup, raw_html: str
-) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-
-    for a in soup.find_all("a", href=True):
-        href = str(a["href"])
-        m = re.search(r"/pae/Site/(\d+)/Dashboard", href, re.IGNORECASE)
-        if m:
-            sid = m.group(1)
-            txt = " ".join(a.get_text(" ", strip=True).split())
-            if txt:
-                mapping[txt.lower()] = sid
-            parent_tr = a.find_parent("tr")
-            if parent_tr:
-                row_txt = parent_tr.get_text(" ", strip=True)
-                sm = re.search(r"\b(\d{6,16})\b", row_txt)
-                if sm:
-                    mapping[sm.group(1)] = sid
-
-    for m in re.finditer(
-        r'["\']?(?:SiteId|siteId|Site_Id|site_id)["\']?\s*[:=]\s*["\']?(\d{1,8})["\']?',
-        raw_html,
-    ):
-        sid = m.group(1)
-        win = raw_html[
-            max(0, m.start() - 220) : min(len(raw_html), m.end() + 220)
-        ]
-        ser_m = re.search(r"\b(\d{6,16})\b", win)
-        if ser_m:
-            mapping.setdefault(ser_m.group(1), sid)
-
-    return mapping
 
 
 def normalize_device_record(
@@ -625,6 +641,7 @@ def normalize_device_record(
     raw_last_seen: str,
     now_utc: datetime,
     site_id: str = "",
+    site_code: str = "",
 ) -> dict[str, Any]:
     ser = (serial_no or "N/A").strip()
     ind = (industry or "N/A").strip() or "N/A"
@@ -652,8 +669,9 @@ def normalize_device_record(
         display_time = (raw_last_seen or "N/A").strip() or "N/A"
 
     sid_clean = (site_id or "").strip()
+    scode_clean = (site_code or "").strip()
     dash_url = (
-        f"{BASE_URL}/pae/Site/{sid_clean}/Dashboard"
+        f"{BASE_URL}/{UAC}/Site/{sid_clean}/Dashboard"
         if sid_clean.isdigit()
         else ""
     )
@@ -661,6 +679,7 @@ def normalize_device_record(
     return {
         "serial_no": ser,
         "site_id": sid_clean,
+        "site_code": scode_clean,
         "dashboard_url": dash_url,
         "industry": ind,
         "site": st,
@@ -676,101 +695,15 @@ def normalize_device_record(
     }
 
 
-def _dict_to_device(
-    item: dict[str, Any], now_utc: datetime, site_id_map: dict[str, str]
-) -> dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    low_map = {str(k).lower(): v for k, v in item.items()}
-
-    def pick(*keys: str) -> str:
-        for k in keys:
-            v = item.get(k)
-            if v is None:
-                v = low_map.get(k.lower())
-            if v is not None and str(v).strip() != "":
-                return str(v).strip()
-        return ""
-
-    serial = pick(
-        "SerialNo",
-        "serial_no",
-        "Serial",
-        "DeviceSerial",
-        "SerialNumber",
-        "IMEI",
-        "LoggerId",
-        "DeviceId",
-    )
-    if not serial:
-        return None
-
-    sid = pick("SiteId", "siteId", "Site_Id", "site_id", "ID") or site_id_map.get(
-        serial, ""
-    )
-    ind = pick(
-        "IndustryName",
-        "Industry",
-        "ClientName",
-        "CompanyName",
-        "SiteName",
-        "Name",
-    ) or "N/A"
-    stype = pick("SiteType", "Site", "Category", "Location") or "N/A"
-    dtype = pick("DeviceType", "Model", "Type", "LoggerType") or "N/A"
-    fw = pick("Firmware", "FirmwareVersion", "FW", "Version") or "N/A"
-    raw_ts = pick(
-        "LastSeen",
-        "LastDataTime",
-        "LastCommunication",
-        "UpdatedOn",
-        "LastUpdate",
-        "LastPacketTime",
-        "DateTime",
-    )
-    raw_st = pick(
-        "Status",
-        "ConnectionStatus",
-        "IsConnected",
-        "Online",
-        "IsOnline",
-    )
-    return normalize_device_record(
-        serial_no=serial,
-        industry=ind,
-        site_type=stype,
-        device_type=dtype,
-        firmware=fw,
-        raw_status=raw_st,
-        raw_last_seen=raw_ts,
-        now_utc=now_utc,
-        site_id=sid,
-    )
-
-
 def _extract_list_from_json_payload(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
-        if data and all(isinstance(x, list) for x in data):
-            # Convert array-of-arrays rows into dict rows
-            out_rows: list[dict[str, Any]] = []
-            for arr in data:
-                if len(arr) >= 2:
-                    out_rows.append(
-                        {
-                            "SerialNo": str(arr[0]),
-                            "IndustryName": str(arr[1]) if len(arr) > 1 else "N/A",
-                            "SiteType": str(arr[2]) if len(arr) > 2 else "N/A",
-                            "DeviceType": str(arr[3]) if len(arr) > 3 else "N/A",
-                            "Firmware": str(arr[4]) if len(arr) > 4 else "N/A",
-                            "LastSeen": str(arr[-1]),
-                        }
-                    )
-            return out_rows
         return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict):
         for key in (
             "data",
+            "Data",
             "rows",
+            "Rows",
             "devices",
             "Devices",
             "items",
@@ -795,254 +728,471 @@ def _extract_list_from_json_payload(data: Any) -> list[dict[str, Any]]:
     return []
 
 
-def extract_devices_from_ws(
-    session: requests.Session,
-    now_utc: datetime,
-    site_id_map: dict[str, str],
+def _dict_to_device(
+    item: dict[str, Any], now_utc: datetime
+) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    low_map = {str(k).lower(): v for k, v in item.items()}
+
+    def pick(*keys: str) -> str:
+        for k in keys:
+            v = item.get(k)
+            if v is None:
+                v = low_map.get(k.lower())
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+        return ""
+
+    serial = pick(
+        "SerialNo",
+        "serial_no",
+        "Serial",
+        "DeviceSerial",
+        "SerialNumber",
+        "IMEI",
+        "LoggerId",
+        "DeviceId",
+    )
+    sid = pick("SiteId", "siteId", "Site_Id", "site_id", "ID")
+    scode = pick(
+        "SiteCode",
+        "siteCode",
+        "Code",
+        "UnitCode",
+        "SiteNo",
+    )
+    ind = (
+        pick(
+            "IndustryName",
+            "Industry",
+            "ClientName",
+            "CompanyName",
+            "SiteName",
+            "Name",
+        )
+        or "N/A"
+    )
+    stype = pick("SiteType", "Site", "Category", "Location") or "N/A"
+    dtype = pick("DeviceType", "Model", "Type", "LoggerType") or "N/A"
+    fw = pick("Firmware", "FirmwareVersion", "FW", "Version") or "N/A"
+    raw_ts = pick(
+        "LastSeen",
+        "LastDataTime",
+        "LastCommunication",
+        "UpdatedOn",
+        "LastUpdate",
+        "LastPacketTime",
+        "DateTime",
+    )
+    raw_st = pick(
+        "Status",
+        "ConnectionStatus",
+        "IsConnected",
+        "Online",
+        "IsOnline",
+    )
+
+    if not serial and not sid:
+        return None
+
+    return normalize_device_record(
+        serial_no=serial or f"SITE-{sid}",
+        industry=ind,
+        site_type=stype,
+        device_type=dtype,
+        firmware=fw,
+        raw_status=raw_st,
+        raw_last_seen=raw_ts,
+        now_utc=now_utc,
+        site_id=sid,
+        site_code=scode,
+    )
+
+
+def fetch_devices_from_ws_api(
+    session: requests.Session, now_utc: datetime
 ) -> list[dict[str, Any]]:
-    # Method 1A: GET WS_DEVICES_URL
-    # Method 1B: POST WS_DEVICES_URL (for ASP.NET ASHX / DataTables handlers)
-    for method in ("GET", "POST"):
+    all_devs: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    # Fetch pages (rp=50 as captured in network logs)
+    for page_num in range(1, 11):
+        params = {
+            "uac": UAC,
+            "rp": "50",
+            "page": str(page_num),
+            "devices": "",
+            "deviceType": "",
+            "ind": "",
+            "status": "all",
+            "_": str(_ts_ms()),
+        }
         try:
-            if method == "GET":
-                r = session.get(
-                    WS_DEVICES_URL,
-                    headers={
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": DEVICES_URL,
-                    },
-                    timeout=20,
-                )
-            else:
-                r = session.post(
-                    WS_DEVICES_URL,
-                    data={"draw": "1", "start": "0", "length": "500"},
-                    headers={
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": DEVICES_URL,
-                    },
-                    timeout=20,
-                )
+            r = session.get(
+                DEVICES_WS_URL,
+                params=params,
+                headers=_ajax_headers(DEVICES_PAGE_URL),
+                timeout=22,
+            )
             if not r.ok:
-                continue
+                break
             txt = (r.text or "").strip()
             if not txt or txt.startswith("<"):
-                continue
-            if txt.startswith('{"d":') or txt.startswith("{'d':"):
-                try:
-                    outer = json.loads(txt)
-                    if isinstance(outer, dict) and "d" in outer:
-                        txt = (
-                            outer["d"]
-                            if isinstance(outer["d"], str)
-                            else json.dumps(outer["d"])
-                        )
-                except Exception:
-                    pass
+                break
             data = json.loads(txt)
             rows = _extract_list_from_json_payload(data)
             if not rows:
-                continue
-            out: list[dict[str, Any]] = []
+                break
+
+            added_this_page = 0
             for item in rows:
-                rec = _dict_to_device(item, now_utc, site_id_map)
-                if rec:
-                    out.append(rec)
-            if out:
-                return out
-        except Exception:
-            continue
-    return []
+                rec = _dict_to_device(item, now_utc)
+                if not rec:
+                    continue
+                dedup_key = f"{rec['serial_no']}|{rec['site_id']}|{rec['industry']}"
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
+                    all_devs.append(rec)
+                    added_this_page += 1
 
-
-def extract_devices_from_html_table(
-    soup: BeautifulSoup, now_utc: datetime
-) -> tuple[list[dict[str, Any]], int, int]:
-    devices: list[dict[str, Any]] = []
-    tr_total = 0
-    unparsed_ts = 0
-
-    for tr in soup.select("table tr"):
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        tr_total += 1
-        cells = [" ".join(td.get_text(" ", strip=True).split()) for td in tds]
-        if len(cells) < 2:
-            continue
-
-        row_sid = ""
-        for a in tr.find_all("a", href=True):
-            m = re.search(
-                r"/pae/Site/(\d+)/Dashboard", str(a["href"]), re.IGNORECASE
-            )
-            if m:
-                row_sid = m.group(1)
+            # Stop if fewer than page size returned
+            if len(rows) < 50 or added_this_page == 0:
                 break
+        except Exception as exc:
+            logger.warning("WS Devices page %s error: %s", page_num, exc)
+            break
 
-        serial = ""
-        for c in cells:
-            if re.fullmatch(r"[A-Za-z0-9\-_]{6,20}", c) and re.search(
-                r"\d", c
-            ):
-                if not re.fullmatch(r"\d{1,3}", c):
-                    serial = c
-                    break
-        if not serial:
-            serial = cells[1] if len(cells) > 1 else cells[0]
+    return all_devs
 
-        industry = cells[2] if len(cells) > 2 else "N/A"
-        site_type = cells[3] if len(cells) > 3 else "N/A"
-        dtype = cells[4] if len(cells) > 4 else "N/A"
-        fw = cells[5] if len(cells) > 5 else "N/A"
 
-        raw_ts = ""
-        for c in reversed(cells):
-            if re.search(
-                r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{4}|/Date\(",
-                c,
-            ):
-                raw_ts = c
-                break
-        if not raw_ts and len(cells) >= 2:
-            raw_ts = cells[-1]
+def fetch_site_name_by_code(
+    session: requests.Session, site_code: str, referer: str
+) -> str:
+    code = (site_code or "").strip()
+    if not code:
+        return ""
+    if code in SITE_NAME_CACHE:
+        return SITE_NAME_CACHE[code]
 
-        raw_status = " ".join(cells)
-        rec = normalize_device_record(
-            serial_no=serial,
-            industry=industry,
-            site_type=site_type,
-            device_type=dtype,
-            firmware=fw,
-            raw_status=raw_status,
-            raw_last_seen=raw_ts,
-            now_utc=now_utc,
-            site_id=row_sid,
+    url = f"{SITE_NAME_WS_BASE}/{quote(code)}"
+    try:
+        r = session.get(
+            url,
+            params={"uac": UAC, "_": str(_ts_ms())},
+            headers=_ajax_headers(referer),
+            timeout=15,
         )
-        if rec["last_seen"] is None:
-            unparsed_ts += 1
-        devices.append(rec)
-
-    return devices, tr_total, unparsed_ts
-
-
-def extract_devices_from_embedded_scripts(
-    raw_html: str, now_utc: datetime, site_id_map: dict[str, str]
-) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    seen_serials: set[str] = set()
-    for m in re.finditer(
-        r'\{[^{}]{20,900}?(?:SerialNo|serial_no|Serial|DeviceSerial|IndustryName|LastSeen|LastDataTime)[^{}]{20,900}?\}',
-        raw_html,
-        re.IGNORECASE,
-    ):
-        try:
-            obj = json.loads(m.group(0))
-            rec = _dict_to_device(obj, now_utc, site_id_map)
-            if rec and rec["serial_no"] not in seen_serials:
-                seen_serials.add(rec["serial_no"])
-                found.append(rec)
-        except Exception:
-            continue
-    return found
+        if not r.ok:
+            return ""
+        txt = (r.text or "").strip().strip('"')
+        if not txt:
+            return ""
+        if txt.startswith("{"):
+            obj = json.loads(txt)
+            if isinstance(obj, dict):
+                txt = str(
+                    obj.get("SiteName")
+                    or obj.get("Name")
+                    or obj.get("IndustryName")
+                    or obj.get("d")
+                    or ""
+                ).strip()
+        SITE_NAME_CACHE[code] = txt
+        return txt
+    except Exception:
+        return ""
 
 
-def extract_devices_from_dashboard_links(
-    soup: BeautifulSoup, now_utc: datetime
-) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for a in soup.find_all("a", href=True):
-        href = str(a["href"])
-        m = re.search(r"/pae/Site/(\d+)/Dashboard", href, re.IGNORECASE)
-        if not m:
-            continue
-        sid = m.group(1)
-        if sid in seen:
-            continue
-        seen.add(sid)
-        txt = " ".join(a.get_text(" ", strip=True).split()) or f"Site {sid}"
-        found.append(
-            normalize_device_record(
-                serial_no=f"SITE-{sid}",
-                industry=txt,
-                site_type="Dashboard Site",
-                device_type="Enviro Logger",
-                firmware="N/A",
-                raw_status="",
-                raw_last_seen="",
-                now_utc=now_utc,
-                site_id=sid,
-            )
+def fetch_vat_codes_for_site(
+    session: requests.Session, site_id: str, referer: str
+) -> list[str]:
+    sid = (site_id or "").strip()
+    if not sid.isdigit():
+        return []
+    if sid in VAT_CODE_CACHE:
+        return VAT_CODE_CACHE[sid]
+
+    url = f"{VAT_CODES_WS_BASE}/{sid}"
+    codes: list[str] = []
+    try:
+        r = session.get(
+            url,
+            params={"uac": UAC, "_": str(_ts_ms())},
+            headers=_ajax_headers(referer),
+            timeout=15,
         )
-    return found
+        if r.ok:
+            txt = (r.text or "").strip()
+            if txt and not txt.startswith("<"):
+                parsed = json.loads(txt)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, str) and item.strip():
+                            codes.append(item.strip())
+                        elif isinstance(item, dict):
+                            c = str(
+                                item.get("VatCode")
+                                or item.get("Code")
+                                or item.get("Name")
+                                or item.get("Value")
+                                or ""
+                            ).strip()
+                            if c:
+                                codes.append(c)
+                elif isinstance(parsed, dict):
+                    for k in ("data", "Data", "result", "Result", "items", "vatCodes"):
+                        v = parsed.get(k)
+                        if isinstance(v, list):
+                            for item in v:
+                                if isinstance(item, str) and item.strip():
+                                    codes.append(item.strip())
+                                elif isinstance(item, dict):
+                                    c = str(
+                                        item.get("VatCode")
+                                        or item.get("Code")
+                                        or item.get("Name")
+                                        or ""
+                                    ).strip()
+                                    if c:
+                                        codes.append(c)
+    except Exception:
+        pass
+
+    VAT_CODE_CACHE[sid] = codes
+    return codes
+
+
+def fetch_site_api_report(
+    session: requests.Session,
+    site_id: str,
+    report_date: str | None = None,
+    vat_code: str = "",
+) -> dict[str, Any]:
+    sid = (site_id or "").strip()
+    rdate = (report_date or today_ist_report_date()).strip()
+    if not sid.isdigit():
+        return {
+            "ok": False,
+            "site_id": sid,
+            "report_date": rdate,
+            "vat_codes": [],
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "latest_ts": "",
+            "latest_result": "",
+            "rows": [],
+            "error": "Site ID missing",
+        }
+
+    referer_vat = (
+        f"{BASE_URL}/{UAC}/Site/{sid}/Vat/{quote(vat_code)}/ApiReport"
+        if vat_code
+        else f"{BASE_URL}/{UAC}/Site/{sid}/Dashboard"
+    )
+    vat_codes = fetch_vat_codes_for_site(session, sid, referer_vat)
+    if vat_code and vat_code not in vat_codes:
+        vat_codes.insert(0, vat_code)
+
+    cache_key = f"{sid}:{rdate}"
+    cached = API_REPORT_CACHE.get(cache_key)
+    if cached and (time.time() - cached.get("_ts", 0)) < 45:
+        return cached
+
+    params: dict[str, str] = {
+        "sEcho": "1",
+        "iColumns": "18",
+        "sColumns": "," * 17,
+        "iDisplayStart": "0",
+        "iDisplayLength": "22",
+        "sSearch": "",
+        "bRegex": "false",
+        "strReportDate": rdate,
+        "strSearch": "",
+        "siteId": sid,
+        "_": str(_ts_ms()),
+    }
+    cols = [
+        "Id",
+        "AccountId",
+        "siteId",
+        "UserId",
+        "ExciseApiUrl",
+        "UnitCode",
+        "VatCode",
+        "RequestId",
+        "Timestamp",
+        "EncryptedRequest",
+        "DecryptedRequest",
+        "DecryptedResponse",
+        "UserIp",
+        "Status",
+        "RequestType",
+        "Process",
+        "Result",
+        "IsDeleted",
+    ]
+    for idx, col in enumerate(cols):
+        params[f"mDataProp_{idx}"] = col
+        params[f"sSearch_{idx}"] = ""
+        params[f"bRegex_{idx}"] = "false"
+        params[f"bSearchable_{idx}"] = "true"
+
+    rows: list[dict[str, Any]] = []
+    err_msg = ""
+    try:
+        r = session.get(
+            EXCISE_REQ_WS_URL,
+            params=params,
+            headers={
+                "Accept": "*/*",
+                "Content-Type": "application/json; charset=utf-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": referer_vat,
+            },
+            timeout=22,
+        )
+        if not r.ok:
+            err_msg = f"HTTP {r.status_code}"
+        else:
+            txt = (r.text or "").strip()
+            if txt and not txt.startswith("<"):
+                parsed = json.loads(txt)
+                raw_rows = _extract_list_from_json_payload(parsed)
+                if not raw_rows and isinstance(parsed, dict):
+                    for k in ("aaData", "data", "rows", "Result", "result"):
+                        if isinstance(parsed.get(k), list):
+                            raw_rows = [
+                                x for x in parsed[k] if isinstance(x, dict)
+                            ]
+                            break
+                rows = raw_rows
+    except Exception as exc:
+        err_msg = str(exc)
+
+    success_cnt = 0
+    failed_cnt = 0
+    latest_ts = ""
+    latest_result = ""
+
+    for item in rows:
+        st_val = str(
+            item.get("Status")
+            or item.get("Result")
+            or item.get("Process")
+            or ""
+        ).lower()
+        if any(
+            w in st_val
+            for w in ("success", "ok", "200", "completed", "approved", "valid")
+        ) and not any(
+            w in st_val for w in ("fail", "error", "invalid", "reject", "timeout")
+        ):
+            success_cnt += 1
+        elif st_val:
+            failed_cnt += 1
+
+        ts_val = str(item.get("Timestamp") or item.get("DateTime") or "").strip()
+        res_val = str(
+            item.get("Result")
+            or item.get("Status")
+            or item.get("DecryptedResponse")
+            or ""
+        ).strip()
+        if ts_val and not latest_ts:
+            latest_ts = ts_val
+        if res_val and not latest_result:
+            latest_result = res_val[:80]
+
+    res_obj = {
+        "ok": not bool(err_msg),
+        "site_id": sid,
+        "report_date": rdate,
+        "vat_codes": vat_codes,
+        "total": len(rows),
+        "success": success_cnt,
+        "failed": failed_cnt,
+        "latest_ts": latest_ts,
+        "latest_result": latest_result,
+        "rows": rows[:15],
+        "error": err_msg,
+        "_ts": time.time(),
+    }
+    API_REPORT_CACHE[cache_key] = res_obj
+    return res_obj
+
+
+def _discover_dashboard_tags_and_page(
+    session: requests.Session, site_id: str
+) -> tuple[str, str]:
+    dash_page_url = f"{BASE_URL}/{UAC}/Site/{site_id}/Dashboard"
+    discovered_tags: list[str] = []
+    seen_tags: set[str] = set()
+
+    def add_tag(t: str) -> None:
+        clean = " ".join(str(t or "").split()).strip()
+        if clean and len(clean) <= 40 and clean not in seen_tags:
+            seen_tags.add(clean)
+            discovered_tags.append(clean)
+
+    try:
+        r = session.get(dash_page_url, timeout=20, allow_redirects=True)
+        if r.ok and "account/login" not in r.url.lower():
+            raw = r.text or ""
+            # Look for tags= query param in scripts/URLs
+            for m in re.finditer(r"[?&]tags=([^&\"'\s]+)", raw, re.IGNORECASE):
+                for part in m.group(1).replace("%2C", ",").split(","):
+                    add_tag(part)
+            # Look for EST-* or tank/sensor tag patterns in HTML/JS
+            for m in re.finditer(r"\b(EST-[A-Za-z0-9\-_]+)\b", raw):
+                add_tag(m.group(1))
+    except Exception:
+        pass
+
+    if not discovered_tags:
+        # Default tags observed on EnviroFRONT site dashboard
+        for t in (
+            "EST-1,EST-1-BL,EST-2,EST-2-BL,EST-3,EST-3-BL,EST-4,EST-4-BL,EST-5,EST-5-BL"
+        ).split(","):
+            add_tag(t)
+
+    return ",".join(discovered_tags), dash_page_url
 
 
 def scrape_site_dashboard_details(
     session: requests.Session, dev: dict[str, Any]
 ) -> dict[str, Any]:
     site_id = str(dev.get("site_id") or "").strip()
-    dash_url = str(dev.get("dashboard_url") or "").strip()
-
-    if not site_id.isdigit():
-        try:
-            r_dev = session.get(DEVICES_URL, timeout=20)
-            if r_dev.ok:
-                soup_d = BeautifulSoup(r_dev.text, "html.parser")
-                smap = extract_site_id_map_from_html(soup_d, r_dev.text)
-                site_id = (
-                    smap.get(dev.get("serial_no", ""))
-                    or smap.get(dev.get("industry", "").lower())
-                    or smap.get(dev.get("site", "").lower())
-                    or ""
-                )
-                if site_id.isdigit():
-                    dash_url = f"{BASE_URL}/pae/Site/{site_id}/Dashboard"
-        except Exception:
-            pass
+    site_code = str(dev.get("site_code") or "").strip()
 
     if not site_id.isdigit():
         return {
             "ok": False,
             "site_id": "",
+            "site_code": site_code,
+            "site_name_ws": "",
             "url": "",
             "error": "Is device ke liye Site ID nahi mila.",
             "instruments": [],
+            "api_report": None,
         }
 
-    if not dash_url:
-        dash_url = f"{BASE_URL}/pae/Site/{site_id}/Dashboard"
-
-    cache_key = f"{site_id}:{dash_url}"
+    cache_key = f"dash:{site_id}"
     cached = DASHBOARD_CACHE.get(cache_key)
     if cached and (time.time() - cached.get("_ts", 0)) < 45:
         return cached
 
-    try:
-        resp = session.get(dash_url, timeout=22, allow_redirects=True)
-        resp.raise_for_status()
-    except Exception as exc:
-        return {
-            "ok": False,
-            "site_id": site_id,
-            "url": dash_url,
-            "error": f"Dashboard load fail: {exc}",
-            "instruments": [],
-        }
+    tags_str, dash_page_url = _discover_dashboard_tags_and_page(session, site_id)
+    site_name_ws = (
+        fetch_site_name_by_code(session, site_code, dash_page_url)
+        if site_code
+        else ""
+    )
 
-    if "account/login" in resp.url.lower():
-        return {
-            "ok": False,
-            "site_id": site_id,
-            "url": dash_url,
-            "error": "Portal session expire ho gaya — /login karein.",
-            "instruments": [],
-        }
-
-    html_txt = resp.text or ""
-    soup = BeautifulSoup(html_txt, "html.parser")
     instruments: list[dict[str, str]] = []
     seen_pairs: set[str] = set()
+    err_msg = ""
 
     def add_instrument(
         name: str, value: str, unit: str = "", extra: str = ""
@@ -1053,7 +1203,7 @@ def scrape_site_dashboard_details(
         if not v:
             return
         if not n:
-            n = "Instrument / Tank"
+            n = "Tag / Tank"
         key = f"{n.lower()}|{v.lower()}|{u.lower()}"
         if key not in seen_pairs:
             seen_pairs.add(key)
@@ -1066,103 +1216,102 @@ def scrape_site_dashboard_details(
                 }
             )
 
-    for script in soup.find_all("script"):
-        s_txt = script.string or script.get_text() or ""
-        if not s_txt:
-            continue
-        for m in re.finditer(
-            r'\{[^{}]{10,450}?(?:Parameter|Channel|Tank|Tag|Sensor|Name|Level|Volume)[^{}]{10,450}?\}',
-            s_txt,
-            re.IGNORECASE,
-        ):
-            try:
-                obj = json.loads(m.group(0))
-                if isinstance(obj, dict):
-                    nm = str(
-                        obj.get("TankName")
-                        or obj.get("ParameterName")
-                        or obj.get("TagName")
-                        or obj.get("Name")
-                        or obj.get("ChannelName")
-                        or ""
-                    )
-                    val = str(
-                        obj.get("Value")
-                        or obj.get("LastValue")
-                        or obj.get("Reading")
-                        or obj.get("Level")
-                        or obj.get("Volume")
-                        or ""
-                    )
-                    unit = str(obj.get("Unit") or obj.get("Units") or "")
-                    if nm and val:
-                        add_instrument(nm, val, unit)
-            except Exception:
-                continue
-
-    for tr in soup.select("table tr"):
-        cols = [
-            " ".join(c.get_text(" ", strip=True).split())
-            for c in tr.find_all(["td", "th"])
-        ]
-        cols = [c for c in cols if c]
-        if len(cols) >= 2:
-            joined = " ".join(cols)
-            if re.search(
-                r"\b(\d+(?:\.\d+)?)\s*(mm|cm|m|mtr|meter|litr|liter|litre|ltr|l|m3|m³|kl|kld|mld|mg/l|ppm|ph|bar|psi|°c|temp|flow|level)\b",
-                joined,
-                re.IGNORECASE,
-            ):
-                if len(cols) >= 3:
-                    add_instrument(
-                        cols[0],
-                        cols[1],
-                        cols[2],
-                        cols[3] if len(cols) > 3 else "",
-                    )
-                else:
-                    add_instrument(cols[0], cols[1])
-
-    for card in soup.select(
-        ".card, .panel, .widget, .box, .info-box, .small-box, [class*='tank'], [class*='gauge'], [class*='sensor']"
-    ):
-        txt = " ".join(card.get_text(" | ", strip=True).split())
-        if len(txt) > 320:
-            continue
-        m_unit = re.search(
-            r"([A-Za-z0-9_\-\(\)\s]{2,40}?)\s*[:|\-]\s*([\-+]?\d+(?:\.\d+)?)\s*(mm|cm|m|ltr|litr|liter|litre|m3|m³|kl|kld|mg/l|ppm|ph|°c|%)",
-            txt,
-            re.IGNORECASE,
+    try:
+        r = session.get(
+            DASHBOARD_WS_URL,
+            params={
+                "uac": UAC,
+                "site": site_id,
+                "mode": "1d",
+                "avg": "nul",
+                "tags": tags_str,
+                "tagTypes": "1",
+                "tzo": "-330",
+                "_": str(_ts_ms()),
+            },
+            headers=_ajax_headers(dash_page_url),
+            timeout=22,
         )
-        if m_unit:
-            add_instrument(m_unit.group(1), m_unit.group(2), m_unit.group(3))
+        if not r.ok:
+            err_msg = f"Dashboard WS HTTP {r.status_code}"
+        else:
+            txt = (r.text or "").strip()
+            if txt and not txt.startswith("<"):
+                payload = json.loads(txt)
+                # Extract readings from flexible JSON structure
+                def walk_readings(obj: Any, ctx_tag: str = "") -> None:
+                    if isinstance(obj, dict):
+                        tag_lbl = str(
+                            obj.get("Tag")
+                            or obj.get("TagName")
+                            or obj.get("Name")
+                            or obj.get("ParameterName")
+                            or obj.get("TankName")
+                            or obj.get("Label")
+                            or ctx_tag
+                            or ""
+                        ).strip()
+                        unit_lbl = str(
+                            obj.get("Unit")
+                            or obj.get("Units")
+                            or obj.get("UOM")
+                            or ""
+                        ).strip()
+                        val_candidate = None
+                        for vk in (
+                            "LastValue",
+                            "CurrentValue",
+                            "Value",
+                            "Reading",
+                            "Level",
+                            "Volume",
+                            "y",
+                        ):
+                            if vk in obj and obj.get(vk) is not None and not isinstance(
+                                obj.get(vk), (dict, list)
+                            ):
+                                val_candidate = obj.get(vk)
+                                break
+                        if val_candidate is not None and str(val_candidate).strip() != "":
+                            add_instrument(
+                                tag_lbl or "Reading",
+                                str(val_candidate),
+                                unit_lbl,
+                            )
+                        for k, v in obj.items():
+                            next_ctx = (
+                                str(k)
+                                if not tag_lbl and isinstance(k, str)
+                                else tag_lbl
+                            )
+                            if isinstance(v, (dict, list)):
+                                walk_readings(v, next_ctx)
+                    elif isinstance(obj, list):
+                        for idx, elem in enumerate(obj):
+                            if isinstance(elem, (dict, list)):
+                                walk_readings(elem, ctx_tag)
+                            elif (
+                                isinstance(elem, (int, float))
+                                and ctx_tag
+                                and idx == len(obj) - 1
+                            ):
+                                add_instrument(ctx_tag, str(elem))
 
-    if not instruments:
-        body_txt = " ".join(soup.get_text(" \n ", strip=True).split())
-        for m in re.finditer(
-            r"([A-Za-z][A-Za-z0-9_\-\(\)\s]{1,35}?)\s*[:\-]?\s*([\-+]?\d+(?:\.\d+)?)\s*(mm|cm|ltr|litr|liter|litre|m3|m³|kl|kld|mg/l|ppm|ph)\b",
-            body_txt,
-            re.IGNORECASE,
-        ):
-            lbl = m.group(1).strip()
-            if lbl.lower() not in (
-                "http",
-                "width",
-                "height",
-                "margin",
-                "padding",
-                "font",
-            ):
-                add_instrument(lbl, m.group(2), m.group(3))
-            if len(instruments) >= 25:
-                break
+                walk_readings(payload)
+    except Exception as exc:
+        err_msg = f"Dashboard WS error: {exc}"
+
+    api_report = fetch_site_api_report(session, site_id)
 
     res = {
-        "ok": True,
+        "ok": not bool(err_msg),
         "site_id": site_id,
-        "url": dash_url,
+        "site_code": site_code,
+        "site_name_ws": site_name_ws,
+        "url": dash_page_url,
         "instruments": instruments[:25],
-        "error": "",
+        "api_report": api_report,
+        "error": err_msg,
         "_ts": time.time(),
     }
     DASHBOARD_CACHE[cache_key] = res
@@ -1172,17 +1321,29 @@ def scrape_site_dashboard_details(
 def fetch_devices_multi_strategy(
     session: requests.Session,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    resp = session.get(DEVICES_URL, timeout=25)
-    resp.raise_for_status()
-    raw_html = resp.text or ""
-
+    now = datetime.now(timezone.utc)
     meta: dict[str, Any] = {
         "server_error_500": False,
-        "html_length": len(raw_html),
+        "html_length": 0,
         "tr_total": 0,
         "unparsed_ts_count": 0,
         "source": "none",
     }
+
+    # Primary: /Services/EF/WS/Devices?uac=pae&rp=50&page=1...
+    ws_devs = fetch_devices_from_ws_api(session, now)
+    if ws_devs:
+        meta["source"] = "ws-ef-devices"
+        meta["unparsed_ts_count"] = sum(
+            1 for d in ws_devs if d["last_seen"] is None
+        )
+        return ws_devs, meta
+
+    # Fallback: /pae/ControlPanel/Devices HTML page
+    resp = session.get(DEVICES_PAGE_URL, timeout=25)
+    resp.raise_for_status()
+    raw_html = resp.text or ""
+    meta["html_length"] = len(raw_html)
 
     if (
         not raw_html
@@ -1193,107 +1354,38 @@ def fetch_devices_multi_strategy(
         return [], meta
 
     soup = BeautifulSoup(raw_html, "html.parser")
-    now = datetime.now(timezone.utc)
-    site_id_map = extract_site_id_map_from_html(soup, raw_html)
-
-    _, tr_total, _ = extract_devices_from_html_table(soup, now)
-    meta["tr_total"] = tr_total
-
-    # Method 1: WS_DEVICES_URL (GET/POST JSON)
-    ws_devices = extract_devices_from_ws(session, now, site_id_map)
-    if ws_devices:
-        for d in ws_devices:
-            if d.get("site_id") and not d.get("dashboard_url"):
-                d["dashboard_url"] = (
-                    f"{BASE_URL}/pae/Site/{d['site_id']}/Dashboard"
-                )
-        meta["unparsed_ts_count"] = sum(
-            1 for d in ws_devices if d["last_seen"] is None
-        )
-        meta["source"] = "ws-devices-json"
-        return ws_devices, meta
-
-    # Method 2: HTML Table rows on DEVICES_URL
-    html_devices, _, unparsed_ts = extract_devices_from_html_table(soup, now)
-    if html_devices:
-        for d in html_devices:
-            if not d.get("site_id"):
-                d["site_id"] = site_id_map.get(d["serial_no"], "")
-                if d["site_id"]:
-                    d["dashboard_url"] = (
-                        f"{BASE_URL}/pae/Site/{d['site_id']}/Dashboard"
-                    )
-        meta["unparsed_ts_count"] = unparsed_ts
-        meta["source"] = "html-table"
-        return html_devices, meta
-
-    # Method 3: Embedded JSON inside <script> tags
-    script_devices = extract_devices_from_embedded_scripts(
-        raw_html, now, site_id_map
-    )
-    if script_devices:
-        for d in script_devices:
-            if d.get("site_id"):
-                d["dashboard_url"] = (
-                    f"{BASE_URL}/pae/Site/{d['site_id']}/Dashboard"
-                )
-        meta["unparsed_ts_count"] = sum(
-            1 for d in script_devices if d["last_seen"] is None
-        )
-        meta["source"] = "embedded-json"
-        return script_devices, meta
-
-    # Method 4: Fallback endpoint scan + dashboard links
-    fallback_endpoints = [
-        f"{BASE_URL}/pae/ControlPanel/GetDevices",
-        f"{BASE_URL}/pae/ControlPanel/DevicesList",
-        f"{BASE_URL}/pae/Device/Devices",
-        f"{BASE_URL}/api/Devices",
-    ]
-    for ep in fallback_endpoints:
-        try:
-            r_ep = session.get(
-                ep,
-                headers={
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": DEVICES_URL,
-                },
-                timeout=15,
-            )
-            if not r_ep.ok:
-                continue
-            ep_txt = (r_ep.text or "").strip()
-            if ep_txt and not ep_txt.startswith("<"):
-                parsed_ep = json.loads(ep_txt)
-                rows_ep = _extract_list_from_json_payload(parsed_ep)
-                ep_devs = [
-                    rec
-                    for item in rows_ep
-                    if (rec := _dict_to_device(item, now, site_id_map))
-                ]
-                if ep_devs:
-                    meta["source"] = f"fallback-json:{ep.split('/')[-1]}"
-                    meta["unparsed_ts_count"] = sum(
-                        1 for d in ep_devs if d["last_seen"] is None
-                    )
-                    return ep_devs, meta
-            elif ep_txt:
-                soup_ep = BeautifulSoup(ep_txt, "html.parser")
-                ep_tbl, _, ep_unp = extract_devices_from_html_table(
-                    soup_ep, now
-                )
-                if ep_tbl:
-                    meta["source"] = f"fallback-html:{ep.split('/')[-1]}"
-                    meta["unparsed_ts_count"] = ep_unp
-                    return ep_tbl, meta
-        except Exception:
+    devs: list[dict[str, Any]] = []
+    for tr in soup.select("table tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
+        meta["tr_total"] += 1
+        cells = [" ".join(td.get_text(" ", strip=True).split()) for td in tds]
+        if len(cells) < 2:
+            continue
+        row_sid = ""
+        for a in tr.find_all("a", href=True):
+            m = re.search(r"/Site/(\d+)/Dashboard", str(a["href"]), re.IGNORECASE)
+            if m:
+                row_sid = m.group(1)
+                break
+        rec = normalize_device_record(
+            serial_no=cells[1] if len(cells) > 1 else cells[0],
+            industry=cells[2] if len(cells) > 2 else "N/A",
+            site_type=cells[3] if len(cells) > 3 else "N/A",
+            device_type=cells[4] if len(cells) > 4 else "N/A",
+            firmware=cells[5] if len(cells) > 5 else "N/A",
+            raw_status=" ".join(cells),
+            raw_last_seen=cells[-1],
+            now_utc=now,
+            site_id=row_sid,
+        )
+        devs.append(rec)
 
-    link_devs = extract_devices_from_dashboard_links(soup, now)
-    if link_devs:
-        meta["source"] = "dashboard-links"
-        meta["unparsed_ts_count"] = len(link_devs)
-        return link_devs, meta
+    if devs:
+        meta["source"] = "html-table"
+        meta["unparsed_ts_count"] = sum(1 for d in devs if d["last_seen"] is None)
+        return devs, meta
 
     meta["source"] = "0-found"
     return [], meta
@@ -1417,6 +1509,7 @@ def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
             "Client",
             "Serial No",
             "Site ID",
+            "Site Code",
             "Dashboard URL",
             "Industry Name",
             "Site Type",
@@ -1434,6 +1527,7 @@ def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
                 CLIENT_NAME,
                 d.get("serial_no", "N/A"),
                 d.get("site_id", ""),
+                d.get("site_code", ""),
                 d.get("dashboard_url", ""),
                 d.get("industry", "N/A"),
                 d.get("site", "N/A"),
@@ -1448,7 +1542,7 @@ def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
 
 
 # ==============================================================================
-# GROQ AI ENGINE WITH LIVE SCRAPED DASHBOARD (MM, LITR, TANKS) INJECTION
+# GROQ AI ENGINE WITH LIVE DASHBOARD & API REPORT INJECTION
 # ==============================================================================
 def get_available_groq_models() -> list[str]:
     preferred = [
@@ -1503,24 +1597,33 @@ def enrich_context_with_live_dashboards(
                 or q in str(d.get("site", "")).lower()
                 or q in str(d.get("serial_no", "")).lower()
                 or q in str(d.get("site_id", "")).lower()
+                or q in str(d.get("site_code", "")).lower()
             ):
                 candidates.append(d)
 
     for d in analysis.get("assigned_devices", []):
         if d not in candidates:
             candidates.append(d)
-        if len(candidates) >= 8:
+        if len(candidates) >= 6:
             break
 
-    for dev in candidates[:8]:
+    for dev in candidates[:6]:
         try:
             dash = scrape_site_dashboard_details(session, dev)
+            rep = dash.get("api_report") or {}
             live_readings[dev.get("serial_no", "N/A")] = {
                 "industry": dev.get("industry"),
                 "site_type": dev.get("site"),
                 "site_id": dash.get("site_id") or dev.get("site_id"),
+                "site_code": dash.get("site_code") or dev.get("site_code"),
                 "instruments": dash.get("instruments", []),
-                "error": dash.get("error", ""),
+                "api_report_summary": {
+                    "date": rep.get("report_date"),
+                    "total": rep.get("total", 0),
+                    "success": rep.get("success", 0),
+                    "failed": rep.get("failed", 0),
+                    "latest_result": rep.get("latest_result", ""),
+                },
             }
         except Exception:
             continue
@@ -1536,6 +1639,7 @@ def build_project_context(
         {
             "serial": d.get("serial_no"),
             "site_id": d.get("site_id"),
+            "site_code": d.get("site_code"),
             "industry": d.get("industry"),
             "site_type": d.get("site"),
             "unassigned": d.get("is_unassigned"),
@@ -1554,7 +1658,7 @@ def build_project_context(
         f"Connected: {analysis.get('connected')} | Disconnected: {analysis.get('disconnected_count')}\n"
         f"Aging (< Range): {analysis.get('aging_counts')}\n"
         f"Top Offline Sites: {analysis.get('top_offline_sites')}\n"
-        f"Live Scraped Dashboard Instruments (mm, litr, tanks): {json.dumps(live_readings or {}, ensure_ascii=False)}\n"
+        f"Live Scraped Dashboard & UP Excise API Report: {json.dumps(live_readings or {}, ensure_ascii=False)}\n"
         f"Devices Sample: {compact_devices}"
     )
 
@@ -1621,7 +1725,7 @@ def generate_ai_analysis(
     sys_p = (
         f"Tum {CLIENT_NAME} ke EnviroFRONT / M2M telemetry suite ke senior AI engineer ho. "
         "Hinglish mein saaf bullet points mein report do (bina markdown tables ke aur bina ** asterisks ke). "
-        "Agar Live Scraped Dashboard Instruments mein mm/litr/tank readings hain to unhe zaroor dikhao."
+        "Dashboard readings aur UP Excise API Report status dono ko saaf dikhao."
     )
     usr_p = f"LIVE TELEMETRY & DASHBOARD DATA:\n{ctx}"
     return call_groq_ai(sys_p, usr_p, analysis)
@@ -1639,8 +1743,7 @@ def answer_project_question(
     sys_p = (
         f"Tum {CLIENT_NAME} telemetry bot ke AI assistant ho. "
         "Diye gaye LIVE TELEMETRY & DASHBOARD DATA ke basis par Hinglish mein seedha, saaf jawab do. "
-        "Markdown table ya ** asterisks mat lagao; clean lines/bullets use karo. "
-        "Live Scraped Dashboard Instruments mein jo mm, litr, tank name aur readings hain unhe directly batao."
+        "Markdown table ya ** asterisks mat lagao; clean lines/bullets use karo."
     )
     usr_p = f"LIVE DATA:\n{ctx}\n\nQUESTION:\n{user_question}"
     return call_groq_ai(sys_p, usr_p, analysis)
@@ -1651,6 +1754,36 @@ def require_auth(chat_id: int) -> dict[str, Any] | None:
     if not sess_data or sess_data.get("step") != "authenticated":
         return None
     return sess_data
+
+
+def _find_device_by_target(
+    devices: list[dict[str, Any]], target: str
+) -> dict[str, Any] | None:
+    t = (target or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        num = int(t)
+        if 1 <= num <= len(devices):
+            return devices[num - 1]
+        for d in devices:
+            if (
+                str(d.get("serial_no") or "") == t
+                or str(d.get("site_id") or "") == t
+                or str(d.get("site_code") or "") == t
+            ):
+                return d
+        return None
+    t_low = t.lower()
+    for d in devices:
+        if (
+            t_low in str(d.get("industry", "")).lower()
+            or t_low in str(d.get("site", "")).lower()
+            or t_low in str(d.get("serial_no", "")).lower()
+            or t_low in str(d.get("site_code", "")).lower()
+        ):
+            return d
+    return None
 
 
 # ==============================================================================
@@ -1697,7 +1830,7 @@ async def send_start_view(chat_id: int, bot) -> None:
             f"  ▸ Alert Tier: <code>2h → 10h → 1d (1-Time)</code>\n"
             f"  ▸ Notif Mode: <code>{esc(NOTIF_STYLE)}</code>\n\n"
             "  ▸ Next/Prev ke liye <code>/next</code> aur <code>/prev</code> ya buttons use karein.\n"
-            "  ▸ Dashboard ke liye: <code>/dash &lt;no ya serial ya naam&gt;</code>"
+            "  ▸ Dashboard + API Report: <code>/dash &lt;no/serial/name&gt;</code>"
         )
         await safe_send_html(
             bot, chat_id, msg, reply_markup=bottom_reply_keyboard()
@@ -1728,10 +1861,11 @@ async def send_help_view(chat_id: int, bot) -> None:
         "  • <code>/start</code> &amp; <code>/help</code>\n"
         "  • <code>/login</code> &amp; <code>/logout</code>\n"
         "  • <code>/next</code> &amp; <code>/prev</code> (list pagination)\n\n"
-        "<b>▸ Telemetry, Sites &amp; Instruments</b>\n"
+        "<b>▸ Telemetry, Dashboard &amp; API Report</b>\n"
         "  • <code>/status</code> — Live summary &amp; aging\n"
         "  • <code>/allsite [page]</code> — Assigned sites list\n"
-        "  • <code>/dash &lt;no/serial/name&gt;</code> — Site dashboard\n"
+        "  • <code>/dash &lt;no/serial/name&gt;</code> — Dashboard + API Report\n"
+        "  • <code>/apireport &lt;no/serial/name&gt; [DD-Mon-YYYY]</code> — Excise API logs\n"
         "  • <code>/instruments [search]</code> — Tank/mm/litr readings\n"
         "  • <code>/online [page]</code> — Connected devices\n"
         "  • <code>/unassigned [page]</code> — Unassigned N/A\n"
@@ -2065,35 +2199,13 @@ async def send_site_dashboard_by_target(
     LAST_SNAPSHOT[chat_id] = analysis
     assigned_devs = analysis["assigned_devices"]
 
-    t = (target or "").strip()
-    dev: dict[str, Any] | None = None
-
-    if t.isdigit():
-        num = int(t)
-        if 1 <= num <= len(assigned_devs):
-            dev = assigned_devs[num - 1]
-        else:
-            for d in assigned_devs:
-                if d.get("serial_no") == t or d.get("site_id") == t:
-                    dev = d
-                    break
-    elif t:
-        t_low = t.lower()
-        for d in assigned_devs:
-            if (
-                t_low in str(d.get("industry", "")).lower()
-                or t_low in str(d.get("site", "")).lower()
-                or t_low in str(d.get("serial_no", "")).lower()
-            ):
-                dev = d
-                break
-
+    dev = _find_device_by_target(assigned_devs, target)
     if not dev:
         await safe_send_html(
             bot,
             chat_id,
             (
-                f"  • <b>Reason:</b> Site '<code>{esc(t or 'empty')}</code>' nahi mili. "
+                f"  • <b>Reason:</b> Site '<code>{esc(target or 'empty')}</code>' nahi mili. "
                 "Pehle <code>/allsite</code> check karein ya <code>/dash &lt;number/serial/name&gt;</code> bhejein."
             ),
         )
@@ -2101,7 +2213,7 @@ async def send_site_dashboard_by_target(
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text=f"◈ Opening dashboard: {dev['industry']}...",
+        text=f"◈ Opening dashboard & API report: {dev['industry']}...",
     )
 
     try:
@@ -2112,9 +2224,12 @@ async def send_site_dashboard_by_target(
         dash = {
             "ok": False,
             "site_id": dev.get("site_id", ""),
+            "site_code": dev.get("site_code", ""),
+            "site_name_ws": "",
             "url": dev.get("dashboard_url", ""),
             "error": f"Exception: {exc}",
             "instruments": [],
+            "api_report": None,
         }
 
     dot = small_status_dot(dev["is_connected"])
@@ -2126,6 +2241,16 @@ async def send_site_dashboard_by_target(
             dev.get("last_seen"), dev.get("offline_duration")
         )
     )
+    ws_name_line = (
+        f"\n  ▸ WS Name   : <code>{esc(dash.get('site_name_ws'))}</code>"
+        if dash.get("site_name_ws")
+        else ""
+    )
+    code_line = (
+        f"\n  ▸ Site Code : <code>{esc(dash.get('site_code'))}</code>"
+        if dash.get("site_code")
+        else ""
+    )
 
     header = (
         "╔══════════════════════╗\n"
@@ -2133,37 +2258,108 @@ async def send_site_dashboard_by_target(
         "╚══════════════════════╝\n"
         f"  ▸ Site Type : <code>{esc(dev['site'])}</code>\n"
         f"  ▸ Serial No : <b>{esc(dev['serial_no'])}</b>\n"
-        f"  ▸ Site ID   : <code>{esc(dash.get('site_id') or 'N/A')}</code>\n"
+        f"  ▸ Site ID   : <code>{esc(dash.get('site_id') or 'N/A')}</code>{code_line}{ws_name_line}\n"
         f"  ▸ Status    : {dot} <b>{conn_word}</b> (<code>{esc(dev['display_time'])}</code>)/(<code>{esc(off_info)}</code>)\n\n"
     )
 
     if dash.get("instruments"):
-        inst_lines = [f"<b>◈ {sc('LIVE TANK & INSTRUMENT READINGS')}</b>"]
-        for i, inst in enumerate(dash["instruments"], start=1):
+        inst_lines = [f"<b>◈ {sc('LIVE DASHBOARD READINGS')}</b>"]
+        for i, inst in enumerate(dash["instruments"][:15], start=1):
             u = f" {inst['unit']}" if inst.get("unit") else ""
-            ex = f" ({inst['extra']})" if inst.get("extra") else ""
             inst_lines.append(
-                f"  {i}. ▸ <b>{esc(inst['name'])}</b> : <code>{esc(inst['value'])}{esc(u)}</code>{esc(ex)}"
+                f"  {i}. ▸ <b>{esc(inst['name'])}</b> : <code>{esc(inst['value'])}{esc(u)}</code>"
             )
-        body = "\n".join(inst_lines)
+        inst_section = "\n".join(inst_lines)
     else:
-        reason = (
-            dash.get("error")
-            or "Dashboard HTML mein static/JS sensor readings nahi mili."
-        )
-        url_line = (
-            f"\n  ▸ URL       : <code>{esc(dash.get('url'))}</code>"
-            if dash.get("url")
-            else ""
-        )
-        body = (
-            f"<b>◈ {sc('DASHBOARD STATUS')}</b>\n"
-            f"  • Reason    : <code>{esc(reason)}</code>\n"
-            f"  ▸ Device    : <code>{esc(dev['device_type'])}</code>\n"
-            f"  ▸ Firmware  : <code>{esc(dev['firmware'])}</code>{url_line}"
+        reason = dash.get("error") or "Dashboard WS mein koi tag value nahi mili."
+        inst_section = (
+            f"<b>◈ {sc('LIVE DASHBOARD READINGS')}</b>\n"
+            f"  • Info      : <code>{esc(reason)}</code>"
         )
 
-    await safe_edit_html(loader, header + body)
+    rep = dash.get("api_report") or {}
+    vat_list = rep.get("vat_codes") or []
+    vat_str = ", ".join(vat_list[:5]) if vat_list else "N/A"
+    api_lines = [
+        f"\n\n<b>◈ {sc('UP EXCISE API REPORT')} ({esc(rep.get('report_date') or today_ist_report_date())})</b>",
+        f"  ▸ VAT Codes : <code>{esc(vat_str)}</code>",
+        f"  ▸ Requests  : <b>{rep.get('total', 0)}</b> | Ok: <b>{rep.get('success', 0)}</b> | Err: <b>{rep.get('failed', 0)}</b>",
+    ]
+    if rep.get("latest_ts"):
+        api_lines.append(f"  ▸ Last Req  : <code>{esc(rep.get('latest_ts'))}</code>")
+    if rep.get("latest_result"):
+        api_lines.append(f"  ▸ Result    : <code>{esc(rep.get('latest_result'))}</code>")
+    if rep.get("error"):
+        api_lines.append(f"  • Report Note: <code>{esc(rep.get('error'))}</code>")
+
+    await safe_edit_html(loader, header + inst_section + "\n".join(api_lines))
+
+
+async def send_api_report_action(
+    chat_id: int, target: str, report_date: str | None, bot
+) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
+            reply_markup=guest_reply_keyboard(),
+        )
+        return
+
+    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+        run_self_analysis, sess_data["session"]
+    )
+    LAST_SNAPSHOT[chat_id] = analysis
+    devs = analysis.get("assigned_devices", [])
+    dev = _find_device_by_target(devs, target)
+    if not dev:
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Use: <code>/apireport &lt;no/serial/name&gt; [DD-Mon-YYYY]</code>",
+        )
+        return
+
+    sid = str(dev.get("site_id") or "").strip()
+    if not sid.isdigit():
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"  • <b>{esc(dev['industry'])}</b> ke liye Site ID nahi mila.",
+        )
+        return
+
+    rdate = (report_date or today_ist_report_date()).strip()
+    loader = await bot.send_message(
+        chat_id=chat_id,
+        text=f"◈ Fetching UP Excise API Report ({rdate}) for {dev['industry']}...",
+    )
+    rep = await asyncio.to_thread(
+        fetch_site_api_report, sess_data["session"], sid, rdate
+    )
+
+    vat_str = ", ".join(rep.get("vat_codes") or []) or "N/A"
+    lines = [
+        "╔══════════════════════╗",
+        f"║  ◈ <b>{sc('API REPORT')}</b>",
+        "╚══════════════════════╝",
+        f"  ▸ Site      : <b>{esc(dev['industry'])}</b> (ID: <code>{esc(sid)}</code>)",
+        f"  ▸ Date      : <code>{esc(rdate)}</code>",
+        f"  ▸ VAT Codes : <code>{esc(vat_str)}</code>",
+        f"  ▸ Total Logs: <b>{rep.get('total', 0)}</b> | Ok: <b>{rep.get('success', 0)}</b> | Err: <b>{rep.get('failed', 0)}</b>",
+    ]
+    for idx, row in enumerate(rep.get("rows", [])[:8], start=1):
+        ts = str(row.get("Timestamp") or row.get("DateTime") or "N/A")
+        vc = str(row.get("VatCode") or row.get("UnitCode") or "-")
+        st = str(row.get("Result") or row.get("Status") or "N/A")[:55]
+        lines.append(f"  {idx}. <code>{esc(ts)}</code> [{esc(vc)}] → <code>{esc(st)}</code>")
+
+    if not rep.get("rows"):
+        lines.append("  ▸ <code>Is date ke liye koi API request log nahi mila.</code>")
+
+    await safe_edit_html(loader, "\n".join(lines))
 
 
 async def send_instruments_view(
@@ -2194,6 +2390,7 @@ async def send_instruments_view(
             or q in str(d.get("site", "")).lower()
             or q in str(d.get("serial_no", "")).lower()
             or q in str(d.get("site_id", "")).lower()
+            or q in str(d.get("site_code", "")).lower()
         ]
 
     if not devs:
@@ -2218,7 +2415,7 @@ async def send_instruments_view(
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="◈ Fetching tank & instrument readings (mm, litr)...",
+        text="◈ Fetching dashboard tag & instrument readings...",
     )
 
     blocks: list[str] = [
@@ -2248,7 +2445,7 @@ async def send_instruments_view(
                 )
         else:
             blocks.append(
-                f"│  • Readings: <code>{esc(dash.get('error') or 'No mm/litr tags parsed')}</code>"
+                f"│  • Readings: <code>{esc(dash.get('error') or 'No tag values returned')}</code>"
             )
         blocks.append("└──────────────────────")
 
@@ -2462,8 +2659,7 @@ async def send_health_action(chat_id: int, bot) -> None:
             "╚══════════════════════╝\n"
             f"  ▸ Client      : <code>{esc(CLIENT_NAME)}</code>\n"
             f"  ▸ Source      : <code>{esc(meta.get('source', 'none'))}</code>\n"
-            f"  ▸ HTML Len    : <code>{meta.get('html_length', 0)}</code> | TRs: <code>{meta.get('tr_total', 0)}</code>\n"
-            f"  ▸ Sync Rate   : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+            f"  ▸ UAC / Sync  : <code>{esc(UAC)}</code> / <code>{REFRESH_INTERVAL_SEC}s</code>\n"
             f"  ▸ HTTP 500    : <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
             f"  ▸ Total / N/A : <b>{analysis['total']} / {analysis['unassigned_count']}</b>\n\n"
             f"<b>◈ {sc('Device Types')}</b>\n{type_lines}\n\n"
@@ -2538,7 +2734,7 @@ async def send_site_search_action(
         await safe_send_html(
             bot,
             chat_id,
-            "  ▸ Use: <code>/site &lt;industry / site / serial&gt;</code>",
+            "  ▸ Use: <code>/site &lt;industry / site / serial / code&gt;</code>",
         )
         return
 
@@ -2553,6 +2749,7 @@ async def send_site_search_action(
         or q in str(d.get("site", "")).lower()
         or q in str(d.get("serial_no", "")).lower()
         or q in str(d.get("site_id", "")).lower()
+        or q in str(d.get("site_code", "")).lower()
     ]
     if not matches:
         await safe_send_html(
@@ -2585,7 +2782,7 @@ async def send_ai_analyze_action(chat_id: int, bot) -> None:
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="◈ Groq AI live telemetry & dashboard readings analyze kar raha hai...",
+        text="◈ Groq AI live telemetry, dashboard & API report analyze kar raha hai...",
     )
     try:
         analysis = await asyncio.to_thread(
@@ -2733,6 +2930,22 @@ async def cmd_dash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target = " ".join(context.args).strip() if context.args else ""
     await send_site_dashboard_by_target(chat_id, target, context.bot)
+
+
+async def cmd_apireport(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.effective_chat or not update.effective_user:
+        return
+    chat_id = update.effective_chat.id
+    if not await check_access(chat_id, update.effective_user.id, context.bot):
+        return
+    args = list(context.args or [])
+    rdate: str | None = None
+    if args and re.fullmatch(r"\d{2}-[A-Za-z]{3}-\d{4}", args[-1]):
+        rdate = args.pop()
+    target = " ".join(args).strip()
+    await send_api_report_action(chat_id, target, rdate, context.bot)
 
 
 async def cmd_instruments(
@@ -2893,7 +3106,7 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send_html(
             context.bot,
             chat_id,
-            "  ▸ <b>Groq AI Mode ON</b> — Apna sawal bhejein (jaise tank level, mm, litr, offline sites). Band karne ke liye <code>/exit_ai</code> bhejein.",
+            "  ▸ <b>Groq AI Mode ON</b> — Apna sawal bhejein. Band karne ke liye <code>/exit_ai</code> bhejein.",
         )
         return
     await send_ai_answer_action(chat_id, q, context.bot)
@@ -3101,21 +3314,20 @@ async def handle_text_message(
         except Exception:
             pass
 
-        wait_msg = await bot.send_message(
+        wait_msg = await context.bot.send_message(
             chat_id=chat_id,
             text="◈ EnviroFRONT portal par login ho raha hai...",
-        ) if (bot := context.bot) else None
+        )
 
         session, err = await asyncio.to_thread(
             login_envirofront, username, password
         )
         if not session:
             USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-            if wait_msg:
-                await safe_edit_html(
-                    wait_msg,
-                    f"  • <b>Login Failed:</b> <code>{esc(err)}</code>\n  ▸ Dobara <b>Login ID / Email</b> bhejein:",
-                )
+            await safe_edit_html(
+                wait_msg,
+                f"  • <b>Login Failed:</b> <code>{esc(err)}</code>\n  ▸ Dobara <b>Login ID / Email</b> bhejein:",
+            )
             return
 
         USER_SESSIONS[chat_id] = {
@@ -3123,17 +3335,16 @@ async def handle_text_message(
             "username": username,
             "session": session,
         }
-        if wait_msg:
-            await safe_edit_html(
-                wait_msg,
-                "╔══════════════════════╗\n"
-                f"║  ∙ <b>{esc(CLIENT_NAME)}</b>\n"
-                f"║  <i>{sc('AUTHENTICATED')}</i>\n"
-                "╚══════════════════════╝\n"
-                f"  ▸ Account   : <code>{esc(username)}</code>\n"
-                f"  ▸ Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
-                f"  ▸ Alerts    : <code>2h → 10h → 1d (1-Time)</code>",
-            )
+        await safe_edit_html(
+            wait_msg,
+            "╔══════════════════════╗\n"
+            f"║  ∙ <b>{esc(CLIENT_NAME)}</b>\n"
+            f"║  <i>{sc('AUTHENTICATED')}</i>\n"
+            "╚══════════════════════╝\n"
+            f"  ▸ Account   : <code>{esc(username)}</code>\n"
+            f"  ▸ Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+            f"  ▸ Alerts    : <code>2h → 10h → 1d (1-Time)</code>",
+        )
         await safe_send_html(
             context.bot,
             chat_id,
@@ -3350,7 +3561,8 @@ async def post_init(app) -> None:
             BotCommand("help", "All commands & guide"),
             BotCommand("status", "Live status & aging summary"),
             BotCommand("allsite", "Assigned sites list"),
-            BotCommand("dash", "Site dashboard (<no/serial/name>)"),
+            BotCommand("dash", "Dashboard + API report (<no/serial/name>)"),
+            BotCommand("apireport", "UP Excise API report (<site> [date])"),
             BotCommand("instruments", "Tank / mm / litr readings"),
             BotCommand("online", "Connected devices"),
             BotCommand("unassigned", "Unassigned N/A devices"),
@@ -3358,7 +3570,7 @@ async def post_init(app) -> None:
             BotCommand("age", "Filter bucket (<1d|1w|24d|11m|1y|gt1y>)"),
             BotCommand("next", "Next page"),
             BotCommand("prev", "Previous page"),
-            BotCommand("ai_analyze", "Groq AI telemetry & dashboard report"),
+            BotCommand("ai_analyze", "Groq AI telemetry & API report"),
             BotCommand("ai", "Ask Groq AI (<question>)"),
             BotCommand("health", "System & parser health"),
             BotCommand("export", "Export devices CSV"),
@@ -3389,6 +3601,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("allsite", cmd_allsite))
     app.add_handler(CommandHandler("dash", cmd_dash))
+    app.add_handler(CommandHandler("apireport", cmd_apireport))
     app.add_handler(CommandHandler("instruments", cmd_instruments))
     app.add_handler(CommandHandler("online", cmd_online))
     app.add_handler(CommandHandler("unassigned", cmd_unassigned))
