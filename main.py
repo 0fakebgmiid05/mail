@@ -10,6 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+GROQ_API_KEY = os.getenv("API")
 import requests
 from bs4 import BeautifulSoup
 from telegram import (
@@ -35,7 +40,6 @@ from telegram.ext import (
 # ==============================================================================
 CLIENT_NAME = "BAGGI JAAT"
 BOT_TOKEN = "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
-GROQ_API_KEY = os.getenv("API")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
