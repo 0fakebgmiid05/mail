@@ -35,9 +35,8 @@ from telegram.ext import (
 # ==============================================================================
 CLIENT_NAME = "BAGGI JAAT"
 BOT_TOKEN = "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
-GROQ_API_KEY = "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"
+GROQ_API_KEY = os.getenv("API")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
 BASE_URL = "https://envirofront.m2mlogger.com"
 LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
