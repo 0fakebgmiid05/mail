@@ -1,7 +1,10 @@
 import asyncio
+import csv
+import io
 import json
 import logging
 import re
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,7 +12,6 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from google import genai
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -29,8 +31,9 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# DIRECT CONFIGURATION
+# CONFIGURATION — CLIENT: BAGGI JAAT
 # ==============================================================================
+CLIENT_NAME = "BAGGI JAAT"
 BOT_TOKEN = "9018573596:AAE74Vb8hbWyxNQMARkTxYTptCo9a_E11sE"
 GEMINI_API_KEY = "AQ.Ab8RN6LKHe0Rp-B5loqNfPLVz32jwQgnFCorUoYe2kGX09U4PA"
 
@@ -39,9 +42,10 @@ LOGIN_URL = f"{BASE_URL}/?ReturnUrl=%2Fpae%2FControlPanel%2FDevices"
 DEVICES_URL = f"{BASE_URL}/pae/ControlPanel/Devices"
 WS_DEVICES_URL = f"{BASE_URL}/Services/EF/WS/Devices"
 
+DB_PATH = "baggi_jaat_telemetry.db"
 IST = timezone(timedelta(hours=5, minutes=30))
 DISCONNECT_THRESHOLD = timedelta(hours=5)
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 60  # Har 1 minute mein auto-refresh
 ALERT_COOLDOWN = timedelta(hours=6)
 
 USER_SESSIONS: dict[int, dict[str, Any]] = {}
@@ -53,9 +57,127 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("EnviroFRONT.Bot")
+logger = logging.getLogger("BaggiJaat.EnviroFRONT")
 
 
+# ==============================================================================
+# SQLITE PERSISTENCE
+# ==============================================================================
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshots (
+            chat_id INTEGER PRIMARY KEY,
+            checked_at_ist TEXT,
+            payload_json TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_log (
+            alert_key TEXT PRIMARY KEY,
+            last_alerted_ts REAL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_snapshot_db(chat_id: int, analysis: dict[str, Any]) -> None:
+    try:
+        serializable = {
+            "checked_at_ist": analysis.get("checked_at_ist"),
+            "total": analysis.get("total", 0),
+            "assigned_count": analysis.get("assigned_count", 0),
+            "unassigned_count": analysis.get("unassigned_count", 0),
+            "connected": analysis.get("connected", 0),
+            "disconnected_5h_count": analysis.get("disconnected_5h_count", 0),
+            "top_offline_sites": analysis.get("top_offline_sites", []),
+            "firmware_breakdown": analysis.get("firmware_breakdown", {}),
+            "device_type_breakdown": analysis.get("device_type_breakdown", {}),
+            "meta": analysis.get("meta", {}),
+            "all_devices": [
+                {
+                    k: v
+                    for k, v in d.items()
+                    if k not in ("last_seen", "offline_duration")
+                }
+                | {
+                    "offline_hours": round(
+                        d["offline_duration"].total_seconds() / 3600, 2
+                    )
+                    if d.get("offline_duration")
+                    else None
+                }
+                for d in analysis.get("all_devices", [])
+            ],
+        }
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO snapshots (chat_id, checked_at_ist, payload_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                checked_at_ist = excluded.checked_at_ist,
+                payload_json = excluded.payload_json
+            """,
+            (chat_id, analysis.get("checked_at_ist", ""), json.dumps(serializable)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("DB snapshot save failed: %s", exc)
+
+
+def save_alert_key_db(alert_key: str, dt_utc: datetime) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO alert_log (alert_key, last_alerted_ts)
+            VALUES (?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET last_alerted_ts = excluded.last_alerted_ts
+            """,
+            (alert_key, dt_utc.timestamp()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("DB alert save failed: %s", exc)
+
+
+def delete_alert_key_db(alert_key: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM alert_log WHERE alert_key = ?", (alert_key,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def load_alert_keys_db() -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT alert_key, last_alerted_ts FROM alert_log")
+        for k, ts in cur.fetchall():
+            ALERTED_DEVICES[str(k)] = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        conn.close()
+    except Exception:
+        pass
+
+
+# ==============================================================================
+# HELPERS & KEYBOARDS (INLINE SUB-MENUS + REPLY KEYBOARD)
+# ==============================================================================
 def esc(text: Any) -> str:
     s = "" if text is None else str(text)
     return (
@@ -84,7 +206,7 @@ def main_inline_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("🟢 Online", callback_data="act:online"),
-                InlineKeyboardButton("🔴 Offline >5h", callback_data="act:offline"),
+                InlineKeyboardButton("⏳ Aging Menus", callback_data="act:aging_menu"),
             ],
             [
                 InlineKeyboardButton("📌 Unassigned N/A", callback_data="act:unassigned"),
@@ -95,8 +217,30 @@ def main_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🧠 AI Report", callback_data="act:ai_analyze"),
             ],
             [
-                InlineKeyboardButton("📋 Summary", callback_data="act:summary"),
+                InlineKeyboardButton("📥 Export CSV", callback_data="act:export_csv"),
                 InlineKeyboardButton("🚪 Logout", callback_data="act:logout"),
+            ],
+        ]
+    )
+
+
+def aging_submenu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🗓️ > 1 Year", callback_data="age:1y"),
+                InlineKeyboardButton("📆 > 11 Months", callback_data="age:11m"),
+            ],
+            [
+                InlineKeyboardButton("📅 > 24 Days", callback_data="age:24d"),
+                InlineKeyboardButton("🗓 > 1 Week", callback_data="age:1w"),
+            ],
+            [
+                InlineKeyboardButton("⏰ > 1 Day", callback_data="age:1d"),
+                InlineKeyboardButton("🔴 > 5 Hours", callback_data="age:5h"),
+            ],
+            [
+                InlineKeyboardButton("⬅️ Back to Main", callback_data="act:main_menu"),
             ],
         ]
     )
@@ -119,7 +263,7 @@ def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton("🟢 Online"),
-                KeyboardButton("🔴 Offline >5h"),
+                KeyboardButton("⏳ Aging Menus"),
             ],
             [
                 KeyboardButton("📌 Unassigned N/A"),
@@ -130,7 +274,7 @@ def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("🧠 AI Report"),
             ],
             [
-                KeyboardButton("📋 Summary"),
+                KeyboardButton("📥 Export CSV"),
                 KeyboardButton("🚪 Logout"),
             ],
         ],
@@ -140,7 +284,7 @@ def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def animate_message(
-    msg, frames: list[str], delay: float = 0.35, final_markup=None
+    msg, frames: list[str], delay: float = 0.3, final_markup=None
 ) -> None:
     total = len(frames)
     for idx, frame in enumerate(frames):
@@ -157,6 +301,9 @@ async def animate_message(
             break
 
 
+# ==============================================================================
+# ENVIROFRONT AUTH & PARSER
+# ==============================================================================
 def extract_verification_token(html: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
     inp = soup.find("input", {"name": "__RequestVerificationToken"})
@@ -508,7 +655,7 @@ def parse_ws_device_item(item: dict[str, Any], now: datetime) -> dict[str, Any]:
 
 
 def extract_devices_from_ws(
-    session: requests.Session, now: datetime, log_sample: bool = False
+    session: requests.Session, now: datetime
 ) -> list[dict[str, Any]]:
     headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -558,7 +705,7 @@ def extract_devices_from_ws(
 
 
 def extract_devices_from_html_table(
-    soup: BeautifulSoup, now: datetime, log_sample: bool = False
+    soup: BeautifulSoup, now: datetime
 ) -> tuple[list[dict[str, Any]], int, int]:
     all_trs = soup.select("tr")
     devices: list[dict[str, Any]] = []
@@ -620,7 +767,7 @@ def extract_devices_from_html_table(
 
 
 def fetch_devices_multi_strategy(
-    session: requests.Session, log_sample: bool = False
+    session: requests.Session,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     resp = session.get(DEVICES_URL, timeout=25)
     resp.raise_for_status()
@@ -645,12 +792,10 @@ def fetch_devices_multi_strategy(
     soup = BeautifulSoup(raw_html, "html.parser")
     now = datetime.now(timezone.utc)
 
-    _, tr_total, _ = extract_devices_from_html_table(
-        soup, now, log_sample=log_sample
-    )
+    _, tr_total, _ = extract_devices_from_html_table(soup, now)
     meta["tr_total"] = tr_total
 
-    ws_devices = extract_devices_from_ws(session, now, log_sample=log_sample)
+    ws_devices = extract_devices_from_ws(session, now)
     if ws_devices:
         meta["unparsed_ts_count"] = sum(
             1 for d in ws_devices if d["last_seen"] is None
@@ -658,9 +803,7 @@ def fetch_devices_multi_strategy(
         meta["source"] = "ws-devices-json"
         return ws_devices, meta
 
-    html_devices, _, unparsed_ts = extract_devices_from_html_table(
-        soup, now, log_sample=False
-    )
+    html_devices, _, unparsed_ts = extract_devices_from_html_table(soup, now)
     if len(html_devices) > 1:
         meta["unparsed_ts_count"] = unparsed_ts
         meta["source"] = "html-table"
@@ -670,10 +813,40 @@ def fetch_devices_multi_strategy(
     return [], meta
 
 
-def run_self_analysis(
-    session: requests.Session, log_sample: bool = False
-) -> dict[str, Any]:
-    devices, meta = fetch_devices_multi_strategy(session, log_sample=log_sample)
+# ==============================================================================
+# DURATION BUCKETS & TELEMETRY ANALYSIS
+# ==============================================================================
+AGING_CONFIG: dict[str, tuple[str, timedelta]] = {
+    "1y": ("DISCONNECTED > 1 YEAR (365d+)", timedelta(days=365)),
+    "11m": ("DISCONNECTED > 11 MONTHS (330d+)", timedelta(days=330)),
+    "24d": ("DISCONNECTED > 24 DAYS (24d+)", timedelta(days=24)),
+    "1w": ("DISCONNECTED > 1 WEEK (7d+)", timedelta(days=7)),
+    "1d": ("DISCONNECTED > 1 DAY (24h+)", timedelta(days=1)),
+    "5h": ("DISCONNECTED > 5 HOURS (5h+)", timedelta(hours=5)),
+}
+
+
+def filter_disconnected_by_delta(
+    devices: list[dict[str, Any]], min_delta: timedelta
+) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for d in devices:
+        if d.get("is_connected"):
+            continue
+        off_td: timedelta | None = d.get("offline_duration")
+        if off_td is not None and off_td >= min_delta:
+            matched.append(d)
+    matched.sort(
+        key=lambda x: x["offline_duration"].total_seconds()
+        if x.get("offline_duration")
+        else 0,
+        reverse=True,
+    )
+    return matched
+
+
+def run_self_analysis(session: requests.Session) -> dict[str, Any]:
+    devices, meta = fetch_devices_multi_strategy(session)
 
     assigned_devices = [d for d in devices if not d["is_unassigned"]]
     unassigned_list = [d for d in devices if d["is_unassigned"]]
@@ -686,6 +859,11 @@ def run_self_analysis(
         else 99999999,
         reverse=True,
     )
+
+    aging_counts = {
+        key: len(filter_disconnected_by_delta(devices, delta))
+        for key, (_, delta) in AGING_CONFIG.items()
+    }
 
     site_offline_counts: dict[str, int] = {}
     fw_counts: dict[str, int] = {}
@@ -715,6 +893,7 @@ def run_self_analysis(
         "connected": len(online_list),
         "disconnected_5h_count": len(offline_5h_list),
         "unassigned_count": len(unassigned_list),
+        "aging_counts": aging_counts,
         "all_devices": devices,
         "assigned_devices": assigned_devices,
         "online_list": online_list,
@@ -727,47 +906,94 @@ def run_self_analysis(
     }
 
 
-def build_rich_local_summary(analysis: dict[str, Any]) -> str:
-    off_lines = [
-        f"{idx}. {d['industry']} ({d['site']}) | Logger: {d['serial_no']} | {d['conn_label']} ({d['display_time']})"
-        for idx, d in enumerate(analysis["disconnected_5h_list"][:10], start=1)
-    ]
-    fw_summary = ", ".join(
-        f"{k}: {v}" for k, v in analysis["firmware_breakdown"].items()
-    ) or "N/A"
-    type_summary = ", ".join(
-        f"{k}: {v}" for k, v in analysis["device_type_breakdown"].items()
-    ) or "N/A"
-    return (
-        f"Total: {analysis['total']} | Assigned Sites: {analysis['assigned_count']} | "
-        f"Unassigned (N/A): {analysis['unassigned_count']} | Online: {analysis['connected']} | "
-        f"Disconnected (>5h): {analysis['disconnected_5h_count']}\n"
-        f"Device Types: {type_summary}\n"
-        f"Firmware: {fw_summary}\n"
-        + (
-            "Disconnected (>5h):\n" + "\n".join(off_lines)
-            if off_lines
-            else "Koi device >5h disconnected nahi hai."
+def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "Sr.No",
+            "Client",
+            "Serial No",
+            "Industry Name",
+            "Site Type",
+            "Assignment Status",
+            "Device Type",
+            "Firmware",
+            "Status",
+            "Last Seen (IST)",
+        ]
+    )
+    for idx, d in enumerate(devices, start=1):
+        writer.writerow(
+            [
+                idx,
+                CLIENT_NAME,
+                d.get("serial_no", "N/A"),
+                d.get("industry", "N/A"),
+                d.get("site", "N/A"),
+                "UNASSIGNED" if d.get("is_unassigned") else "ASSIGNED",
+                d.get("device_type", "N/A"),
+                d.get("firmware", "N/A"),
+                d.get("conn_label", "N/A"),
+                d.get("display_time", "N/A"),
+            ]
         )
+    return buf.getvalue().encode("utf-8-sig")
+
+
+# ==============================================================================
+# AI ENGINE (FIXED MODELS + DIAGNOSTIC + SMART LOCAL ANALYZER)
+# ==============================================================================
+def build_smart_local_report(analysis: dict[str, Any], query: str = "") -> str:
+    ages = analysis.get("aging_counts", {})
+    top_sites = ", ".join(f"{s} ({c})" for s, c in analysis.get("top_offline_sites", [])) or "None"
+    fw_txt = ", ".join(f"{k}:{v}" for k, v in analysis.get("firmware_breakdown", {}).items()) or "N/A"
+    type_txt = ", ".join(f"{k}:{v}" for k, v in analysis.get("device_type_breakdown", {}).items()) or "N/A"
+
+    base = (
+        f"[{CLIENT_NAME} Telemetry Report]\n"
+        f"Total: {analysis.get('total', 0)} | Online: {analysis.get('connected', 0)} | "
+        f"Offline >5h: {analysis.get('disconnected_5h_count', 0)} | Unassigned N/A: {analysis.get('unassigned_count', 0)}\n"
+        f"Aging -> >1Y: {ages.get('1y', 0)} | >11M: {ages.get('11m', 0)} | "
+        f">24D: {ages.get('24d', 0)} | >1W: {ages.get('1w', 0)} | >1D: {ages.get('1d', 0)}\n"
+        f"Top Offline Sites: {top_sites}\n"
+        f"Device Types: {type_txt}\n"
+        f"Firmware: {fw_txt}"
     )
 
+    if not query:
+        return base
 
-def call_gemini_with_fallback(prompt: str, fallback_text: str) -> str:
+    q = query.lower()
+    devs = analysis.get("all_devices", [])
+    matches = [
+        d
+        for d in devs
+        if q in str(d.get("industry", "")).lower()
+        or q in str(d.get("site", "")).lower()
+        or q in str(d.get("serial_no", "")).lower()
+        or q in str(d.get("device_type", "")).lower()
+        or q in str(d.get("firmware", "")).lower()
+    ]
+    if matches:
+        m_lines = [
+            f"{i+1}. {m.get('industry')} ({m.get('site')}) | {m.get('serial_no')} | {m.get('conn_label')} ({m.get('display_time')})"
+            for i, m in enumerate(matches[:8])
+        ]
+        return f"Matched ({len(matches)}) for '{query}':\n" + "\n".join(m_lines)
+
+    return base + f"\nNote: '{query}' ke direct matches nahi mile, overall summary upar hai."
+
+
+def call_gemini_ai(prompt: str, analysis: dict[str, Any], query: str = "") -> str:
+    local_fallback = build_smart_local_report(analysis, query=query)
     if not GEMINI_API_KEY:
-        return fallback_text
+        return local_fallback
 
-    models_to_try = ("gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash")
-
-    for m_name in models_to_try:
-        try:
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            response = client.models.generate_content(model=m_name, contents=prompt)
-            if response and response.text:
-                return response.text.strip()
-        except Exception:
-            continue
-
+    models_to_try = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash")
     body = {"contents": [{"parts": [{"text": prompt}]}]}
+    last_err = ""
+
     for m_name in models_to_try:
         try:
             r = requests.post(
@@ -789,71 +1015,82 @@ def call_gemini_with_fallback(prompt: str, fallback_text: str) -> str:
                 txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
                 if txt:
                     return txt
-        except Exception:
-            continue
+            else:
+                try:
+                    err_msg = r.json().get("error", {}).get("message", r.text[:160])
+                except Exception:
+                    err_msg = r.text[:160]
+                last_err = f"{m_name}: HTTP {r.status_code} ({err_msg})"
+        except Exception as exc:
+            last_err = f"{m_name}: {exc}"
 
-    return fallback_text
+    logger.warning("Gemini fallback used. Last error: %s", last_err)
+    status_note = (
+        f"[Gemini API Status: {last_err}]\n\n" if last_err else ""
+    )
+    return status_note + local_fallback
 
 
 def build_project_context(analysis: dict[str, Any]) -> str:
     compact_devices = [
         {
-            "serial": d["serial_no"],
-            "industry": d["industry"],
-            "site_type": d["site"],
-            "unassigned": d["is_unassigned"],
-            "device_type": d["device_type"],
-            "fw": d["firmware"],
-            "status": d["conn_label"],
-            "online": d["is_connected"],
-            "offline_5h": d["disconnected_5h"],
-            "offline_hours": round(d["offline_duration"].total_seconds() / 3600, 1)
-            if d["offline_duration"]
-            else None,
-            "last_seen": d["display_time"],
+            "serial": d.get("serial_no"),
+            "industry": d.get("industry"),
+            "site_type": d.get("site"),
+            "unassigned": d.get("is_unassigned"),
+            "device_type": d.get("device_type"),
+            "fw": d.get("firmware"),
+            "status": d.get("conn_label"),
+            "offline_hours": d.get("offline_hours")
+            if "offline_hours" in d
+            else (
+                round(d["offline_duration"].total_seconds() / 3600, 1)
+                if d.get("offline_duration")
+                else None
+            ),
+            "last_seen": d.get("display_time"),
         }
-        for d in analysis["all_devices"][:50]
+        for d in analysis.get("all_devices", [])[:50]
     ]
     return (
-        f"Checked At: {analysis['checked_at_ist']}\n"
-        f"Total Devices: {analysis['total']}\n"
-        f"Assigned Sites Count: {analysis['assigned_count']}\n"
-        f"Unassigned (N/A) Count: {analysis['unassigned_count']}\n"
-        f"Online Devices: {analysis['connected']}\n"
-        f"Offline (>5h) Count: {analysis['disconnected_5h_count']}\n"
-        f"Top Offline Sites: {analysis['top_offline_sites']}\n"
-        f"Device Type Breakdown: {analysis['device_type_breakdown']}\n"
-        f"Firmware Breakdown: {analysis['firmware_breakdown']}\n"
-        f"Parser/Server Meta: {analysis['meta']}\n"
-        f"Devices (up to 50): {compact_devices}"
+        f"Client: {CLIENT_NAME}\n"
+        f"Checked At: {analysis.get('checked_at_ist')}\n"
+        f"Total Devices: {analysis.get('total')}\n"
+        f"Assigned Sites: {analysis.get('assigned_count')}\n"
+        f"Unassigned (N/A): {analysis.get('unassigned_count')}\n"
+        f"Online: {analysis.get('connected')}\n"
+        f"Offline >5h: {analysis.get('disconnected_5h_count')}\n"
+        f"Aging Counts: {analysis.get('aging_counts')}\n"
+        f"Top Offline Sites: {analysis.get('top_offline_sites')}\n"
+        f"Device Types: {analysis.get('device_type_breakdown')}\n"
+        f"Firmware: {analysis.get('firmware_breakdown')}\n"
+        f"Devices (sample): {compact_devices}"
     )
 
 
 def generate_ai_analysis(analysis: dict[str, Any]) -> str:
-    context_str = build_project_context(analysis)
+    ctx = build_project_context(analysis)
     prompt = (
-        "Tum ek senior industrial telemetry & IoT monitoring engineer ho jo EnviroFRONT (M2MLogger) "
-        "device monitoring project par kaam kar raha hai. Is project ke live data ke basis par "
-        "Hinglish mein crisp, executive aur actionable analysis do:\n"
-        "1. Overall Health & Risk Level\n"
-        "2. Sabse Critical Industries / Sites (>5h offline)\n"
-        "3. Unassigned (N/A) Devices, Device Types & Firmware Patterns\n"
-        "4. Immediate Action Checklist\n\n"
-        f"{context_str}"
+        f"Tum {CLIENT_NAME} ke EnviroFRONT telemetry project ke senior AI engineer ho. "
+        "Hinglish mein crisp, actionable analysis do:\n"
+        "1. System Health & Risk\n"
+        "2. Critical Offline Sites & Long-Disconnected Buckets (>1Y, >11M, >24D, >1W, >1D)\n"
+        "3. Unassigned (N/A) Sites, Device Types & Firmware\n"
+        "4. Action Checklist\n\n"
+        f"{ctx}"
     )
-    return call_gemini_with_fallback(prompt, build_rich_local_summary(analysis))
+    return call_gemini_ai(prompt, analysis)
 
 
 def answer_project_question(user_question: str, analysis: dict[str, Any]) -> str:
-    context_str = build_project_context(analysis)
+    ctx = build_project_context(analysis)
     prompt = (
-        "Tum EnviroFRONT (M2MLogger) telemetry monitoring bot aur dashboard ke dedicated AI assistant ho. "
-        "User ke message ka jawab sirf is project ke live devices, industries, site types, serials, firmware, "
-        "device types, unassigned (N/A) devices, timestamps aur alerts ke context mein Hinglish mein do.\n\n"
-        f"LIVE PROJECT DATA:\n{context_str}\n\n"
-        f"USER MESSAGE:\n{user_question}"
+        f"Tum {CLIENT_NAME} EnviroFRONT telemetry bot ke AI assistant ho. "
+        "Live telemetry data ke basis par Hinglish mein seedha aur accurate jawab do.\n\n"
+        f"LIVE DATA:\n{ctx}\n\n"
+        f"QUESTION:\n{user_question}"
     )
-    return call_gemini_with_fallback(prompt, build_rich_local_summary(analysis))
+    return call_gemini_ai(prompt, analysis, query=user_question)
 
 
 def require_auth(chat_id: int) -> dict[str, Any] | None:
@@ -864,28 +1101,26 @@ def require_auth(chat_id: int) -> dict[str, Any] | None:
 
 
 # ==============================================================================
-# ACTION RUNNERS (DM + ALL GROUPS)
+# ACTION RUNNERS
 # ==============================================================================
 async def send_start_view(chat_id: int, send_fn) -> None:
     existing = require_auth(chat_id)
     if existing:
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🌈 <b>ENVIROFRONT TELEMETRY SUITE</b>\n"
-            "✨ <i>Active Session Restored</i>\n"
+            f"👑 <b>{esc(CLIENT_NAME)} — TELEMETRY SUITE</b>\n"
+            "✨ <i>Enterprise Active Session</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 <b>Account:</b> <code>{esc(existing.get('username'))}</code>\n"
-            "🟢 <b>Session:</b> <b>AUTHENTICATED</b>\n"
-            "🔔 <b>5h Auto-Alert:</b> <b>ACTIVE (1 Grouped Msg)</b>\n\n"
-            "<i>Buttons ya 4-dot command menu se chalayein:</i>"
+            "🔄 <b>Auto-Refresh:</b> <code>EVERY 1 MINUTE</code>\n"
+            "🔔 <b>Alerts:</b> <code>GROUPED + RECONNECT</code>\n\n"
+            "<i>Neeche buttons ya sub-menus se chalayein:</i>"
         )
         await send_fn(
-            msg,
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_inline_keyboard(),
+            msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
         )
         await send_fn(
-            "🎛️ <b>Quick Controls Ready</b>",
+            "🎛️ <b>Control Panel Ready</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=bottom_reply_keyboard(),
         )
@@ -894,7 +1129,7 @@ async def send_start_view(chat_id: int, send_fn) -> None:
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
     intro = await send_fn(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌈 <b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+        f"👑 <b>{esc(CLIENT_NAME)} — TELEMETRY SUITE</b>\n"
         "<i>Initializing Console...</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode=ParseMode.HTML,
@@ -904,16 +1139,16 @@ async def send_start_view(chat_id: int, send_fn) -> None:
         intro,
         [
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🌈 <b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+            f"👑 <b>{esc(CLIENT_NAME)} — TELEMETRY SUITE</b>\n"
             "<i>Loading modules [■■□□□]</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━",
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🌈 <b>ENVIROFRONT TELEMETRY SUITE</b>\n"
+            f"👑 <b>{esc(CLIENT_NAME)} — TELEMETRY SUITE</b>\n"
             "<i>Loading modules [■■■■■]</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "🔐 Kripya apna <b>Login ID / Email</b> bhejein:",
         ],
-        delay=0.35,
+        delay=0.3,
         final_markup=guest_inline_keyboard(),
     )
 
@@ -923,7 +1158,7 @@ async def send_login_prompt(chat_id: int, send_fn) -> None:
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
     await send_fn(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔐 <b>ENVIROFRONT LOGIN</b>\n"
+        f"🔐 <b>{esc(CLIENT_NAME)} — LOGIN</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Kripya apna <b>Login ID / Email</b> bhejein:",
         parse_mode=ParseMode.HTML,
@@ -938,6 +1173,7 @@ async def send_logout_action(chat_id: int, send_fn) -> None:
 
     for key in [k for k in ALERTED_DEVICES if k.startswith(f"{chat_id}:")]:
         ALERTED_DEVICES.pop(key, None)
+        delete_alert_key_db(key)
 
     if sess_data and sess_data.get("session"):
         try:
@@ -963,6 +1199,118 @@ async def send_logout_action(chat_id: int, send_fn) -> None:
     )
 
 
+async def send_aging_menu(chat_id: int, send_fn) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await send_fn(
+            "🔒 Pehle login karein:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=guest_inline_keyboard(),
+        )
+        return
+
+    try:
+        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+            run_self_analysis, sess_data["session"]
+        )
+        LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
+        ages = analysis.get("aging_counts", {})
+    except Exception:
+        ages = {}
+
+    msg = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⏳ <b>DISCONNECT DURATION SUB-MENU</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<code>&gt; 1 Year (365d+)  : {ages.get('1y', 0)}</code>\n"
+        f"<code>&gt; 11 Months(330d+): {ages.get('11m', 0)}</code>\n"
+        f"<code>&gt; 24 Days (24d+)  : {ages.get('24d', 0)}</code>\n"
+        f"<code>&gt; 1 Week (7d+)    : {ages.get('1w', 0)}</code>\n"
+        f"<code>&gt; 1 Day (24h+)    : {ages.get('1d', 0)}</code>\n"
+        f"<code>&gt; 5 Hours (5h+)   : {ages.get('5h', 0)}</code>\n\n"
+        "<i>Kisi bhi duration button par tap karke list dekhein:</i>"
+    )
+    await send_fn(
+        msg, parse_mode=ParseMode.HTML, reply_markup=aging_submenu_keyboard()
+    )
+
+
+async def send_aging_bucket_list(chat_id: int, bucket_key: str, send_fn) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await send_fn(
+            "🔒 Pehle login karein:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=guest_inline_keyboard(),
+        )
+        return
+
+    title, min_delta = AGING_CONFIG.get(
+        bucket_key, ("DISCONNECTED > 5 HOURS (5h+)", timedelta(hours=5))
+    )
+
+    try:
+        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
+        matched = filter_disconnected_by_delta(analysis["all_devices"], min_delta)
+
+        if not matched:
+            await send_fn(
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏳ <b>{esc(title)}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<code>Is duration mein koi disconnected site nahi hai.</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=aging_submenu_keyboard(),
+            )
+            return
+
+        entries: list[str] = []
+        for idx, d in enumerate(matched, start=1):
+            entries.append(
+                f"{idx}. {format_industry_with_type(d['industry'], d['site'])} | "
+                f"<code>{esc(d['serial_no'])}</code>\n"
+                f"   {format_status_with_time(False, d['display_time'])}"
+            )
+
+        chunk: list[str] = []
+        sent_parts = 0
+        for line in entries:
+            chunk.append(line)
+            if len("\n".join(chunk)) > 3300:
+                hdr = (
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏳ <b>{esc(title)} ({len(matched)})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    if sent_parts == 0
+                    else ""
+                )
+                await send_fn(hdr + "\n".join(chunk), parse_mode=ParseMode.HTML)
+                sent_parts += 1
+                chunk = []
+
+        hdr = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ <b>{esc(title)} ({len(matched)})</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            if sent_parts == 0
+            else ""
+        )
+        await send_fn(
+            hdr + "\n".join(chunk),
+            parse_mode=ParseMode.HTML,
+            reply_markup=aging_submenu_keyboard(),
+        )
+    except Exception as exc:
+        await send_fn(
+            f"❌ <b>Bucket Error:</b> <code>{esc(exc)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=aging_submenu_keyboard(),
+        )
+
+
 async def send_status_action(chat_id: int, send_fn) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
@@ -979,6 +1327,7 @@ async def send_status_action(chat_id: int, send_fn) -> None:
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
 
         if analysis["meta"]["server_error_500"]:
             await loader.edit_text(
@@ -999,17 +1348,20 @@ async def send_status_action(chat_id: int, send_fn) -> None:
             if analysis["top_offline_sites"]
             else "  ✨ <code>Koi critical offline site nahi</code>"
         )
+        ages = analysis["aging_counts"]
 
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📊 <b>EXECUTIVE SYSTEM STATUS</b>\n"
-            f"🕒 <i>{esc(analysis['checked_at_ist'])}</i>\n"
+            f"📊 <b>{esc(CLIENT_NAME)} — STATUS</b>\n"
+            f"🕒 <i>{esc(analysis['checked_at_ist'])}</i> (1m auto-sync)\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📦 <b>Total Devices:</b> <code>{analysis['total']}</code>\n"
             f"🏭 <b>Assigned Sites:</b> <code>{analysis['assigned_count']}</code>\n"
             f"📌 <b>Unassigned (N/A):</b> <code>{analysis['unassigned_count']}</code>\n"
             f"🟢 <b>Online:</b> <code>{analysis['connected']}</code>\n"
             f"🔴 <b>Disconnected (&gt;5h):</b> <code>{analysis['disconnected_5h_count']}</code>\n\n"
+            "<b>Aging Buckets</b>\n"
+            f"<code>&gt;1Y: {ages['1y']} | &gt;11M: {ages['11m']} | &gt;24D: {ages['24d']} | &gt;1W: {ages['1w']} | &gt;1D: {ages['1d']}</code>\n\n"
             "<b>Priority Offline (&gt;5h)</b>\n"
             f"{sites_lines}"
         )
@@ -1019,43 +1371,6 @@ async def send_status_action(chat_id: int, send_fn) -> None:
     except Exception as exc:
         await loader.edit_text(
             f"❌ <b>Status Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_inline_keyboard(),
-        )
-
-
-async def send_summary_action(chat_id: int, send_fn) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await send_fn(
-            "🔒 Pehle login karein:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=guest_inline_keyboard(),
-        )
-        return
-
-    try:
-        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        msg = (
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📋 <b>QUICK TELEMETRY SUMMARY</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>Total       : {analysis['total']}</code>\n"
-            f"<code>Assigned    : {analysis['assigned_count']}</code>\n"
-            f"<code>Unassigned  : {analysis['unassigned_count']}</code>\n"
-            f"<code>Online      : {analysis['connected']}</code>\n"
-            f"<code>Offline >5h : {analysis['disconnected_5h_count']}</code>\n"
-            f"<code>Checked     : {esc(analysis['checked_at_ist'])}</code>"
-        )
-        await send_fn(
-            msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
-        )
-    except Exception as exc:
-        await send_fn(
-            f"❌ <b>Summary Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_inline_keyboard(),
         )
@@ -1074,6 +1389,7 @@ async def send_online_action(chat_id: int, send_fn) -> None:
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
         online_list = analysis["online_list"]
 
         if not online_list:
@@ -1111,59 +1427,6 @@ async def send_online_action(chat_id: int, send_fn) -> None:
         )
 
 
-async def send_offline_action(chat_id: int, send_fn) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await send_fn(
-            "🔒 Pehle login karein:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=guest_inline_keyboard(),
-        )
-        return
-
-    try:
-        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
-        LAST_SNAPSHOT[chat_id] = analysis
-        off_list = analysis["disconnected_5h_list"]
-
-        if not off_list:
-            await send_fn(
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🟢 <b>OFFLINE MONITOR (&gt;5h)</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<code>Sabhi devices 5 ghante ke andar active hain.</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_inline_keyboard(),
-            )
-            return
-
-        lines = [
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            f"🔴 <b>DISCONNECTED &gt; 5 HOURS ({len(off_list)})</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-        ]
-        for idx, d in enumerate(off_list[:25], start=1):
-            lines.append(
-                f"{idx}. {format_industry_with_type(d['industry'], d['site'])} | "
-                f"<code>{esc(d['serial_no'])}</code>\n"
-                f"   {format_status_with_time(False, d['display_time'])}"
-            )
-        if len(off_list) > 25:
-            lines.append(f"\n<code>...aur {len(off_list) - 25} disconnected devices hain.</code>")
-
-        await send_fn(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_inline_keyboard(),
-        )
-    except Exception as exc:
-        await send_fn(
-            f"❌ <b>Offline Error:</b> <code>{esc(exc)}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_inline_keyboard(),
-        )
-
-
 async def send_unassigned_action(chat_id: int, send_fn) -> None:
     sess_data = require_auth(chat_id)
     if not sess_data:
@@ -1177,6 +1440,7 @@ async def send_unassigned_action(chat_id: int, send_fn) -> None:
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
         unassigned_list = analysis["unassigned_list"]
 
         if not unassigned_list:
@@ -1218,19 +1482,18 @@ async def send_unassigned_action(chat_id: int, send_fn) -> None:
                 sent_chunks += 1
                 chunk_lines = []
 
-        if chunk_lines:
-            header = (
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 <b>UNASSIGNED N/A — SITE ASSIGN NAHI HAI ({len(unassigned_list)})</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                if sent_chunks == 0
-                else ""
-            )
-            await send_fn(
-                header + "\n".join(chunk_lines),
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_inline_keyboard(),
-            )
+        header = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>UNASSIGNED N/A — SITE ASSIGN NAHI HAI ({len(unassigned_list)})</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            if sent_chunks == 0
+            else ""
+        )
+        await send_fn(
+            header + "\n".join(chunk_lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
+        )
     except Exception as exc:
         await send_fn(
             f"❌ <b>Unassigned Error:</b> <code>{esc(exc)}</code>",
@@ -1256,6 +1519,7 @@ async def send_allsite_action(chat_id: int, send_fn) -> None:
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
         assigned_devs = analysis["assigned_devices"]
 
         if not assigned_devs:
@@ -1301,26 +1565,25 @@ async def send_allsite_action(chat_id: int, send_fn) -> None:
                 sent_chunks += 1
                 chunk_lines = []
 
-        if chunk_lines:
-            header = (
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌐 <b>ALL ASSIGNED SITES ({len(assigned_devs)})</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                if sent_chunks == 0
-                else ""
+        header = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌐 <b>ALL ASSIGNED SITES ({len(assigned_devs)})</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            if sent_chunks == 0
+            else ""
+        )
+        if sent_chunks == 0:
+            await loader.edit_text(
+                header + "\n".join(chunk_lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_inline_keyboard(),
             )
-            if sent_chunks == 0:
-                await loader.edit_text(
-                    header + "\n".join(chunk_lines),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=main_inline_keyboard(),
-                )
-            else:
-                await send_fn(
-                    "\n".join(chunk_lines),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=main_inline_keyboard(),
-                )
+        else:
+            await send_fn(
+                "\n".join(chunk_lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_inline_keyboard(),
+            )
     except Exception as exc:
         await loader.edit_text(
             f"❌ <b>AllSite Error:</b> <code>{esc(exc)}</code>",
@@ -1342,6 +1605,7 @@ async def send_health_action(chat_id: int, send_fn) -> None:
     try:
         analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
         LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
         meta = analysis["meta"]
 
         type_lines = (
@@ -1368,11 +1632,12 @@ async def send_health_action(chat_id: int, send_fn) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🩺 <b>SYSTEM &amp; PARSER HEALTH</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"▸ <b>Client:</b> <code>{esc(CLIENT_NAME)}</code>\n"
+            f"▸ <b>Auto-Refresh:</b> <code>EVERY 60s</code>\n"
             f"▸ <b>Server HTTP 500:</b> <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
             f"▸ <b>Source:</b> <code>{esc(meta.get('source', 'none'))}</code>\n"
             f"▸ <b>Total Parsed:</b> <code>{analysis['total']}</code>\n"
-            f"▸ <b>Assigned Sites:</b> <code>{analysis['assigned_count']}</code>\n"
-            f"▸ <b>Unassigned (N/A):</b> <code>{analysis['unassigned_count']}</code>\n"
+            f"▸ <b>Assigned / Unassigned:</b> <code>{analysis['assigned_count']} / {analysis['unassigned_count']}</code>\n"
             f"▸ <b>Unparsed TS:</b> <code>{meta['unparsed_ts_count']}</code>\n\n"
             "<b>Device Type Distribution</b>\n"
             f"{type_lines}\n\n"
@@ -1385,6 +1650,39 @@ async def send_health_action(chat_id: int, send_fn) -> None:
     except Exception as exc:
         await send_fn(
             f"❌ <b>Health Error:</b> <code>{esc(exc)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
+        )
+
+
+async def send_export_csv_action(chat_id: int, bot, send_fn) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await send_fn(
+            "🔒 Pehle login karein:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=guest_inline_keyboard(),
+        )
+        return
+
+    try:
+        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+            run_self_analysis, sess_data["session"]
+        )
+        LAST_SNAPSHOT[chat_id] = analysis
+        csv_bytes = build_csv_bytes(analysis.get("all_devices", []))
+        bio = io.BytesIO(csv_bytes)
+        bio.name = f"BaggiJaat_EnviroFRONT_{datetime.now(IST).strftime('%Y%m%d_%H%M')}.csv"
+        await bot.send_document(
+            chat_id=chat_id,
+            document=bio,
+            caption=f"📥 <b>{esc(CLIENT_NAME)} Telemetry CSV Export</b>\n<code>Total: {analysis.get('total', 0)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
+        )
+    except Exception as exc:
+        await send_fn(
+            f"❌ <b>Export Error:</b> <code>{esc(exc)}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_inline_keyboard(),
         )
@@ -1405,7 +1703,7 @@ async def send_ai_mode_prompt(chat_id: int, send_fn) -> None:
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 <b>PROJECT AI MODE ON</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Ab apna sawaal type karein—AI aapke EnviroFRONT project ke live data ke hisaab se jawab dega.\n"
+        "Ab apna sawaal type karein—AI aapke live telemetry data ke hisaab se jawab dega.\n"
         "Bahar jaane ke liye <code>/exit_ai</code> bhejein.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_inline_keyboard(),
@@ -1428,23 +1726,26 @@ async def send_ai_report_action(chat_id: int, send_fn) -> None:
     await animate_message(
         status_box,
         [
-            "<i>Scanning industries &amp; loggers [■■□]</i>",
+            "<i>Scanning industries &amp; buckets [■■□]</i>",
             "<i>Compiling AI report [■■■]</i>",
         ],
-        delay=0.35,
+        delay=0.3,
     )
 
     try:
-        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+            run_self_analysis, sess_data["session"]
+        )
         LAST_SNAPSHOT[chat_id] = analysis
+        save_snapshot_db(chat_id, analysis)
         ai_text = await asyncio.to_thread(generate_ai_analysis, analysis)
 
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🧠 <b>AI SELF-ANALYSIS REPORT</b>\n"
+            f"🧠 <b>{esc(CLIENT_NAME)} — AI REPORT</b>\n"
             f"🕒 <i>{esc(analysis['checked_at_ist'])}</i>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>{esc(ai_text)}</code>"
+            f"<code>{esc(ai_text[:3400])}</code>"
         )
         await status_box.edit_text(
             msg, parse_mode=ParseMode.HTML, reply_markup=main_inline_keyboard()
@@ -1458,7 +1759,7 @@ async def send_ai_report_action(chat_id: int, send_fn) -> None:
 
 
 # ==============================================================================
-# COMMAND & CALLBACK HANDLERS
+# COMMAND, CALLBACK & TEXT HANDLERS
 # ==============================================================================
 def get_reply_fn(update: Update):
     if update.effective_message:
@@ -1482,16 +1783,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await send_status_action(update.effective_chat.id, get_reply_fn(update))
 
 
-async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_summary_action(update.effective_chat.id, get_reply_fn(update))
+async def aging_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_aging_menu(update.effective_chat.id, get_reply_fn(update))
 
 
 async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_online_action(update.effective_chat.id, get_reply_fn(update))
-
-
-async def offline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_offline_action(update.effective_chat.id, get_reply_fn(update))
 
 
 async def unassigned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1500,6 +1797,16 @@ async def unassigned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def allsite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_allsite_action(update.effective_chat.id, get_reply_fn(update))
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_health_action(update.effective_chat.id, get_reply_fn(update))
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_export_csv_action(
+        update.effective_chat.id, context.bot, get_reply_fn(update)
+    )
 
 
 async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1524,7 +1831,9 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        analysis = await asyncio.to_thread(run_self_analysis, sess_data["session"])
+        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+            run_self_analysis, sess_data["session"]
+        )
         matches = [
             d
             for d in analysis["all_devices"]
@@ -1565,10 +1874,6 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_health_action(update.effective_chat.id, get_reply_fn(update))
-
-
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     reply_fn = get_reply_fn(update)
@@ -1587,8 +1892,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     thinking = await reply_fn(
-        "<i>🤖 Project data ke hisaab se jawab ban raha hai...</i>",
-        parse_mode=ParseMode.HTML,
+        "<i>🤖 AI jawab taiyar kar raha hai...</i>", parse_mode=ParseMode.HTML
     )
     try:
         analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
@@ -1602,7 +1906,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🤖 <b>PROJECT AI ASSISTANT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>{esc(reply_txt)}</code>",
+            f"<code>{esc(reply_txt[:3400])}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_inline_keyboard(),
         )
@@ -1643,24 +1947,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=reply_markup,
         )
 
-    if data == "act:login":
+    if data == "act:main_menu":
+        await send_via_chat(
+            f"🎛️ <b>{esc(CLIENT_NAME)} — MAIN MENU</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_inline_keyboard(),
+        )
+    elif data == "act:aging_menu":
+        await send_aging_menu(chat_id, send_via_chat)
+    elif data.startswith("age:"):
+        bucket = data.split(":", 1)[1]
+        await send_aging_bucket_list(chat_id, bucket, send_via_chat)
+    elif data == "act:login":
         await send_login_prompt(chat_id, send_via_chat)
     elif data == "act:logout":
         await send_logout_action(chat_id, send_via_chat)
     elif data == "act:status":
         await send_status_action(chat_id, send_via_chat)
-    elif data == "act:summary":
-        await send_summary_action(chat_id, send_via_chat)
     elif data == "act:online":
         await send_online_action(chat_id, send_via_chat)
-    elif data == "act:offline":
-        await send_offline_action(chat_id, send_via_chat)
     elif data == "act:unassigned":
         await send_unassigned_action(chat_id, send_via_chat)
     elif data == "act:allsite":
         await send_allsite_action(chat_id, send_via_chat)
     elif data == "act:health":
         await send_health_action(chat_id, send_via_chat)
+    elif data == "act:export_csv":
+        await send_export_csv_action(chat_id, context.bot, send_via_chat)
     elif data == "act:ai_mode":
         await send_ai_mode_prompt(chat_id, send_via_chat)
     elif data == "act:ai_analyze":
@@ -1671,12 +1984,12 @@ REPLY_BUTTON_MAP: dict[str, str] = {
     "📊 status": "status",
     "🌐 all sites": "allsite",
     "🟢 online": "online",
-    "🔴 offline >5h": "offline",
+    "⏳ aging menus": "aging_menu",
     "📌 unassigned n/a": "unassigned",
     "🩺 health": "health",
     "🤖 ai chat": "ai_mode",
     "🧠 ai report": "ai_analyze",
-    "📋 summary": "summary",
+    "📥 export csv": "export_csv",
     "🚪 logout": "logout",
 }
 
@@ -1732,10 +2045,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             }
             await auth_box.edit_text(
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🟢 <b>SESSION AUTHENTICATED</b>\n"
+                f"🟢 <b>{esc(CLIENT_NAME)} — AUTHENTICATED</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>Account:</b> <code>{esc(username)}</code>\n"
-                "🔔 <b>5h Auto-Alert:</b> <b>ACTIVE (1 Grouped Msg)</b>",
+                "🔄 <b>Auto-Refresh:</b> <code>EVERY 1 MINUTE</code>\n"
+                "🔔 <b>Alerts:</b> <code>GROUPED + RECONNECT</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_inline_keyboard(),
             )
@@ -1762,8 +2076,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await send_allsite_action(chat_id, reply_fn)
         elif mapped_action == "online":
             await send_online_action(chat_id, reply_fn)
-        elif mapped_action == "offline":
-            await send_offline_action(chat_id, reply_fn)
+        elif mapped_action == "aging_menu":
+            await send_aging_menu(chat_id, reply_fn)
         elif mapped_action == "unassigned":
             await send_unassigned_action(chat_id, reply_fn)
         elif mapped_action == "health":
@@ -1772,8 +2086,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await send_ai_mode_prompt(chat_id, reply_fn)
         elif mapped_action == "ai_analyze":
             await send_ai_report_action(chat_id, reply_fn)
-        elif mapped_action == "summary":
-            await send_summary_action(chat_id, reply_fn)
+        elif mapped_action == "export_csv":
+            await send_export_csv_action(chat_id, context.bot, reply_fn)
         elif mapped_action == "logout":
             await send_logout_action(chat_id, reply_fn)
         return
@@ -1790,8 +2104,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         ans_msg = await reply_fn(
-            "<i>🤖 Project data ke hisaab se jawab ban raha hai...</i>",
-            parse_mode=ParseMode.HTML,
+            "<i>🤖 AI jawab taiyar kar raha hai...</i>", parse_mode=ParseMode.HTML
         )
         try:
             analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
@@ -1805,7 +2118,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "🤖 <b>PROJECT AI ASSISTANT</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<code>{esc(reply_txt)}</code>",
+                f"<code>{esc(reply_txt[:3400])}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_inline_keyboard(),
             )
@@ -1826,7 +2139,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ==============================================================================
-# BACKGROUND MONITOR (SINGLE GROUPED ALERT MESSAGE WITH 1., 2., 3.)
+# 1-MINUTE BACKGROUND MONITOR (GROUPED DISCONNECT + RECONNECT ALERTS)
 # ==============================================================================
 async def background_monitor(app) -> None:
     while True:
@@ -1836,10 +2149,18 @@ async def background_monitor(app) -> None:
                 continue
 
             try:
+                prev_snap = LAST_SNAPSHOT.get(chat_id)
+                prev_offline_serials = (
+                    {d["serial_no"] for d in prev_snap.get("disconnected_5h_list", [])}
+                    if prev_snap
+                    else set()
+                )
+
                 analysis = await asyncio.to_thread(
                     run_self_analysis, sess_data["session"]
                 )
                 LAST_SNAPSHOT[chat_id] = analysis
+                save_snapshot_db(chat_id, analysis)
 
                 newly_disconnected: list[dict[str, Any]] = []
                 for dev in analysis["disconnected_5h_list"]:
@@ -1847,12 +2168,13 @@ async def background_monitor(app) -> None:
                     last_alert = ALERTED_DEVICES.get(key)
                     if not last_alert or (now - last_alert) > ALERT_COOLDOWN:
                         ALERTED_DEVICES[key] = now
+                        save_alert_key_db(key, now)
                         newly_disconnected.append(dev)
 
                 if newly_disconnected:
                     header = (
                         "━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🚨 <b>DISCONNECT ALERT (&gt;5H) — {len(newly_disconnected)}</b>\n"
+                        f"🚨 <b>{esc(CLIENT_NAME)} — DISCONNECT (&gt;5H) {len(newly_disconnected)}</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
                     chunk: list[str] = []
@@ -1881,37 +2203,67 @@ async def background_monitor(app) -> None:
                             reply_markup=main_inline_keyboard(),
                         )
 
-                active_serials = {
+                current_online_map = {
+                    d["serial_no"]: d for d in analysis["online_list"]
+                }
+                recovered = [
+                    current_online_map[s]
+                    for s in prev_offline_serials
+                    if s in current_online_map
+                ]
+                if recovered:
+                    rec_lines = [
+                        "━━━━━━━━━━━━━━━━━━━━━━",
+                        f"🟢 <b>{esc(CLIENT_NAME)} — RECONNECTED ({len(recovered)})</b>",
+                        "━━━━━━━━━━━━━━━━━━━━━━",
+                    ]
+                    for idx, d in enumerate(recovered[:20], start=1):
+                        rec_lines.append(
+                            f"{idx}. {format_industry_with_type(d['industry'], d['site'])} | "
+                            f"<code>{esc(d['serial_no'])}</code>\n"
+                            f"   {format_status_with_time(True, d['display_time'])}"
+                        )
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text="\n".join(rec_lines),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=main_inline_keyboard(),
+                    )
+
+                active_offline_serials = {
                     d["serial_no"] for d in analysis["disconnected_5h_list"]
                 }
                 for k in list(ALERTED_DEVICES.keys()):
                     if k.startswith(f"{chat_id}:"):
                         serial = k.split(":", 1)[1]
-                        if serial not in active_serials:
+                        if serial not in active_offline_serials:
                             ALERTED_DEVICES.pop(k, None)
+                            delete_alert_key_db(k)
 
             except Exception as exc:
-                logger.warning("Background monitor error for %s: %s", chat_id, exc)
+                logger.warning("1m background monitor error for %s: %s", chat_id, exc)
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 async def post_init(app) -> None:
+    init_db()
+    load_alert_keys_db()
     try:
         await app.bot.set_my_commands(
             [
-                BotCommand("start", "Start & panel buttons"),
+                BotCommand("start", "BAGGI JAAT control panel"),
                 BotCommand("login", "Login to EnviroFRONT"),
-                BotCommand("status", "Executive telemetry status"),
+                BotCommand("status", "Live status & aging counts"),
+                BotCommand("aging", "1Y / 11M / 24D / 1W / 1D menus"),
                 BotCommand("allsite", "All assigned sites"),
                 BotCommand("unassigned", "Unassigned N/A sites"),
                 BotCommand("online", "Online devices list"),
-                BotCommand("offline", "Disconnected (>5h) list"),
-                BotCommand("summary", "Quick telemetry summary"),
                 BotCommand("health", "Device types & firmware health"),
-                BotCommand("site", "Search by industry/type/serial"),
-                BotCommand("ai", "Ask AI about live project"),
-                BotCommand("ai_analyze", "Full AI analysis report"),
+                BotCommand("export", "Download CSV report"),
+                BotCommand("site", "Search industry/type/serial"),
+                BotCommand("ai", "Ask AI about live telemetry"),
+                BotCommand("ai_analyze", "Full AI report"),
                 BotCommand("logout", "Logout session"),
             ]
         )
@@ -1930,20 +2282,20 @@ def main() -> None:
     app.add_handler(CommandHandler("login", login_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("summary", summary_cmd))
+    app.add_handler(CommandHandler("aging", aging_cmd))
     app.add_handler(CommandHandler("online", online_cmd))
-    app.add_handler(CommandHandler("offline", offline_cmd))
     app.add_handler(CommandHandler("unassigned", unassigned_cmd))
     app.add_handler(CommandHandler("allsite", allsite_cmd))
-    app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
+    app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
     app.add_handler(CommandHandler("exit_ai", exit_ai_cmd))
     app.add_handler(CommandHandler("ai_analyze", ai_analyze_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("EnviroFRONT Telemetry Bot starting...")
+    logger.info("%s EnviroFRONT Bot starting (1m auto-refresh)...", CLIENT_NAME)
     app.run_polling()
 
 
