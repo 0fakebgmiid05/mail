@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
@@ -44,7 +45,7 @@ ADMIN_TG_ID: int = int(
 CLIENT_NAME: str = os.getenv("CLIENT_NAME", "BAAGI JAAT").strip() or "BAAGI JAAT"
 DB_PATH: str = os.getenv("BOT_DB_PATH", "baagijaat_telemetry.db").strip()
 
-# Authentic EnviroFRONT / M2M Logger Endpoints
+# EnviroFRONT / M2M Logger Endpoints
 BASE_URL: str = (
     os.getenv("ENVIRO_BASE_URL", "https://envirofront.m2mlogger.com")
     .strip()
@@ -90,23 +91,29 @@ GROQ_MODELS_URL: str = "https://api.groq.com/openai/v1/models"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Runtime Admin Authority Settings
+# Runtime Admin & Display Authority Settings
 BOT_ENABLED: bool = True
 MAINTENANCE_MODE: bool = False
 MAINTENANCE_MSG: str = (
     "System maintenance chal raha hai. Kripya thodi der baad try karein."
 )
 REFRESH_INTERVAL_SEC: int = 60
-NOTIF_STYLE: str = "detailed"  # detailed | compact | alerts_only
+NOTIF_STYLE: str = "detailed"  # detailed | compact | alerts_only | digest
+ACTIVE_THEME: str = "obsidian"  # obsidian | minimal | cyber | royal
 
-# Session & UI State Maps
+# Session, Navigation, Watchlist, Games & Cache State
 USER_SESSIONS: dict[int, dict[str, Any]] = {}
 LAST_SNAPSHOT: dict[int, dict[str, Any]] = {}
 LAST_PAGE_STATE: dict[int, dict[str, Any]] = {}
-MENU_STATE: dict[int, str] = {}  # main | dash_menu | api_menu | age_menu | ops_menu
+MENU_STACK: dict[int, list[str]] = {}
+MENU_STATE: dict[int, str] = {}
 AWAITING_INPUT: dict[int, dict[str, Any]] = {}
 SENT_STAGE_ALERTS: set[str] = set()
+DIGEST_QUEUE: dict[int, list[str]] = {}
 AI_CHAT_MODE: set[int] = set()
+WATCHLIST_SITES: dict[int, list[str]] = {}
+GAME_SESSIONS: dict[int, dict[str, Any]] = {}
+
 DASHBOARD_CACHE: dict[str, dict[str, Any]] = {}
 SITE_NAME_CACHE: dict[str, str] = {}
 VAT_CODE_CACHE: dict[str, list[str]] = {}
@@ -154,6 +161,15 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_watchlist (
+            chat_id INTEGER NOT NULL,
+            site_key TEXT NOT NULL,
+            PRIMARY KEY (chat_id, site_key)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -172,7 +188,7 @@ def save_setting_db(key: str, val: str) -> None:
 
 
 def load_persisted_state() -> None:
-    global BOT_ENABLED, MAINTENANCE_MODE, MAINTENANCE_MSG, REFRESH_INTERVAL_SEC, NOTIF_STYLE
+    global BOT_ENABLED, MAINTENANCE_MODE, MAINTENANCE_MSG, REFRESH_INTERVAL_SEC, NOTIF_STYLE, ACTIVE_THEME
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -194,14 +210,54 @@ def load_persisted_state() -> None:
                 "detailed",
                 "compact",
                 "alerts_only",
+                "digest",
             ):
                 NOTIF_STYLE = v
+            elif k == "active_theme" and v in (
+                "obsidian",
+                "minimal",
+                "cyber",
+                "royal",
+            ):
+                ACTIVE_THEME = v
 
         for (stage_key,) in cur.execute("SELECT stage_key FROM sent_alerts"):
             SENT_STAGE_ALERTS.add(stage_key)
+
+        for chat_id, site_key in cur.execute(
+            "SELECT chat_id, site_key FROM user_watchlist"
+        ):
+            WATCHLIST_SITES.setdefault(int(chat_id), []).append(str(site_key))
         conn.close()
     except Exception as exc:
         logger.warning("DB load_persisted_state failed: %s", exc)
+
+
+def toggle_watchlist_site(chat_id: int, site_key: str) -> tuple[bool, list[str]]:
+    key = (site_key or "").strip()
+    lst = WATCHLIST_SITES.setdefault(chat_id, [])
+    added = False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        if key in lst:
+            lst.remove(key)
+            conn.execute(
+                "DELETE FROM user_watchlist WHERE chat_id = ? AND site_key = ?",
+                (chat_id, key),
+            )
+            added = False
+        else:
+            lst.append(key)
+            conn.execute(
+                "INSERT OR IGNORE INTO user_watchlist(chat_id, site_key) VALUES(?, ?)",
+                (chat_id, key),
+            )
+            added = True
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Watchlist DB error: %s", exc)
+    return added, lst
 
 
 def mark_stage_alert_sent(stage_key: str) -> None:
@@ -266,6 +322,7 @@ def save_snapshot_db(chat_id: int, analysis: dict[str, Any]) -> None:
                 "online_list",
                 "offline_list",
                 "unassigned_list",
+                "stale_list",
             )
         }
         conn = sqlite3.connect(DB_PATH)
@@ -284,14 +341,60 @@ def save_snapshot_db(chat_id: int, analysis: dict[str, Any]) -> None:
 
 
 # ==============================================================================
-# ULTRA PREMIUM UI TEXTURE, TYPOGRAPHY & SAFE HTML ENGINE
+# 4 UI THEMES, TYPOGRAPHY & SAFE HTML ENGINE
 # ==============================================================================
 _SMALL_CAPS_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ",
 )
 
-UI_TEXTURE_BAR = "▓▓▒▒░░ ◈ ░░▒▒▓▓"
+THEME_CONFIGS: dict[str, dict[str, str]] = {
+    "obsidian": {
+        "label": "Obsidian Authority",
+        "top": "╔══════════════════════╗",
+        "bot": "╚══════════════════════╝",
+        "bar": "▓▓▒▒░░ ◈ ░░▒▒▓▓",
+        "bullet": "▸",
+        "prefix": "║  ◈ ",
+    },
+    "minimal": {
+        "label": "Executive Minimal",
+        "top": "────────────────────────",
+        "bot": "────────────────────────",
+        "bar": "── ◈ ──────────────────",
+        "bullet": "•",
+        "prefix": "  ◈ ",
+    },
+    "cyber": {
+        "label": "Cyber Telemetry Grid",
+        "top": "┌──────────────────────┐",
+        "bot": "└──────────────────────┘",
+        "bar": "░░▓▓▒▒ [GRID] ▒▒▓▓░░",
+        "bullet": "▹",
+        "prefix": "│ [◈] ",
+    },
+    "royal": {
+        "label": "Royal Frame",
+        "top": "╔═◈══════════════════◈═╗",
+        "bot": "╚═◈══════════════════◈═╝",
+        "bar": "❖───◈───❖───◈───❖",
+        "bullet": "❖",
+        "prefix": "║ ❖ ",
+    },
+}
+
+
+def get_theme() -> dict[str, str]:
+    return THEME_CONFIGS.get(ACTIVE_THEME, THEME_CONFIGS["obsidian"])
+
+
+def themed_box(title: str, subtitle: str = "") -> str:
+    th = get_theme()
+    lines = [th["top"], f"{th['prefix']}<b>{title}</b>"]
+    if subtitle:
+        lines.append(f"{th['prefix']}<i>{subtitle}</i>")
+    lines.append(th["bot"])
+    return "\n".join(lines)
 
 
 def sc(text: str) -> str:
@@ -411,6 +514,8 @@ def format_industry_site_label(industry: str, site: str) -> str:
 def format_premium_device_block(
     dev: dict[str, Any], index: int | None = None
 ) -> str:
+    th = get_theme()
+    b = th["bullet"]
     dot = small_status_dot(bool(dev.get("is_connected")))
     conn_word = "CONNECTED" if dev.get("is_connected") else "DISCONNECTED"
     off_info = (
@@ -420,6 +525,7 @@ def format_premium_device_block(
             dev.get("last_seen"), dev.get("offline_duration")
         )
     )
+    stale_tag = " [STALE]" if dev.get("is_stale") else ""
     prefix = f"#{index} " if index is not None else ""
     sid = f" [Site:{esc(dev['site_id'])}]" if dev.get("site_id") else ""
     scode = (
@@ -427,50 +533,322 @@ def format_premium_device_block(
         if dev.get("site_code")
         else ""
     )
+    label = format_industry_site_label(
+        dev.get("industry", "N/A"), dev.get("site", "N/A")
+    )
 
-    if NOTIF_STYLE == "compact":
+    if NOTIF_STYLE == "compact" or ACTIVE_THEME == "minimal":
         return (
-            f"▸ {prefix}<b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>{sid}\n"
+            f"{b} {prefix}<b>{label}</b>{sid}{esc(stale_tag)}\n"
             f"  Serial: <b>{esc(dev.get('serial_no', 'N/A'))}</b> | {dot} <b>{conn_word}</b>{scode} | "
             f"<code>{esc(dev.get('display_time', 'N/A'))}</code> / <code>{esc(off_info)}</code>"
         )
 
     return (
-        f"╔══════════════════════╗\n"
-        f"║  {dot} {prefix}<b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>{sid}\n"
-        f"╚══════════════════════╝\n"
-        f"  ▸ Serial : <b>{esc(dev.get('serial_no', 'N/A'))}</b>{scode}\n"
-        f"  ▸ Status : {dot} <b>{conn_word}</b>\n"
-        f"  ▸ Device : <code>{esc(dev.get('device_type', 'N/A'))}</code> | FW: <code>{esc(dev.get('firmware', 'N/A'))}</code>\n"
-        f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code> / <code>{esc(off_info)}</code>"
+        f"{themed_box(prefix + label + sid + stale_tag)}\n"
+        f"  {b} Serial : <b>{esc(dev.get('serial_no', 'N/A'))}</b>{scode}\n"
+        f"  {b} Status : {dot} <b>{conn_word}</b>\n"
+        f"  {b} Device : <code>{esc(dev.get('device_type', 'N/A'))}</code> | FW: <code>{esc(dev.get('firmware', 'N/A'))}</code>\n"
+        f"  {b} Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code> / <code>{esc(off_info)}</code>"
     )
 
 
 # ==============================================================================
-# CONTEXT-AWARE DYNAMIC REPLY KEYBOARDS (ZERO INLINE BUTTONS)
+# GUEST LOUNGE MINI-GAMES (NO BOREDOM WHILE WAITING FOR LOGIN)
+# ==============================================================================
+def start_ttt_game(chat_id: int) -> str:
+    board = [" "] * 9
+    GAME_SESSIONS[chat_id] = {
+        "game": "ttt",
+        "board": board,
+        "moves": 0,
+    }
+    return render_ttt_board(board, "Aap 'X' hain, Bot 'O' hai. 1 se 9 tak cell number bhejein:")
+
+
+def _check_ttt_winner(board: list[str]) -> str | None:
+    wins = [
+        (0, 1, 2),
+        (3, 4, 5),
+        (6, 7, 8),
+        (0, 3, 6),
+        (1, 4, 7),
+        (2, 5, 8),
+        (0, 4, 8),
+        (2, 4, 6),
+    ]
+    for a, b, c in wins:
+        if board[a] != " " and board[a] == board[b] == board[c]:
+            return board[a]
+    if " " not in board:
+        return "DRAW"
+    return None
+
+
+def render_ttt_board(board: list[str], status_line: str) -> str:
+    def cell_disp(idx: int) -> str:
+        val = board[idx]
+        if val == "X":
+            return "✕"
+        if val == "O":
+            return "◯"
+        return str(idx + 1)
+
+    grid = (
+        f"<code>  {cell_disp(0)} │ {cell_disp(1)} │ {cell_disp(2)}  </code>\n"
+        f"<code> ───┼───┼─── </code>\n"
+        f"<code>  {cell_disp(3)} │ {cell_disp(4)} │ {cell_disp(5)}  </code>\n"
+        f"<code> ───┼───┼─── </code>\n"
+        f"<code>  {cell_disp(6)} │ {cell_disp(7)} │ {cell_disp(8)}  </code>"
+    )
+    return (
+        f"{themed_box(sc('TIC-TAC-TOE LOUNGE'))}\n"
+        f"{get_theme()['bar']}\n"
+        f"{grid}\n\n"
+        f"  ▸ {esc(status_line)}"
+    )
+
+
+def play_ttt_turn(chat_id: int, cell_num: int) -> tuple[str, bool]:
+    st = GAME_SESSIONS.get(chat_id)
+    if not st or st.get("game") != "ttt":
+        return start_ttt_game(chat_id), False
+
+    board: list[str] = st["board"]
+    idx = cell_num - 1
+    if idx < 0 or idx > 8 or board[idx] != " ":
+        return (
+            render_ttt_board(
+                board, "Khali cell (1–9) chuniye."
+            ),
+            False,
+        )
+
+    board[idx] = "X"
+    win = _check_ttt_winner(board)
+    if win == "X":
+        GAME_SESSIONS.pop(chat_id, None)
+        return render_ttt_board(board, "Badhai! Aap jeet gaye!"), True
+    if win == "DRAW":
+        GAME_SESSIONS.pop(chat_id, None)
+        return render_ttt_board(board, "Match Draw hua!"), True
+
+    empty_cells = [i for i, v in enumerate(board) if v == " "]
+    # Smart bot: try win or block X, else random/center
+    bot_move = None
+    for mark in ("O", "X"):
+        for c in empty_cells:
+            board[c] = mark
+            if _check_ttt_winner(board) == mark:
+                bot_move = c
+            board[c] = " "
+            if bot_move is not None:
+                break
+        if bot_move is not None:
+            break
+    if bot_move is None:
+        bot_move = 4 if 4 in empty_cells else random.choice(empty_cells)
+
+    board[bot_move] = "O"
+    win2 = _check_ttt_winner(board)
+    if win2 == "O":
+        GAME_SESSIONS.pop(chat_id, None)
+        return render_ttt_board(board, "Bot ne is baar baazi maar li!"), True
+    if win2 == "DRAW":
+        GAME_SESSIONS.pop(chat_id, None)
+        return render_ttt_board(board, "Match Draw hua!"), True
+
+    return (
+        render_ttt_board(
+            board, f"Bot ne cell {bot_move + 1} khela. Ab aapki baari (1–9):"
+        ),
+        False,
+    )
+
+
+def start_guess_game(chat_id: int) -> str:
+    secret = random.randint(1, 100)
+    GAME_SESSIONS[chat_id] = {
+        "game": "guess",
+        "secret": secret,
+        "tries": 0,
+        "low": 1,
+        "high": 100,
+    }
+    return (
+        f"{themed_box(sc('NUMBER GUESS (1–100)'))}\n"
+        f"{get_theme()['bar']}\n"
+        "  ▸ Maine 1 se 100 ke beech ek number socha hai.\n"
+        "  ▸ Apna guess number bhejein (e.g. <code>50</code>):"
+    )
+
+
+def play_guess_turn(chat_id: int, guess_num: int) -> tuple[str, bool]:
+    st = GAME_SESSIONS.get(chat_id)
+    if not st or st.get("game") != "guess":
+        return start_guess_game(chat_id), False
+
+    st["tries"] += 1
+    secret = int(st["secret"])
+    tries = int(st["tries"])
+
+    if guess_num == secret:
+        GAME_SESSIONS.pop(chat_id, None)
+        return (
+            f"{themed_box(sc('NUMBER FOUND!'))}\n"
+            f"  ▸ Sahi number <b>{secret}</b> aapne <b>{tries}</b> tries mein guess kar liya!"
+        ), True
+
+    if guess_num < secret:
+        st["low"] = max(int(st["low"]), guess_num + 1)
+        hint = f"Thoda <b>BADA</b> number try karein (Range: <code>{st['low']}–{st['high']}</code>)"
+    else:
+        st["high"] = min(int(st["high"]), guess_num - 1)
+        hint = f"Thoda <b>CHHOTA</b> number try karein (Range: <code>{st['low']}–{st['high']}</code>)"
+
+    return (
+        f"  ▸ Try #{tries} (<code>{guess_num}</code>): {hint}"
+    ), False
+
+
+def start_rps_game(chat_id: int) -> str:
+    GAME_SESSIONS[chat_id] = {
+        "game": "rps",
+        "user_score": 0,
+        "bot_score": 0,
+        "round": 0,
+        "max_rounds": 5,
+    }
+    return (
+        f"{themed_box(sc('ROCK • PAPER • SCISSORS'))}\n"
+        f"{get_theme()['bar']}\n"
+        "  ▸ Best of 5 rounds! Niche <code>Rock</code>, <code>Paper</code>, ya <code>Scissors</code> dabayein:"
+    )
+
+
+def play_rps_turn(chat_id: int, choice_raw: str) -> tuple[str, bool]:
+    st = GAME_SESSIONS.get(chat_id)
+    if not st or st.get("game") != "rps":
+        return start_rps_game(chat_id), False
+
+    c_low = choice_raw.lower()
+    if "rock" in c_low:
+        u_choice = "Rock"
+    elif "paper" in c_low:
+        u_choice = "Paper"
+    elif "scissor" in c_low:
+        u_choice = "Scissors"
+    else:
+        return "  ▸ <code>Rock</code>, <code>Paper</code>, ya <code>Scissors</code> chuniye.", False
+
+    b_choice = random.choice(["Rock", "Paper", "Scissors"])
+    st["round"] += 1
+    beats = {"Rock": "Scissors", "Paper": "Rock", "Scissors": "Paper"}
+
+    if u_choice == b_choice:
+        outcome = "Round Draw!"
+    elif beats[u_choice] == b_choice:
+        st["user_score"] += 1
+        outcome = "Aap yeh round jeete!"
+    else:
+        st["bot_score"] += 1
+        outcome = "Bot yeh round jeeta!"
+
+    done = st["round"] >= st["max_rounds"] or st["user_score"] == 3 or st["bot_score"] == 3
+    score_line = f"Score — Aap: <b>{st['user_score']}</b> | Bot: <b>{st['bot_score']}</b> (Round {st['round']}/{st['max_rounds']})"
+
+    if done:
+        GAME_SESSIONS.pop(chat_id, None)
+        if st["user_score"] > st["bot_score"]:
+            final_res = "Final Result: Aap match jeet gaye!"
+        elif st["bot_score"] > st["user_score"]:
+            final_res = "Final Result: Bot match jeet gaya!"
+        else:
+            final_res = "Final Result: Match Tie raha!"
+        return (
+            f"  ▸ Aap: <b>{u_choice}</b> vs Bot: <b>{b_choice}</b> → {outcome}\n"
+            f"  ▸ {score_line}\n"
+            f"  ▸ <b>{esc(final_res)}</b>"
+        ), True
+
+    return (
+        f"  ▸ Aap: <b>{u_choice}</b> vs Bot: <b>{b_choice}</b> → {outcome}\n"
+        f"  ▸ {score_line}"
+    ), False
+
+
+# ==============================================================================
+# CONTEXT-AWARE DYNAMIC REPLY KEYBOARDS WITH BACK & ADMIN SUB-MENUS
 # ==============================================================================
 def guest_reply_keyboard() -> ReplyKeyboardMarkup:
+    st = GAME_SESSIONS.get(0)  # placeholder check overridden below
+    _ = st
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🔐 Login"), KeyboardButton("📖 Manual")],
+            [KeyboardButton("🎮 Games Lounge")],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-def main_reply_keyboard() -> ReplyKeyboardMarkup:
+def guest_keyboard_for_chat(chat_id: int) -> ReplyKeyboardMarkup:
+    g = GAME_SESSIONS.get(chat_id)
+    if g and g.get("game") == "rps":
+        return ReplyKeyboardMarkup(
+            [
+                [
+                    KeyboardButton("Rock"),
+                    KeyboardButton("Paper"),
+                    KeyboardButton("Scissors"),
+                ],
+                [KeyboardButton("🎮 Games Lounge"), KeyboardButton("🔐 Login")],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+    if g and g.get("game") == "ttt":
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
+                [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")],
+                [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")],
+                [KeyboardButton("🎮 Games Lounge"), KeyboardButton("🔐 Login")],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+    return guest_reply_keyboard()
+
+
+def games_lounge_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("◈ Status"), KeyboardButton("◈ All Sites")],
-            [KeyboardButton("🌐 Site Dashboard"), KeyboardButton("📡 API Report")],
-            [KeyboardButton("📐 Instruments"), KeyboardButton("⏳ Aging")],
-            [KeyboardButton("🤖 AI Suite"), KeyboardButton("📖 Manual")],
-            [KeyboardButton("⚙ Ops & Export"), KeyboardButton("🚪 Logout")],
+            [
+                KeyboardButton("🎲 Tic-Tac-Toe"),
+                KeyboardButton("🔢 Number Guess"),
+            ],
+            [KeyboardButton("✂ Rock Paper Scissors"), KeyboardButton("🔐 Login")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def main_reply_keyboard(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = [
+        [KeyboardButton("◈ Status"), KeyboardButton("◈ All Sites")],
+        [KeyboardButton("🌐 Site Dashboard"), KeyboardButton("📡 API Report")],
+        [KeyboardButton("📐 Instruments"), KeyboardButton("⏳ Aging")],
+        [KeyboardButton("⭐ Watchlist"), KeyboardButton("📋 Shift Summary")],
+        [KeyboardButton("🤖 AI Suite"), KeyboardButton("📖 Manual")],
+        [KeyboardButton("⚙ Ops & Export"), KeyboardButton("🚪 Logout")],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton("🛡 Admin Panel")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
 def dashboard_sub_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
@@ -488,10 +866,10 @@ def dashboard_sub_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
         rows.append(quick_row)
 
     rows.append(
-        [KeyboardButton("🔎 Open Site by ID/Name"), KeyboardButton("◈ All Sites")]
+        [KeyboardButton("🔎 Open Site by ID/Name"), KeyboardButton("⭐ Pin Site")]
     )
     rows.append([KeyboardButton("⬅ Previous"), KeyboardButton("Next ➡")])
-    rows.append([KeyboardButton("🏠 Main Menu")])
+    rows.append([KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
@@ -506,7 +884,7 @@ def api_report_sub_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("🏭 Site API Report"),
                 KeyboardButton("🌐 Site Dashboard"),
             ],
-            [KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -527,7 +905,7 @@ def aging_sub_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("▸ >1Y"),
             ],
             [KeyboardButton("⬅ Previous"), KeyboardButton("Next ➡")],
-            [KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -539,16 +917,76 @@ def ops_sub_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("🩺 Health"), KeyboardButton("📥 Export CSV")],
             [KeyboardButton("∙ Online"), KeyboardButton("📌 Unassigned")],
-            [KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("❄ Stale Sites"), KeyboardButton("⭐ Watchlist")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-def current_keyboard_for_chat(chat_id: int) -> ReplyKeyboardMarkup:
+def admin_sub_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🎨 Themes"), KeyboardButton("🔔 Notif & Demo")],
+            [KeyboardButton("⏱ Sync Interval"), KeyboardButton("🛠 Maintenance")],
+            [KeyboardButton("⚡ Bot ON/OFF"), KeyboardButton("🧹 Clear Alerts")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def theme_sub_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("Theme: Obsidian"),
+                KeyboardButton("Theme: Minimal"),
+            ],
+            [KeyboardButton("Theme: Cyber"), KeyboardButton("Theme: Royal")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def notif_demo_sub_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("Mode: Detailed"),
+                KeyboardButton("Mode: Compact"),
+            ],
+            [
+                KeyboardButton("Mode: Alerts Only"),
+                KeyboardButton("Mode: Digest"),
+            ],
+            [
+                KeyboardButton("Demo: 2h Down"),
+                KeyboardButton("Demo: 10h Down"),
+            ],
+            [
+                KeyboardButton("Demo: 1d Down"),
+                KeyboardButton("Demo: Recovered"),
+            ],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def current_keyboard_for_chat(
+    chat_id: int, user_id: int | None = None
+) -> ReplyKeyboardMarkup:
     if not require_auth(chat_id):
-        return guest_reply_keyboard()
+        if MENU_STATE.get(chat_id) == "games_menu":
+            return games_lounge_keyboard()
+        return guest_keyboard_for_chat(chat_id)
+
     state = MENU_STATE.get(chat_id, "main")
     if state == "dash_menu":
         return dashboard_sub_keyboard(chat_id)
@@ -558,7 +996,52 @@ def current_keyboard_for_chat(chat_id: int) -> ReplyKeyboardMarkup:
         return aging_sub_keyboard()
     if state == "ops_menu":
         return ops_sub_keyboard()
-    return main_reply_keyboard()
+    if state == "admin_menu" and is_admin(user_id):
+        return admin_sub_keyboard()
+    if state == "theme_menu" and is_admin(user_id):
+        return theme_sub_keyboard()
+    if state == "notif_menu" and is_admin(user_id):
+        return notif_demo_sub_keyboard()
+    return main_reply_keyboard(user_id)
+
+
+def push_menu_state(chat_id: int, new_state: str) -> None:
+    cur = MENU_STATE.get(chat_id, "main")
+    if cur != new_state:
+        stack = MENU_STACK.setdefault(chat_id, [])
+        stack.append(cur)
+        if len(stack) > 12:
+            stack.pop(0)
+    MENU_STATE[chat_id] = new_state
+
+
+async def pop_menu_state(
+    chat_id: int, user_id: int | None, bot
+) -> None:
+    AWAITING_INPUT.pop(chat_id, None)
+    GAME_SESSIONS.pop(chat_id, None)
+    stack = MENU_STACK.get(chat_id) or []
+    prev_state = stack.pop() if stack else "main"
+    MENU_STATE[chat_id] = prev_state
+
+    title_map = {
+        "main": "MAIN MENU",
+        "dash_menu": "SITE DASHBOARD HUB",
+        "api_menu": "EXCISE API REPORT",
+        "age_menu": "AGING BUCKETS",
+        "ops_menu": "OPS & EXPORT",
+        "admin_menu": "ADMIN AUTHORITY",
+        "theme_menu": "UI THEMES",
+        "notif_menu": "NOTIFICATIONS & DEMO",
+        "games_menu": "GAMES LOUNGE",
+    }
+    label = title_map.get(prev_state, "MAIN MENU")
+    await safe_send_html(
+        bot,
+        chat_id,
+        f"{themed_box(sc(label))}",
+        reply_markup=current_keyboard_for_chat(chat_id, user_id),
+    )
 
 
 # ==============================================================================
@@ -680,6 +1163,19 @@ def login_envirofront(
     return sess, "OK"
 
 
+def ensure_live_session(
+    chat_id: int, sess_data: dict[str, Any]
+) -> requests.Session | None:
+    session: requests.Session | None = sess_data.get("session")
+    if session is None:
+        return None
+    # Session auto-heal check on repeated failures
+    if sess_data.get("fail_streak", 0) >= 3:
+        logger.info("Session auto-heal triggered for chat %s", chat_id)
+        sess_data["fail_streak"] = 0
+    return session
+
+
 def parse_timestamp_utc(
     raw_ts: str | None, now_utc: datetime
 ) -> datetime | None:
@@ -797,6 +1293,11 @@ def normalize_device_record(
         last_seen_dt, raw_status, now_utc
     )
 
+    # Connected-but-stale flag: connected yet last seen > 30 mins ago
+    is_stale = bool(
+        is_conn and off_hours is not None and off_hours >= 0.5
+    )
+
     if last_seen_dt is not None:
         display_time = last_seen_dt.astimezone(IST).strftime(
             "%d-%b-%Y %I:%M:%S %p IST"
@@ -823,6 +1324,7 @@ def normalize_device_record(
         "device_type": dtype,
         "firmware": fw,
         "is_connected": is_conn,
+        "is_stale": is_stale,
         "conn_label": conn_label,
         "offline_hours": off_hours,
         "offline_duration": off_td,
@@ -1124,6 +1626,15 @@ def _safe_parse_json_str(val: Any) -> dict[str, Any]:
     return {}
 
 
+def _to_float_or_none(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return float(str(val).replace(",", "").strip())
+    except Exception:
+        return None
+
+
 def fetch_site_api_report(
     session: requests.Session,
     site_id: str,
@@ -1143,6 +1654,7 @@ def fetch_site_api_report(
             "failed": 0,
             "initial_count": 0,
             "final_count": 0,
+            "pending_final_count": 0,
             "latest_ts": "",
             "latest_result": "",
             "pairs": [],
@@ -1348,6 +1860,27 @@ def fetch_site_api_report(
         elif proc_code == "F" and pair_obj["final"] is None:
             pair_obj["final"] = entry
 
+    pending_final_cnt = 0
+    for p in grouped_by_req.values():
+        ini = p.get("initial")
+        fin = p.get("final")
+        if ini and not fin:
+            pending_final_cnt += 1
+            p["delta_text"] = "Pending Final (F)"
+        elif ini and fin:
+            b1 = _to_float_or_none(ini.get("bl"))
+            b2 = _to_float_or_none(fin.get("bl"))
+            l1 = _to_float_or_none(ini.get("length"))
+            l2 = _to_float_or_none(fin.get("length"))
+            parts_d: list[str] = []
+            if b1 is not None and b2 is not None:
+                parts_d.append(f"ΔL: {b2 - b1:+.2f}".rstrip("0").rstrip("."))
+            if l1 is not None and l2 is not None:
+                parts_d.append(f"Δmm: {l2 - l1:+.2f}".rstrip("0").rstrip("."))
+            p["delta_text"] = " | ".join(parts_d) if parts_d else "Paired I→F"
+        else:
+            p["delta_text"] = "Final Only"
+
     res_obj = {
         "ok": not bool(err_msg),
         "site_id": sid,
@@ -1358,6 +1891,7 @@ def fetch_site_api_report(
         "failed": failed_cnt,
         "initial_count": initial_cnt,
         "final_count": final_cnt,
+        "pending_final_count": pending_final_cnt,
         "latest_ts": latest_ts,
         "latest_result": latest_result,
         "pairs": list(grouped_by_req.values())[:10],
@@ -1391,7 +1925,6 @@ def _discover_dashboard_tags_and_page(
             seen_tags.add(clean)
             discovered_tags.append(clean)
 
-    # 1. Scrape Dashboard HTML & inline scripts for tag names
     try:
         r = session.get(dash_page_url, timeout=20, allow_redirects=True)
         if r.ok and "account/login" not in r.url.lower():
@@ -1399,7 +1932,6 @@ def _discover_dashboard_tags_and_page(
             for m in re.finditer(r"[?&]tags=([^&\"'\s]+)", raw, re.IGNORECASE):
                 for part in m.group(1).replace("%2C", ",").split(","):
                     add_tag(part)
-            # Distillery & Bottling common tag tokens
             for m in re.finditer(
                 r"\b((?:EST|LT|CBH|CBT|CBV|CET|CMFM|FM|FL|BT|BL|SV|AS|T)[A-Za-z0-9\-_]*)\b",
                 raw,
@@ -1410,14 +1942,12 @@ def _discover_dashboard_tags_and_page(
     except Exception:
         pass
 
-    # 2. If site has VAT codes, include VAT code & -BL variants
     vat_codes = fetch_vat_codes_for_site(session, sid, dash_page_url)
     for vc in vat_codes:
         add_tag(vc)
         if not vc.upper().endswith("-BL"):
             add_tag(f"{vc}-BL")
 
-    # 3. Fallback pool covering Distillery + Bottling tags
     if not discovered_tags:
         fallback_pool = (
             "EST-1,EST-1-BL,EST-2,EST-2-BL,EST-3,EST-3-BL,EST-4,EST-4-BL,EST-5,EST-5-BL,"
@@ -1451,19 +1981,12 @@ def _classify_reading_category(tag_name: str, unit_str: str) -> str:
         return "level_mm"
     if u_low in ("l", "ltr", "lit", "bl") or t_up.endswith(("-BL", "-L")):
         return "volume_l"
-    if any(k in t_up for k in ("FM", "FL", "TOT", "FLOW", "METER")):
-        return "instrument"
     return "instrument"
 
 
 def _parse_dashboard_stats_and_tags(
     payload: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """
-    Parses EnviroFRONT Dashboard JSON structure:
-    Tags:  [["LT2023-A", "mm"], ["LT2023-A-BL", "L"], ["CBH-1-BL", "L"], ...]
-    Stats: [["LT2023-A", latest, avg, min, max], ...]
-    """
     if not isinstance(payload, dict):
         return []
 
@@ -1498,7 +2021,6 @@ def _parse_dashboard_stats_and_tags(
             if not tag_name or tag_name.lower() == "timestamps":
                 continue
 
-            # s_item: [tag, latest, avg, min, max]
             latest_val = s_item[1] if len(s_item) > 1 else None
             avg_val = s_item[2] if len(s_item) > 2 else None
 
@@ -1511,10 +2033,7 @@ def _parse_dashboard_stats_and_tags(
             if not unit_str and tag_name.upper().endswith("-BL"):
                 unit_str = "L"
 
-            extra_str = ""
-            if latest_val is None and avg_val is not None:
-                extra_str = "avg"
-
+            extra_str = "avg" if (latest_val is None and avg_val is not None) else ""
             cat = _classify_reading_category(tag_name, unit_str)
             dedup = f"{tag_name.lower()}|{val_str}|{unit_str}"
             if dedup not in seen:
@@ -1530,6 +2049,54 @@ def _parse_dashboard_stats_and_tags(
                 )
 
     return results
+
+
+def group_readings_by_tank(
+    instruments: list[dict[str, str]],
+) -> list[str]:
+    """
+    Groups mm + L (-BL) + instrument/totalizer readings by base tank/tag key
+    so Distillery & Bottling tanks appear cleanly together.
+    """
+    groups: dict[str, dict[str, list[str]]] = {}
+    order: list[str] = []
+
+    for item in instruments:
+        raw_name = item.get("name", "")
+        val_str = item.get("value", "")
+        unit_str = item.get("unit", "")
+        cat = item.get("category", "instrument")
+        disp = f"{val_str} {unit_str}".strip()
+
+        base = re.sub(r"-(BL|L|TOT|MM)$", "", raw_name, flags=re.IGNORECASE).strip()
+        if not base:
+            base = raw_name
+
+        if base not in groups:
+            groups[base] = {"mm": [], "l": [], "inst": []}
+            order.append(base)
+
+        if cat == "level_mm":
+            groups[base]["mm"].append(f"{raw_name}: {disp}")
+        elif cat == "volume_l":
+            groups[base]["l"].append(f"{raw_name}: {disp}")
+        else:
+            groups[base]["inst"].append(f"{raw_name}: {disp}")
+
+    lines: list[str] = []
+    for base in order[:16]:
+        g = groups[base]
+        parts: list[str] = []
+        if g["mm"]:
+            parts.append(", ".join(g["mm"]))
+        if g["l"]:
+            parts.append(", ".join(g["l"]))
+        if g["inst"]:
+            parts.append(", ".join(g["inst"]))
+        lines.append(
+            f"  ▸ <b>{esc(base)}</b> → <code>{esc(' | '.join(parts))}</code>"
+        )
+    return lines
 
 
 def scrape_site_dashboard_details(
@@ -1737,6 +2304,7 @@ def run_self_analysis(session: requests.Session) -> dict[str, Any]:
     unassigned_list = [d for d in devices if d["is_unassigned"]]
     online_list = [d for d in devices if d["is_connected"]]
     offline_list = [d for d in devices if not d["is_connected"]]
+    stale_list = [d for d in devices if d.get("is_stale")]
 
     offline_list.sort(
         key=lambda x: x["offline_duration"].total_seconds()
@@ -1781,12 +2349,14 @@ def run_self_analysis(session: requests.Session) -> dict[str, Any]:
         "assigned_count": len(assigned_devices),
         "connected": len(online_list),
         "disconnected_count": len(offline_list),
+        "stale_count": len(stale_list),
         "unassigned_count": len(unassigned_list),
         "aging_counts": aging_counts,
         "all_devices": devices,
         "assigned_devices": assigned_devices,
         "online_list": online_list,
         "offline_list": offline_list,
+        "stale_list": stale_list,
         "unassigned_list": unassigned_list,
         "top_offline_sites": top_sites,
         "firmware_breakdown": fw_counts,
@@ -1812,6 +2382,7 @@ def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
             "Device Type",
             "Firmware",
             "Status",
+            "Stale",
             "Last Seen (IST)",
         ]
     )
@@ -1830,6 +2401,7 @@ def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
                 d.get("device_type", "N/A"),
                 d.get("firmware", "N/A"),
                 d.get("conn_label", "N/A"),
+                "YES" if d.get("is_stale") else "NO",
                 d.get("display_time", "N/A"),
             ]
         )
@@ -1837,16 +2409,42 @@ def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
 
 
 # ==============================================================================
-# HIGH-END GROQ AI ENGINE WITH LIVE DASHBOARD & EXCISE API REPORT CONTEXT
+# PROFESSIONAL COMPACT GROQ AI ENGINE (STRICT TEXT-ONLY MODELS)
 # ==============================================================================
+_BLOCKED_MODEL_TOKENS = (
+    "whisper",
+    "orpheus",
+    "arabic",
+    "saudi",
+    "tts",
+    "playai",
+    "guard",
+    "prompt-guard",
+    "embed",
+    "audio",
+    "speech",
+)
+
+_PREFERRED_TEXT_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "qwen/qwen3-32b",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+]
+
+
+def _is_safe_text_model(model_id: str) -> bool:
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return False
+    return not any(tok in mid for tok in _BLOCKED_MODEL_TOKENS)
+
+
 def get_available_groq_models() -> list[str]:
-    preferred = [
-        "llama-3.3-70b-versatile",
-        "gemma2-9b-it",
-        "mixtral-8x7b-32768",
-    ]
     if not GROQ_API_KEY:
-        return preferred
+        return list(_PREFERRED_TEXT_MODELS[:4])
     try:
         r = requests.get(
             GROQ_MODELS_URL,
@@ -1856,21 +2454,20 @@ def get_available_groq_models() -> list[str]:
         if r.ok:
             data = r.json().get("data", [])
             live_ids = [
-                m.get("id")
+                str(m.get("id")).strip()
                 for m in data
                 if isinstance(m, dict)
                 and m.get("id")
-                and "whisper" not in str(m.get("id")).lower()
-                and "guard" not in str(m.get("id")).lower()
+                and _is_safe_text_model(str(m.get("id")))
             ]
-            ordered = [m for m in preferred if m in live_ids] + [
-                m for m in live_ids if m not in preferred
+            ordered = [m for m in _PREFERRED_TEXT_MODELS if m in live_ids] + [
+                m for m in live_ids if m not in _PREFERRED_TEXT_MODELS
             ]
             if ordered:
                 return ordered[:4]
     except Exception:
         pass
-    return preferred
+    return list(_PREFERRED_TEXT_MODELS[:4])
 
 
 def enrich_context_with_live_dashboards(
@@ -1899,10 +2496,10 @@ def enrich_context_with_live_dashboards(
     for d in analysis.get("assigned_devices", []):
         if d not in candidates:
             candidates.append(d)
-        if len(candidates) >= 6:
+        if len(candidates) >= 5:
             break
 
-    for dev in candidates[:6]:
+    for dev in candidates[:5]:
         try:
             dash = scrape_site_dashboard_details(session, dev)
             rep = dash.get("api_report") or {}
@@ -1910,16 +2507,15 @@ def enrich_context_with_live_dashboards(
                 "industry": dev.get("industry"),
                 "site_type": dev.get("site"),
                 "site_id": dash.get("site_id") or dev.get("site_id"),
-                "site_code": dash.get("site_code") or dev.get("site_code"),
-                "instruments": dash.get("instruments", []),
-                "api_report_summary": {
+                "instruments": dash.get("instruments", [])[:12],
+                "api_report": {
                     "date": rep.get("report_date"),
                     "total": rep.get("total", 0),
                     "initial": rep.get("initial_count", 0),
                     "final": rep.get("final_count", 0),
+                    "pending_final": rep.get("pending_final_count", 0),
                     "success": rep.get("success", 0),
                     "failed": rep.get("failed", 0),
-                    "latest_result": rep.get("latest_result", ""),
                 },
             }
         except Exception:
@@ -1932,31 +2528,14 @@ def build_project_context(
     analysis: dict[str, Any],
     live_readings: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    compact_devices = [
-        {
-            "serial": d.get("serial_no"),
-            "site_id": d.get("site_id"),
-            "site_code": d.get("site_code"),
-            "industry": d.get("industry"),
-            "site_type": d.get("site"),
-            "unassigned": d.get("is_unassigned"),
-            "device_type": d.get("device_type"),
-            "fw": d.get("firmware"),
-            "status": d.get("conn_label"),
-            "offline_hours": d.get("offline_hours"),
-            "last_seen": d.get("display_time"),
-        }
-        for d in analysis.get("all_devices", [])[:60]
-    ]
     return (
-        f"Client: {CLIENT_NAME}\n"
-        f"Checked At: {analysis.get('checked_at_ist')}\n"
-        f"Total: {analysis.get('total')} | Assigned: {analysis.get('assigned_count')} | Unassigned N/A: {analysis.get('unassigned_count')}\n"
-        f"Connected: {analysis.get('connected')} | Disconnected: {analysis.get('disconnected_count')}\n"
-        f"Aging (< Range): {analysis.get('aging_counts')}\n"
+        f"Client: {CLIENT_NAME} | Checked: {analysis.get('checked_at_ist')}\n"
+        f"Total: {analysis.get('total')} | Assigned: {analysis.get('assigned_count')} | "
+        f"Connected: {analysis.get('connected')} | Disconnected: {analysis.get('disconnected_count')} | "
+        f"Stale (>30m): {analysis.get('stale_count', 0)} | Unassigned: {analysis.get('unassigned_count')}\n"
+        f"Aging: {analysis.get('aging_counts')}\n"
         f"Top Offline Sites: {analysis.get('top_offline_sites')}\n"
-        f"Live Scraped Dashboard & UP Excise API Report: {json.dumps(live_readings or {}, ensure_ascii=False)}\n"
-        f"Devices Sample: {compact_devices}"
+        f"Live Sample: {json.dumps(live_readings or {}, ensure_ascii=False)}"
     )
 
 
@@ -1964,9 +2543,9 @@ def call_groq_ai(
     system_prompt: str, user_prompt: str, analysis: dict[str, Any]
 ) -> str:
     if not GROQ_API_KEY:
-        return "GROQ_API_KEY (.env -> API) set nahi hai."
+        return "GROQ_API_KEY set nahi hai."
 
-    models = get_available_groq_models()
+    models = [m for m in get_available_groq_models() if _is_safe_text_model(m)]
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -1984,8 +2563,8 @@ def call_groq_ai(
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.25,
-                    "max_tokens": 1100,
+                    "temperature": 0.2,
+                    "max_tokens": 550,
                 },
                 timeout=25,
             )
@@ -2000,17 +2579,15 @@ def call_groq_ai(
                 if txt:
                     return txt
             else:
-                last_err = f"{model} HTTP {r.status_code}: {r.text[:140]}"
+                last_err = f"{model} HTTP {r.status_code}"
         except Exception as exc:
             last_err = f"{model}: {exc}"
 
     ages = analysis.get("aging_counts", {})
     return (
-        f"[Groq Fallback — {last_err}]\n"
-        f"Total: {analysis.get('total', 0)} | Connected: {analysis.get('connected', 0)} | "
-        f"Disconnected: {analysis.get('disconnected_count', 0)} | Unassigned N/A: {analysis.get('unassigned_count', 0)}\n"
-        f"<1D: {ages.get('1d', 0)} | <1W: {ages.get('1w', 0)} | <24D: {ages.get('24d', 0)} | "
-        f"<11M: {ages.get('11m', 0)} | <1Y: {ages.get('1y', 0)}"
+        f"Compact Summary ({last_err or 'Text fallback'}):\n"
+        f"• Total: {analysis.get('total', 0)} | Online: {analysis.get('connected', 0)} | Off: {analysis.get('disconnected_count', 0)}\n"
+        f"• Aging: <1D {ages.get('1d', 0)}, <1W {ages.get('1w', 0)}, <24D {ages.get('24d', 0)}, <11M {ages.get('11m', 0)}"
     )
 
 
@@ -2020,11 +2597,11 @@ def generate_ai_analysis(
     live = enrich_context_with_live_dashboards(session, analysis)
     ctx = build_project_context(analysis, live)
     sys_p = (
-        f"Tum {CLIENT_NAME} ke EnviroFRONT / M2M telemetry command suite ke principal AI engineer ho. "
-        "Hinglish mein executive, crisp bullet points mein report do (bina markdown tables ke aur bina ** asterisks ke). "
-        "Connection health, offline aging, Distillery/Bottling mm/L/instrument readings aur UP Excise Initial/Final API Report status ko priority do."
+        f"Aap {CLIENT_NAME} telemetry suite ke ek polite, calm, aur professional operations advisor hain. "
+        "Hinglish mein sirf 4–5 crisp main points dein—zyada lamba ya complex mat likhein. "
+        "Markdown tables ya ** asterisks bilkul use na karein."
     )
-    usr_p = f"LIVE TELEMETRY & DASHBOARD DATA:\n{ctx}"
+    usr_p = f"TELEMETRY SNAPSHOT:\n{ctx}"
     return call_groq_ai(sys_p, usr_p, analysis)
 
 
@@ -2038,9 +2615,9 @@ def answer_project_question(
     )
     ctx = build_project_context(analysis, live)
     sys_p = (
-        f"Tum {CLIENT_NAME} telemetry bot ke high-end AI assistant ho. "
-        "Diye gaye LIVE TELEMETRY & DASHBOARD DATA ke basis par Hinglish mein accurate, crisp jawab do. "
-        "Markdown table ya ** asterisks mat lagao; clean lines/bullets use karo."
+        f"Aap {CLIENT_NAME} telemetry bot ke professional aur helpful assistant hain. "
+        "Diye gaye live data ke hisab se seedha, saaf aur compact jawab dein. "
+        "Markdown table ya ** asterisks na lagayein."
     )
     usr_p = f"LIVE DATA:\n{ctx}\n\nQUESTION:\n{user_question}"
     return call_groq_ai(sys_p, usr_p, analysis)
@@ -2098,100 +2675,99 @@ async def check_access(chat_id: int, user_id: int | None, bot) -> bool:
         await safe_send_html(
             bot,
             chat_id,
-            (
-                "╔══════════════════════╗\n"
-                f"║  • <b>{sc('BOT CURRENTLY OFF')}</b>  ║\n"
-                "╚══════════════════════╝\n"
-                f"{UI_TEXTURE_BAR}\n"
-                "  ▸ Admin ne bot ko temporary OFF kiya hua hai."
-            ),
+            f"{themed_box(sc('BOT CURRENTLY OFF'))}\n{get_theme()['bar']}\n  ▸ Bot abhi temporary OFF hai.",
         )
         return False
     if MAINTENANCE_MODE:
         await safe_send_html(
             bot,
             chat_id,
-            (
-                "╔══════════════════════╗\n"
-                f"║  ◈ <b>{sc('MAINTENANCE MODE')}</b>  ║\n"
-                "╚══════════════════════╝\n"
-                f"{UI_TEXTURE_BAR}\n"
-                f"  ▸ {esc(MAINTENANCE_MSG)}"
-            ),
+            f"{themed_box(sc('MAINTENANCE MODE'))}\n{get_theme()['bar']}\n  ▸ {esc(MAINTENANCE_MSG)}",
         )
         return False
     return True
 
 
 # ==============================================================================
-# COMMAND-DRIVEN VIEWS & CONTEXT MENUS (ZERO INLINE BUTTONS)
+# VIEWS, THEMES, NOTIFICATION DEMO & SHIFT SUMMARY
 # ==============================================================================
-async def send_start_view(chat_id: int, bot) -> None:
+async def send_start_view(chat_id: int, user_id: int | None, bot) -> None:
     existing = require_auth(chat_id)
     if existing:
         MENU_STATE[chat_id] = "main"
+        MENU_STACK[chat_id] = []
         AWAITING_INPUT.pop(chat_id, None)
+        th = get_theme()
         msg = (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{esc(CLIENT_NAME)}</b>\n"
-            f"║  <i>{sc('AUTHORITY TELEMETRY')}</i>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
-            f"  ▸ Account   : <code>{esc(existing.get('username'))}</code>\n"
-            f"  ▸ Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
-            f"  ▸ Alert Tier: <code>2h → 10h → 1d (1-Time)</code>\n"
-            f"  ▸ Notif Mode: <code>{esc(NOTIF_STYLE)}</code>\n\n"
-            "  ▸ Niche buttons dabakar situation ke hisab se sub-menus kholein ya <code>📖 Manual</code> dekhein."
+            f"{themed_box(esc(CLIENT_NAME), sc('AUTHORITY TELEMETRY'))}\n"
+            f"{th['bar']}\n"
+            f"  {th['bullet']} Account   : <code>{esc(existing.get('username'))}</code>\n"
+            f"  {th['bullet']} Theme     : <code>{esc(th['label'])}</code>\n"
+            f"  {th['bullet']} Notif Mode: <code>{esc(NOTIF_STYLE)}</code>\n"
+            f"  {th['bullet']} Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n\n"
+            "  ▸ Niche buttons se menus, sub-menus, watchlist aur shift summary access karein."
         )
         await safe_send_html(
-            bot, chat_id, msg, reply_markup=main_reply_keyboard()
+            bot, chat_id, msg, reply_markup=main_reply_keyboard(user_id)
         )
         return
 
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
+    th = get_theme()
     await safe_send_html(
         bot,
         chat_id,
         (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{esc(CLIENT_NAME)}</b>\n"
-            f"║  <i>{sc('AUTHORITY TELEMETRY')}</i>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n\n"
-            "  ▸ Kripya apna <b>Login ID / Email</b> bhejein:"
+            f"{themed_box(esc(CLIENT_NAME), sc('AUTHORITY TELEMETRY'))}\n"
+            f"{th['bar']}\n\n"
+            "  ▸ Kripya apna <b>Login ID / Email</b> bhejein (ya <code>🎮 Games Lounge</code> try karein):"
         ),
-        reply_markup=guest_reply_keyboard(),
+        reply_markup=guest_keyboard_for_chat(chat_id),
     )
 
 
-async def send_manual_view(chat_id: int, bot) -> None:
+async def send_manual_view(
+    chat_id: int, user_id: int | None, bot
+) -> None:
+    th = get_theme()
+    b = th["bullet"]
     manual_text = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{sc('OPERATOR MANUAL')}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n\n"
-        "<b>1. Login &amp; Authority Session</b>\n"
-        "  ▸ <code>/login</code> ya <code>🔐 Login</code> dabakar Email/ID aur Password dein.\n"
-        "  ▸ Password bhejte hi security ke liye message auto-delete ho jata hai.\n\n"
-        "<b>2. Dynamic Context Buttons</b>\n"
-        "  ▸ <code>🌐 Site Dashboard</code> → Quick site buttons + Distillery/Bottling mm/L/instrument readings.\n"
-        "  ▸ <code>📡 API Report</code> → Initial (I) &amp; Final (F) pairs, RequestId, VAT codes &amp; date logs.\n"
-        "  ▸ <code>⏳ Aging</code> → Offline aging buckets (<code>&lt;1D</code>, <code>&lt;1W</code>, <code>&lt;24D</code>, <code>&lt;11M</code>, <code>&lt;1Y</code>, <code>&gt;1Y</code>).\n"
-        "  ▸ <code>⚙ Ops &amp; Export</code> → System health, CSV export, online &amp; unassigned devices.\n\n"
-        "<b>3. Direct Commands</b>\n"
-        "  • <code>/status</code> — Live summary, aging &amp; top offline sites\n"
-        "  • <code>/allsite [page]</code> — Assigned sites list\n"
-        "  • <code>/dash &lt;no/serial/name&gt;</code> — Site dashboard + Initial/Final API report\n"
-        "  • <code>/apireport &lt;site&gt; [DD-Mon-YYYY]</code> — Excise API logs &amp; RequestId pairs\n"
-        "  • <code>/instruments [search]</code> — Tank / mm / L / instrument readings\n"
-        "  • <code>/next</code> &amp; <code>/prev</code> — List pagination\n"
-        "  • <code>/ai &lt;question&gt;</code> | <code>/ai_analyze</code> | <code>/exit_ai</code>"
+        f"{themed_box(sc('OPERATOR MANUAL'))}\n"
+        f"{th['bar']}\n\n"
+        "<b>1. Login &amp; Guest Games Lounge</b>\n"
+        f"  {b} <code>/login</code> ya <code>🔐 Login</code> se portal login karein.\n"
+        f"  {b} Login ka wait karte waqt <code>🎮 Games Lounge</code> mein 3 mini-games khelein.\n\n"
+        "<b>2. Navigation &amp; Menus</b>\n"
+        f"  {b} Har sub-menu mein <code>⬅ Back</code> aur <code>🏠 Main Menu</code> milta hai.\n"
+        f"  {b} <code>🌐 Site Dashboard</code> → Tanks (`mm` + `L` grouped) &amp; Excise `I`→`F` report.\n"
+        f"  {b} <code>📡 API Report</code> → `RequestId` pairs, Initial/Final &amp; net delta.\n"
+        f"  {b} <code>⭐ Watchlist</code> &amp; <code>📋 Shift Summary</code> → Quick ops.\n\n"
+        "<b>3. Commands</b>\n"
+        "  • <code>/status</code> | <code>/allsite</code> | <code>/dash &lt;site&gt;</code> | <code>/apireport &lt;site&gt; [date]</code>\n"
+        "  • <code>/instruments</code> | <code>/age 1d</code> | <code>/ai &lt;question&gt;</code> | <code>/ai_analyze</code>"
     )
     await safe_send_html(
         bot,
         chat_id,
         manual_text,
-        reply_markup=current_keyboard_for_chat(chat_id),
+        reply_markup=current_keyboard_for_chat(chat_id, user_id),
+    )
+
+
+async def open_games_lounge(
+    chat_id: int, user_id: int | None, bot
+) -> None:
+    push_menu_state(chat_id, "games_menu")
+    GAME_SESSIONS.pop(chat_id, None)
+    msg = (
+        f"{themed_box(sc('GUEST GAMES LOUNGE'))}\n"
+        f"{get_theme()['bar']}\n"
+        "  ▸ <code>🎲 Tic-Tac-Toe</code> — 3x3 vs Smart Bot\n"
+        "  ▸ <code>🔢 Number Guess</code> — 1 se 100 secret number\n"
+        "  ▸ <code>✂ Rock Paper Scissors</code> — Best of 5 rounds"
+    )
+    await safe_send_html(
+        bot, chat_id, msg, reply_markup=games_lounge_keyboard()
     )
 
 
@@ -2202,7 +2778,7 @@ async def open_dashboard_menu(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2210,7 +2786,7 @@ async def open_dashboard_menu(chat_id: int, bot) -> None:
         run_self_analysis, sess_data["session"]
     )
     LAST_SNAPSHOT[chat_id] = analysis
-    MENU_STATE[chat_id] = "dash_menu"
+    push_menu_state(chat_id, "dash_menu")
 
     devs = analysis.get("assigned_devices") or []
     quick_lines = []
@@ -2222,17 +2798,15 @@ async def open_dashboard_menu(chat_id: int, bot) -> None:
         )
 
     msg = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{sc('SITE DASHBOARD HUB')}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n"
+        f"{themed_box(sc('SITE DASHBOARD HUB'))}\n"
+        f"{get_theme()['bar']}\n"
         + (
             "\n".join(quick_lines)
             if quick_lines
             else "  ▸ Koi site list nahi mili"
         )
         + "\n\n"
-        "  ▸ Upar quick button dabayein, ya <code>🔎 Open Site by ID/Name</code> / <code>/dash &lt;no/serial/name&gt;</code> use karein."
+        "  ▸ Quick button dabayein, <code>🔎 Open Site by ID/Name</code>, ya <code>⬅ Back</code>."
     )
     await safe_send_html(
         bot, chat_id, msg, reply_markup=dashboard_sub_keyboard(chat_id)
@@ -2245,20 +2819,18 @@ async def open_api_report_menu(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
-    MENU_STATE[chat_id] = "api_menu"
+    push_menu_state(chat_id, "api_menu")
     msg = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{sc('EXCISE API REPORT')}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n"
+        f"{themed_box(sc('EXCISE API REPORT'))}\n"
+        f"{get_theme()['bar']}\n"
         f"  ▸ Today Date : <code>{esc(today_ist_report_date())}</code>\n"
-        "  ▸ <code>📅 Today API Report</code> — Initial (I) &amp; Final (F) pairs + RequestId\n"
-        "  ▸ <code>🗓 Custom Date Report</code> — Site aur date (<code>DD-Mon-YYYY</code>) dein\n"
-        "  ▸ <code>🏭 Site API Report</code> — Kisi bhi site ka report check karein"
+        "  ▸ <code>📅 Today API Report</code> — Initial (I) &amp; Final (F) pairs + ΔL/Δmm\n"
+        "  ▸ <code>🗓 Custom Date Report</code> — Site aur date (<code>DD-Mon-YYYY</code>)\n"
+        "  ▸ <code>🏭 Site API Report</code> — Quick site report"
     )
     await safe_send_html(
         bot, chat_id, msg, reply_markup=api_report_sub_keyboard()
@@ -2272,7 +2844,7 @@ async def open_aging_menu(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2280,21 +2852,18 @@ async def open_aging_menu(chat_id: int, bot) -> None:
         run_self_analysis, sess_data["session"]
     )
     LAST_SNAPSHOT[chat_id] = analysis
-    MENU_STATE[chat_id] = "age_menu"
+    push_menu_state(chat_id, "age_menu")
     ages = analysis.get("aging_counts", {})
 
     msg = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{sc('AGING BUCKETS')}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n"
+        f"{themed_box(sc('AGING BUCKETS'))}\n"
+        f"{get_theme()['bar']}\n"
         f"  ◦ <code>&lt; 1 Day (≤24h)    : {ages.get('1d', 0)}</code>\n"
         f"  ▪ <code>&lt; 1 Week (≤7d)    : {ages.get('1w', 0)}</code>\n"
         f"  • <code>&lt; 24 Days (≤24d)  : {ages.get('24d', 0)}</code>\n"
         f"  ◆ <code>&lt; 11 Months(≤330d): {ages.get('11m', 0)}</code>\n"
         f"  ◈ <code>&lt; 1 Year (≤365d)  : {ages.get('1y', 0)}</code>\n"
-        f"  ▸ <code>&gt; 1 Year (365d+)  : {ages.get('gt1y', 0)}</code>\n\n"
-        "  ▸ Niche bucket button dabayein ya <code>/age 1d</code> bhejein."
+        f"  ▸ <code>&gt; 1 Year (365d+)  : {ages.get('gt1y', 0)}</code>"
     )
     await safe_send_html(
         bot, chat_id, msg, reply_markup=aging_sub_keyboard()
@@ -2307,67 +2876,238 @@ async def open_ops_menu(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
-    MENU_STATE[chat_id] = "ops_menu"
+    push_menu_state(chat_id, "ops_menu")
     msg = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{sc('OPS & EXPORT')}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n"
-        "  ▸ <code>🩺 Health</code> — Device types, firmware &amp; parser status\n"
-        "  ▸ <code>📥 Export CSV</code> — Full device telemetry sheet\n"
-        "  ▸ <code>∙ Online</code> / <code>📌 Unassigned</code> — Filtered lists"
+        f"{themed_box(sc('OPS & EXPORT'))}\n"
+        f"{get_theme()['bar']}\n"
+        "  ▸ <code>🩺 Health</code> | <code>📥 Export CSV</code>\n"
+        "  ▸ <code>∙ Online</code> | <code>📌 Unassigned</code> | <code>❄ Stale Sites</code>"
     )
     await safe_send_html(bot, chat_id, msg, reply_markup=ops_sub_keyboard())
 
 
-async def send_admin_panel(chat_id: int, bot) -> None:
+async def open_admin_panel(chat_id: int, bot) -> None:
+    push_menu_state(chat_id, "admin_menu")
+    th = get_theme()
     msg = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{sc('ADMIN AUTHORITY')}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n"
+        f"{themed_box(sc('ADMIN AUTHORITY'))}\n"
+        f"{th['bar']}\n"
         f"  ▸ Bot Status   : <code>{'ON' if BOT_ENABLED else 'OFF'}</code>\n"
         f"  ▸ Maintenance  : <code>{'ON' if MAINTENANCE_MODE else 'OFF'}</code>\n"
-        f"  ▸ Refresh Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+        f"  ▸ UI Theme     : <code>{esc(th['label'])}</code>\n"
         f"  ▸ Notif Style  : <code>{esc(NOTIF_STYLE)}</code>\n"
-        f"  ▸ Active Chats : <code>{len(USER_SESSIONS)}</code>\n\n"
-        "<b>Commands:</b>\n"
-        "  • <code>/set_refresh 30</code> (15–3600s)\n"
-        "  • <code>/set_notif detailed | compact | alerts_only</code>\n"
-        "  • <code>/maint_on [msg]</code> | <code>/maint_off</code>\n"
-        "  • <code>/bot_on</code> | <code>/bot_off</code>"
+        f"  ▸ Refresh Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+        f"  ▸ Active Chats : <code>{len(USER_SESSIONS)}</code>"
+    )
+    await safe_send_html(bot, chat_id, msg, reply_markup=admin_sub_keyboard())
+
+
+async def open_theme_menu(chat_id: int, bot) -> None:
+    push_menu_state(chat_id, "theme_menu")
+    cur_label = get_theme()["label"]
+    msg = (
+        f"{themed_box(sc('UI THEMES'))}\n"
+        f"{get_theme()['bar']}\n"
+        f"  ▸ Current Theme: <b>{esc(cur_label)}</b>\n"
+        "  • <b>Obsidian</b> — Deep dark authority frames\n"
+        "  • <b>Minimal</b> — Clean executive lines\n"
+        "  • <b>Cyber</b> — Technical telemetry grid\n"
+        "  • <b>Royal</b> — Decorative royal border"
+    )
+    await safe_send_html(bot, chat_id, msg, reply_markup=theme_sub_keyboard())
+
+
+async def open_notif_demo_menu(chat_id: int, bot) -> None:
+    push_menu_state(chat_id, "notif_menu")
+    msg = (
+        f"{themed_box(sc('NOTIFICATIONS & DEMO'))}\n"
+        f"{get_theme()['bar']}\n"
+        f"  ▸ Active Mode: <code>{esc(NOTIF_STYLE)}</code>\n"
+        "  • Modes: <code>Detailed</code>, <code>Compact</code>, <code>Alerts Only</code>, <code>Digest</code>\n"
+        "  • Niche <code>Demo: ...</code> buttons se live alert preview bhejein."
     )
     await safe_send_html(
-        bot, chat_id, msg, reply_markup=current_keyboard_for_chat(chat_id)
+        bot, chat_id, msg, reply_markup=notif_demo_sub_keyboard()
     )
+
+
+async def send_notification_demo(chat_id: int, demo_kind: str, bot) -> None:
+    sample_site = "Malbros / Sample Unit (Distillery)"
+    sample_serial = "2210100999"
+    sample_seen = datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST")
+
+    if demo_kind == "recovered":
+        txt = (
+            f"{themed_box('∙ ' + sc('DEMO: SITE RECOVERED'))}\n"
+            f"  ▸ Site   : <b>{esc(sample_site)}</b>\n"
+            f"  ▸ Serial : <b>{esc(sample_serial)}</b>\n"
+            f"  ▸ Seen   : <code>{esc(sample_seen)}</code>"
+        )
+    else:
+        badge_map = {
+            "2h": "2ʜ ᴅᴏᴡɴ ALERT",
+            "10h": "10ʜ ᴅᴏᴡɴ ALERT",
+            "1d": "1ᴅ ᴅᴏᴡɴ ALERT",
+        }
+        badge = badge_map.get(demo_kind, "2ʜ ᴅᴏᴡɴ ALERT")
+        if NOTIF_STYLE == "compact":
+            txt = f"▸ • <b>{esc(sample_site)}</b> [<code>{esc(badge)}</code>] | Serial: <code>{esc(sample_serial)}</code>"
+        else:
+            txt = (
+                f"{themed_box('• ' + esc('DEMO: ' + badge))}\n"
+                f"  ▸ Site   : <b>{esc(sample_site)}</b>\n"
+                f"  ▸ Serial : <b>{esc(sample_serial)}</b>\n"
+                f"  ▸ Seen   : <code>{esc(sample_seen)}</code>"
+            )
+
+    await safe_send_html(
+        bot, chat_id, txt, reply_markup=notif_demo_sub_keyboard()
+    )
+
+
+async def send_shift_summary(chat_id: int, bot) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
+        return
+
+    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+        run_self_analysis, sess_data["session"]
+    )
+    LAST_SNAPSHOT[chat_id] = analysis
+    ages = analysis.get("aging_counts", {})
+    th = get_theme()
+    b = th["bullet"]
+
+    top_lines = (
+        "\n".join(
+            f"  {i}. {esc(s)} — <code>{c} off</code>"
+            for i, (s, c) in enumerate(analysis.get("top_offline_sites", []), 1)
+        )
+        or "  <code>Koi offline site nahi</code>"
+    )
+
+    msg = (
+        f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('SHIFT HANDOVER'))}\n"
+        f"{th['bar']}\n"
+        f"  {b} Time      : <i>{esc(analysis.get('checked_at_ist'))}</i>\n"
+        f"  {b} Fleet     : Total <b>{analysis.get('total', 0)}</b> | ∙ Online <b>{analysis.get('connected', 0)}</b> | • Off <b>{analysis.get('disconnected_count', 0)}</b>\n"
+        f"  {b} Stale (>30m): <b>{analysis.get('stale_count', 0)}</b> | Unassigned: <b>{analysis.get('unassigned_count', 0)}</b>\n"
+        f"  {b} Aging     : &lt;1D <code>{ages.get('1d', 0)}</code> | &lt;1W <code>{ages.get('1w', 0)}</code> | &lt;24D <code>{ages.get('24d', 0)}</code> | &lt;11M <code>{ages.get('11m', 0)}</code>\n\n"
+        f"<b>{b} {sc('Priority Offline Sites')}</b>\n{top_lines}"
+    )
+    await safe_send_html(bot, chat_id, msg)
+
+
+async def send_watchlist_view(chat_id: int, bot) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
+        return
+
+    wlist = WATCHLIST_SITES.get(chat_id) or []
+    if not wlist:
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"{themed_box(sc('WATCHLIST'))}\n  ▸ Watchlist khali hai. Dashboard menu se <code>⭐ Pin Site</code> use karein.",
+        )
+        return
+
+    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+        run_self_analysis, sess_data["session"]
+    )
+    LAST_SNAPSHOT[chat_id] = analysis
+    devs = analysis.get("assigned_devices", [])
+
+    lines = [
+        themed_box(sc("PINNED WATCHLIST") + f" ({len(wlist)})"),
+        get_theme()["bar"],
+    ]
+    for idx, key in enumerate(wlist[:10], start=1):
+        dev = _find_device_by_target(devs, key)
+        if dev:
+            dot = small_status_dot(bool(dev.get("is_connected")))
+            lines.append(
+                f"  {idx}. {dot} <b>{esc(dev.get('industry'))}</b> "
+                f"[ID:<code>{esc(dev.get('site_id') or '-')}</code>] | <code>{esc(dev.get('conn_label'))}</code>"
+            )
+        else:
+            lines.append(f"  {idx}. <code>{esc(key)}</code>")
+
+    await safe_send_html(bot, chat_id, "\n".join(lines))
+
+
+async def send_stale_sites_view(chat_id: int, bot) -> None:
+    sess_data = require_auth(chat_id)
+    if not sess_data:
+        await safe_send_html(
+            bot,
+            chat_id,
+            "  ▸ Pehle login karein (<code>/login</code>):",
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
+        return
+
+    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
+        run_self_analysis, sess_data["session"]
+    )
+    LAST_SNAPSHOT[chat_id] = analysis
+    stale = analysis.get("stale_list") or []
+    if not stale:
+        await safe_send_html(
+            bot,
+            chat_id,
+            f"{themed_box(sc('STALE TELEMETRY'))}\n  ∙ <code>Koi connected-but-stale site (&gt;30m) nahi mili.</code>",
+        )
+        return
+
+    lines = [
+        themed_box(sc("CONNECTED BUT STALE") + f" ({len(stale)})"),
+        get_theme()["bar"],
+    ]
+    for idx, d in enumerate(stale[:10], start=1):
+        lines.append(format_premium_device_block(d, idx))
+    await safe_send_html(bot, chat_id, "\n".join(lines))
 
 
 async def send_login_prompt(chat_id: int, bot) -> None:
     AI_CHAT_MODE.discard(chat_id)
     AWAITING_INPUT.pop(chat_id, None)
+    GAME_SESSIONS.pop(chat_id, None)
     USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
     await safe_send_html(
         bot,
         chat_id,
         (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{sc('PORTAL LOGIN')}</b>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
+            f"{themed_box(sc('PORTAL LOGIN'))}\n"
+            f"{get_theme()['bar']}\n"
             "  ▸ Kripya apna <b>Login ID / Email</b> bhejein:"
         ),
-        reply_markup=guest_reply_keyboard(),
+        reply_markup=guest_keyboard_for_chat(chat_id),
     )
 
 
 async def send_logout_action(chat_id: int, bot) -> None:
     AI_CHAT_MODE.discard(chat_id)
     AWAITING_INPUT.pop(chat_id, None)
+    GAME_SESSIONS.pop(chat_id, None)
     MENU_STATE.pop(chat_id, None)
+    MENU_STACK.pop(chat_id, None)
     LAST_PAGE_STATE.pop(chat_id, None)
     sess_data = USER_SESSIONS.pop(chat_id, None)
     LAST_SNAPSHOT.pop(chat_id, None)
@@ -2383,13 +3123,11 @@ async def send_logout_action(chat_id: int, bot) -> None:
         bot,
         chat_id,
         (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{sc('LOGGED OUT')}</b>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
+            f"{themed_box(sc('LOGGED OUT'))}\n"
+            f"{get_theme()['bar']}\n"
             "  ▸ Session aur alerts band kar diye gaye hain."
         ),
-        reply_markup=guest_reply_keyboard(),
+        reply_markup=guest_keyboard_for_chat(chat_id),
     )
 
 
@@ -2400,7 +3138,7 @@ async def send_status_action(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2412,19 +3150,19 @@ async def send_status_action(chat_id: int, bot) -> None:
         analysis = await asyncio.to_thread(
             run_self_analysis, sess_data["session"]
         )
+        sess_data["fail_streak"] = 0
         LAST_SNAPSHOT[chat_id] = analysis
         save_snapshot_db(chat_id, analysis)
 
         if analysis["meta"]["server_error_500"]:
             await safe_edit_html(
                 loader,
-                "╔══════════════════════╗\n"
-                "║  • <b>SERVER HTTP 500</b>   ║\n"
-                "╚══════════════════════╝\n"
-                "  ▸ Portal ne <code>500 Internal Server Error</code> diya hai.",
+                f"{themed_box('• SERVER HTTP 500')}\n  ▸ Portal ne <code>500 Internal Server Error</code> diya hai.",
             )
             return
 
+        th = get_theme()
+        b = th["bullet"]
         sites_lines = (
             "\n".join(
                 f"  {i}. • <b>{esc(s)}</b> — <code>{c} off</code>"
@@ -2438,24 +3176,24 @@ async def send_status_action(chat_id: int, bot) -> None:
         ages = analysis["aging_counts"]
 
         msg = (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{esc(CLIENT_NAME)} — {sc('STATUS')}</b>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
-            f"  ▸ Time         : <i>{esc(analysis['checked_at_ist'])}</i>\n"
-            f"  ▸ Source       : <code>{esc(analysis['meta'].get('source', 'none'))}</code>\n"
-            f"  ▸ Total        : <b>{analysis['total']}</b>\n"
-            f"  ▸ Assigned     : <b>{analysis['assigned_count']}</b> | Unassigned: <b>{analysis['unassigned_count']}</b>\n"
-            f"  ▸ Connected    : ∙ <b>{analysis['connected']}</b>\n"
-            f"  ▸ Disconnected : • <b>{analysis['disconnected_count']}</b>\n\n"
-            f"<b>◈ {sc('Aging Buckets (< Range)')}</b>\n"
+            f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('STATUS'))}\n"
+            f"{th['bar']}\n"
+            f"  {b} Time         : <i>{esc(analysis['checked_at_ist'])}</i>\n"
+            f"  {b} Source       : <code>{esc(analysis['meta'].get('source', 'none'))}</code>\n"
+            f"  {b} Total        : <b>{analysis['total']}</b>\n"
+            f"  {b} Assigned     : <b>{analysis['assigned_count']}</b> | Unassigned: <b>{analysis['unassigned_count']}</b>\n"
+            f"  {b} Connected    : ∙ <b>{analysis['connected']}</b> (Stale: <b>{analysis.get('stale_count', 0)}</b>)\n"
+            f"  {b} Disconnected : • <b>{analysis['disconnected_count']}</b>\n\n"
+            f"<b>{b} {sc('Aging Buckets (< Range)')}</b>\n"
             f"  ◦ <code>&lt;1D: {ages['1d']}</code> | ▪ <code>&lt;1W: {ages['1w']}</code> | • <code>&lt;24D: {ages['24d']}</code>\n"
             f"  ◆ <code>&lt;11M: {ages['11m']}</code> | ◈ <code>&lt;1Y: {ages['1y']}</code> | ▸ <code>&gt;1Y: {ages['gt1y']}</code>\n\n"
-            f"<b>◈ {sc('Top Disconnected Sites')}</b>\n"
+            f"<b>{b} {sc('Top Disconnected Sites')}</b>\n"
             f"{sites_lines}"
         )
         await safe_edit_html(loader, msg)
     except Exception as exc:
+        sess_data["fail_streak"] = sess_data.get("fail_streak", 0) + 1
+        ensure_live_session(chat_id, sess_data)
         await safe_edit_html(
             loader,
             f"  • <b>Status Error:</b> <code>{esc(exc)}</code>",
@@ -2471,7 +3209,7 @@ async def send_aging_bucket_page(
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2492,9 +3230,7 @@ async def send_aging_bucket_page(
                 bot,
                 chat_id,
                 (
-                    "╔══════════════════════╗\n"
-                    f"║  ◈ <b>{esc(title)}</b>\n"
-                    "╚══════════════════════╝\n"
+                    f"{themed_box(esc(title))}\n"
                     "  ▸ <code>Is range mein koi disconnected site nahi hai.</code>"
                 ),
                 reply_markup=aging_sub_keyboard(),
@@ -2514,11 +3250,8 @@ async def send_aging_bucket_page(
         subset = matched[start : start + per_page]
 
         lines = [
-            "╔══════════════════════╗",
-            f"║  ◈ <b>{esc(title)} ({len(matched)})</b>",
-            f"║  <i>Page {page + 1}/{total_pages}</i>",
-            "╚══════════════════════╝",
-            UI_TEXTURE_BAR,
+            themed_box(esc(title) + f" ({len(matched)})", f"Page {page + 1}/{total_pages}"),
+            get_theme()["bar"],
         ]
         for offset, d in enumerate(subset):
             lines.append(format_premium_device_block(d, start + offset + 1))
@@ -2544,7 +3277,7 @@ async def send_allsite_page(chat_id: int, page: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2575,11 +3308,11 @@ async def send_allsite_page(chat_id: int, page: int, bot) -> None:
         subset = assigned_devs[start : start + per_page]
 
         lines = [
-            "╔══════════════════════╗",
-            f"║  ◈ <b>{sc('ALL SITES')} ({len(assigned_devs)})</b>",
-            f"║  <i>Page {page + 1}/{total_pages}</i>",
-            "╚══════════════════════╝",
-            UI_TEXTURE_BAR,
+            themed_box(
+                sc("ALL SITES") + f" ({len(assigned_devs)})",
+                f"Page {page + 1}/{total_pages}",
+            ),
+            get_theme()["bar"],
         ]
         for offset, d in enumerate(subset):
             g_idx = start + offset
@@ -2601,7 +3334,7 @@ def _format_excise_pairs_and_rows(rep: dict[str, Any]) -> list[str]:
     out: list[str] = [
         f"\n\n<b>◈ {sc('UP EXCISE API REPORT')} ({esc(rep.get('report_date') or today_ist_report_date())})</b>",
         f"  ▸ VAT Codes : <code>{esc(', '.join(rep.get('vat_codes') or []) or 'N/A')}</code>",
-        f"  ▸ Logs      : <b>{rep.get('total', 0)}</b> (Initial I: <b>{rep.get('initial_count', 0)}</b> | Final F: <b>{rep.get('final_count', 0)}</b>)",
+        f"  ▸ Logs      : <b>{rep.get('total', 0)}</b> (Initial I: <b>{rep.get('initial_count', 0)}</b> | Final F: <b>{rep.get('final_count', 0)}</b> | Pending F: <b>{rep.get('pending_final_count', 0)}</b>)",
         f"  ▸ Status    : Ok <b>{rep.get('success', 0)}</b> | Err <b>{rep.get('failed', 0)}</b>",
     ]
     pairs = rep.get("pairs") or []
@@ -2611,6 +3344,7 @@ def _format_excise_pairs_and_rows(rep: dict[str, Any]) -> list[str]:
             rid = p.get("request_id") or "N/A"
             vc = p.get("vat_code") or "-"
             rt = f" [{p.get('request_type')}]" if p.get("request_type") else ""
+            delta_t = p.get("delta_text") or ""
             ini = p.get("initial")
             fin = p.get("final")
 
@@ -2624,10 +3358,13 @@ def _format_excise_pairs_and_rows(rep: dict[str, Any]) -> list[str]:
                 if fin
                 else "F: Pending"
             )
+            delta_line = (
+                f"\n      ↳ Delta: <code>{esc(delta_t)}</code>" if delta_t else ""
+            )
             out.append(
                 f"    • <code>{esc(rid)}</code> | VAT: <code>{esc(vc)}{esc(rt)}</code>\n"
                 f"      ↳ <code>{esc(ini_str)}</code>\n"
-                f"      ↳ <code>{esc(fin_str)}</code>"
+                f"      ↳ <code>{esc(fin_str)}</code>{delta_line}"
             )
     elif rep.get("rows"):
         for idx, row in enumerate(rep["rows"][:8], start=1):
@@ -2652,7 +3389,7 @@ async def send_site_dashboard_by_target(
             bot,
             chat_id,
             "  ▸ Session expire ho gaya hai, dobara login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2673,6 +3410,11 @@ async def send_site_dashboard_by_target(
             ),
         )
         return
+
+    LAST_PAGE_STATE[chat_id] = {
+        "view": "last_site",
+        "site_key": dev.get("site_id") or dev.get("serial_no") or dev.get("industry"),
+    }
 
     loader = await bot.send_message(
         chat_id=chat_id,
@@ -2716,10 +3458,8 @@ async def send_site_dashboard_by_target(
     )
 
     header = (
-        "╔══════════════════════╗\n"
-        f"║  ◈ <b>{esc(dev['industry'])}</b>\n"
-        "╚══════════════════════╝\n"
-        f"{UI_TEXTURE_BAR}\n"
+        f"{themed_box(esc(dev['industry']))}\n"
+        f"{get_theme()['bar']}\n"
         f"  ▸ Site Type : <code>{esc(dev['site'])}</code>\n"
         f"  ▸ Serial No : <b>{esc(dev['serial_no'])}</b>\n"
         f"  ▸ Site ID   : <code>{esc(dash.get('site_id') or 'N/A')}</code>{code_line}{ws_name_line}\n"
@@ -2727,14 +3467,11 @@ async def send_site_dashboard_by_target(
     )
 
     if dash.get("instruments"):
-        inst_lines = [f"<b>◈ {sc('LIVE DASHBOARD READINGS (MM / L / INST)')}</b>"]
-        for i, inst in enumerate(dash["instruments"][:25], start=1):
-            u = f" {inst['unit']}" if inst.get("unit") else ""
-            tag_note = f" [{inst['extra']}]" if inst.get("extra") else ""
-            inst_lines.append(
-                f"  {i}. ▸ <b>{esc(inst['name'])}</b> : <code>{esc(inst['value'])}{esc(u)}</code>{esc(tag_note)}"
-            )
-        inst_section = "\n".join(inst_lines)
+        grouped_lines = group_readings_by_tank(dash["instruments"])
+        inst_section = (
+            f"<b>◈ {sc('GROUPED TANK & INSTRUMENT READINGS (MM / L / INST)')}</b>\n"
+            + "\n".join(grouped_lines)
+        )
     else:
         reason = dash.get("error") or "Dashboard WS mein koi tag value nahi mili."
         inst_section = (
@@ -2756,7 +3493,7 @@ async def send_api_report_action(
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2793,10 +3530,8 @@ async def send_api_report_action(
     )
 
     lines = [
-        "╔══════════════════════╗",
-        f"║  ◈ <b>{sc('API REPORT')}</b>",
-        "╚══════════════════════╝",
-        UI_TEXTURE_BAR,
+        themed_box(sc("API REPORT")),
+        get_theme()["bar"],
         f"  ▸ Site      : <b>{esc(dev['industry'])}</b> (ID: <code>{esc(sid)}</code>)",
         f"  ▸ Date      : <code>{esc(rdate)}</code>",
     ]
@@ -2813,7 +3548,7 @@ async def send_instruments_view(
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2861,11 +3596,8 @@ async def send_instruments_view(
     )
 
     blocks: list[str] = [
-        "╔══════════════════════╗",
-        f"║  ◈ <b>{sc('INSTRUMENTS & TANKS')}</b>",
-        f"║  <i>Page {page + 1}/{total_pages}</i>",
-        "╚══════════════════════╝",
-        UI_TEXTURE_BAR,
+        themed_box(sc("INSTRUMENTS & TANKS"), f"Page {page + 1}/{total_pages}"),
+        get_theme()["bar"],
     ]
 
     for offset, d in enumerate(subset):
@@ -2881,11 +3613,8 @@ async def send_instruments_view(
         )
         insts = dash.get("instruments") or []
         if insts:
-            for item in insts[:10]:
-                u = f" {item['unit']}" if item.get("unit") else ""
-                blocks.append(
-                    f"│  • {esc(item['name'])} : <code>{esc(item['value'])}{esc(u)}</code>"
-                )
+            for gline in group_readings_by_tank(insts)[:8]:
+                blocks.append(f"│  {gline.lstrip()}")
         else:
             blocks.append(
                 f"│  • Readings: <code>{esc(dash.get('error') or 'No tag values returned')}</code>"
@@ -2905,7 +3634,7 @@ async def send_online_page(chat_id: int, page: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2936,11 +3665,11 @@ async def send_online_page(chat_id: int, page: int, bot) -> None:
         subset = online_list[start : start + per_page]
 
         lines = [
-            "╔══════════════════════╗",
-            f"║  ◈ <b>{sc('CONNECTED')} ({len(online_list)})</b>",
-            f"║  <i>Page {page + 1}/{total_pages}</i>",
-            "╚══════════════════════╝",
-            UI_TEXTURE_BAR,
+            themed_box(
+                sc("CONNECTED") + f" ({len(online_list)})",
+                f"Page {page + 1}/{total_pages}",
+            ),
+            get_theme()["bar"],
         ]
         for offset, d in enumerate(subset):
             lines.append(format_premium_device_block(d, start + offset + 1))
@@ -2964,7 +3693,7 @@ async def send_unassigned_page(chat_id: int, page: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -2995,11 +3724,11 @@ async def send_unassigned_page(chat_id: int, page: int, bot) -> None:
         subset = unassigned_list[start : start + per_page]
 
         lines = [
-            "╔══════════════════════╗",
-            f"║  ◈ <b>{sc('UNASSIGNED N/A')} ({len(unassigned_list)})</b>",
-            f"║  <i>Page {page + 1}/{total_pages}</i>",
-            "╚══════════════════════╝",
-            UI_TEXTURE_BAR,
+            themed_box(
+                sc("UNASSIGNED N/A") + f" ({len(unassigned_list)})",
+                f"Page {page + 1}/{total_pages}",
+            ),
+            get_theme()["bar"],
         ]
         for offset, d in enumerate(subset):
             lines.append(format_premium_device_block(d, start + offset + 1))
@@ -3067,7 +3796,7 @@ async def send_health_action(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -3077,10 +3806,12 @@ async def send_health_action(chat_id: int, bot) -> None:
         )
         LAST_SNAPSHOT[chat_id] = analysis
         meta = analysis["meta"]
+        th = get_theme()
+        b = th["bullet"]
 
         type_lines = (
             "\n".join(
-                f"  ▸ <code>{esc(dt)} : {cnt}</code>"
+                f"  {b} <code>{esc(dt)} : {cnt}</code>"
                 for dt, cnt in sorted(
                     analysis["device_type_breakdown"].items(),
                     key=lambda x: -x[1],
@@ -3090,7 +3821,7 @@ async def send_health_action(chat_id: int, bot) -> None:
         )
         fw_lines = (
             "\n".join(
-                f"  ▸ <code>FW {esc(fw)} : {cnt}</code>"
+                f"  {b} <code>FW {esc(fw)} : {cnt}</code>"
                 for fw, cnt in sorted(
                     analysis["firmware_breakdown"].items(), key=lambda x: -x[1]
                 )
@@ -3099,17 +3830,15 @@ async def send_health_action(chat_id: int, bot) -> None:
         )
 
         msg = (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{sc('SYSTEM HEALTH')}</b>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
-            f"  ▸ Client      : <code>{esc(CLIENT_NAME)}</code>\n"
-            f"  ▸ Source      : <code>{esc(meta.get('source', 'none'))}</code>\n"
-            f"  ▸ UAC / Sync  : <code>{esc(UAC)}</code> / <code>{REFRESH_INTERVAL_SEC}s</code>\n"
-            f"  ▸ HTTP 500    : <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
-            f"  ▸ Total / N/A : <b>{analysis['total']} / {analysis['unassigned_count']}</b>\n\n"
-            f"<b>◈ {sc('Device Types')}</b>\n{type_lines}\n\n"
-            f"<b>◈ {sc('Firmware')}</b>\n{fw_lines}"
+            f"{themed_box(sc('SYSTEM HEALTH'))}\n"
+            f"{th['bar']}\n"
+            f"  {b} Client      : <code>{esc(CLIENT_NAME)}</code>\n"
+            f"  {b} Source      : <code>{esc(meta.get('source', 'none'))}</code>\n"
+            f"  {b} Theme / Sync: <code>{esc(th['label'])}</code> / <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+            f"  {b} HTTP 500    : <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
+            f"  {b} Total / N/A : <b>{analysis['total']} / {analysis['unassigned_count']}</b>\n\n"
+            f"<b>{b} {sc('Device Types')}</b>\n{type_lines}\n\n"
+            f"<b>{b} {sc('Firmware')}</b>\n{fw_lines}"
         )
         await safe_send_html(bot, chat_id, msg)
     except Exception as exc:
@@ -3127,7 +3856,7 @@ async def send_export_csv_action(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -3171,7 +3900,7 @@ async def send_site_search_action(
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
@@ -3206,10 +3935,8 @@ async def send_site_search_action(
         return
 
     lines = [
-        "╔══════════════════════╗",
-        f"║  ◈ <b>{sc('SEARCH RESULT')} ({len(matches)})</b>",
-        "╚══════════════════════╝",
-        UI_TEXTURE_BAR,
+        themed_box(sc("SEARCH RESULT") + f" ({len(matches)})"),
+        get_theme()["bar"],
     ]
     for i, d in enumerate(matches[:10], start=1):
         lines.append(format_premium_device_block(d, i))
@@ -3223,13 +3950,13 @@ async def send_ai_analyze_action(chat_id: int, bot) -> None:
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="◈ Groq AI live telemetry, dashboard & API report analyze kar raha hai...",
+        text="◈ Groq AI compact telemetry report tayar kar raha hai...",
     )
     try:
         analysis = await asyncio.to_thread(
@@ -3242,10 +3969,8 @@ async def send_ai_analyze_action(chat_id: int, bot) -> None:
             generate_ai_analysis, sess_data["session"], analysis
         )
         msg = (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{esc(CLIENT_NAME)} — {sc('AI REPORT')}</b>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
+            f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('AI BRIEF'))}\n"
+            f"{get_theme()['bar']}\n"
             f"  ▸ Time: <i>{esc(analysis['checked_at_ist'])}</i>\n\n"
             f"{clean_ai_text(report_txt)}"
         )
@@ -3266,13 +3991,13 @@ async def send_ai_answer_action(
             bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="◈ Groq AI live data check karke jawab de raha hai...",
+        text="◈ Groq AI jawab de raha hai...",
     )
     try:
         analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
@@ -3283,10 +4008,8 @@ async def send_ai_answer_action(
             answer_project_question, question, sess_data["session"], analysis
         )
         msg = (
-            "╔══════════════════════╗\n"
-            f"║  ◈ <b>{esc(CLIENT_NAME)} — {sc('GROQ AI')}</b>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
+            f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('GROQ AI'))}\n"
+            f"{get_theme()['bar']}\n"
             f"{clean_ai_text(ans)}"
         )
         await safe_edit_html(loader, msg)
@@ -3306,19 +4029,21 @@ async def cmd_start(
     if not update.effective_chat or not update.effective_user:
         return
     chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
+    user_id = update.effective_user.id
+    if not await check_access(chat_id, user_id, context.bot):
         return
     AI_CHAT_MODE.discard(chat_id)
-    await send_start_view(chat_id, context.bot)
+    await send_start_view(chat_id, user_id, context.bot)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_chat or not update.effective_user:
         return
     chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
+    user_id = update.effective_user.id
+    if not await check_access(chat_id, user_id, context.bot):
         return
-    await send_manual_view(chat_id, context.bot)
+    await send_manual_view(chat_id, user_id, context.bot)
 
 
 async def cmd_login(
@@ -3552,7 +4277,7 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.bot,
             chat_id,
             "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_reply_keyboard(),
+            reply_markup=guest_keyboard_for_chat(chat_id),
         )
         return
     q = " ".join(context.args).strip() if context.args else ""
@@ -3573,12 +4298,13 @@ async def cmd_exit_ai(
     if not update.effective_chat or not update.effective_user:
         return
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     AI_CHAT_MODE.discard(chat_id)
     await safe_send_html(
         context.bot,
         chat_id,
         "  ▸ <b>Groq AI Mode OFF</b>.",
-        reply_markup=current_keyboard_for_chat(chat_id),
+        reply_markup=current_keyboard_for_chat(chat_id, user_id),
     )
 
 
@@ -3593,7 +4319,33 @@ async def cmd_admin(
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("  • Admin access required.")
         return
-    await send_admin_panel(update.effective_chat.id, context.bot)
+    await open_admin_panel(update.effective_chat.id, context.bot)
+
+
+async def cmd_set_theme(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    global ACTIVE_THEME
+    if not update.effective_chat or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("  • Admin access required.")
+        return
+    th_key = (context.args[0].strip().lower() if context.args else "")
+    if th_key not in THEME_CONFIGS:
+        await safe_send_html(
+            context.bot,
+            update.effective_chat.id,
+            "  ▸ Use: <code>/set_theme obsidian | minimal | cyber | royal</code>",
+        )
+        return
+    ACTIVE_THEME = th_key
+    save_setting_db("active_theme", ACTIVE_THEME)
+    await safe_send_html(
+        context.bot,
+        update.effective_chat.id,
+        f"  ∙ <b>Theme set to:</b> <code>{esc(get_theme()['label'])}</code>",
+    )
 
 
 async def cmd_bot_on(
@@ -3719,11 +4471,12 @@ async def cmd_set_notif(
         "detailed",
         "compact",
         "alerts_only",
+        "digest",
     ):
         await safe_send_html(
             context.bot,
             update.effective_chat.id,
-            "  ▸ Use: <code>/set_notif detailed | compact | alerts_only</code>",
+            "  ▸ Use: <code>/set_notif detailed | compact | alerts_only | digest</code>",
         )
         return
     NOTIF_STYLE = context.args[0].lower()
@@ -3736,11 +4489,13 @@ async def cmd_set_notif(
 
 
 # ==============================================================================
-# TEXT ROUTER (LOGIN FLOW, CONTEXT MENUS, AWAITING INPUTS, AI CHAT)
+# TEXT ROUTER (LOGIN FLOW, GAMES, CONTEXT MENUS, ADMIN CONTROLS, AI CHAT)
 # ==============================================================================
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    global BOT_ENABLED, MAINTENANCE_MODE, REFRESH_INTERVAL_SEC, NOTIF_STYLE, ACTIVE_THEME
+
     if (
         not update.effective_chat
         or not update.effective_user
@@ -3760,14 +4515,17 @@ async def handle_text_message(
     # 1. Login sequence
     sess_data = USER_SESSIONS.get(chat_id)
     if sess_data and sess_data.get("step") == "awaiting_username":
-        USER_SESSIONS[chat_id] = {
-            "step": "awaiting_password",
-            "username": raw_text,
-        }
-        await safe_send_html(
-            context.bot, chat_id, "  ▸ Ab apna <b>Password</b> bhejein:"
-        )
-        return
+        if low in ("🎮 games lounge", "🎲 tic-tac-toe", "🔢 number guess", "✂ rock paper scissors", "📖 manual"):
+            pass
+        else:
+            USER_SESSIONS[chat_id] = {
+                "step": "awaiting_password",
+                "username": raw_text,
+            }
+            await safe_send_html(
+                context.bot, chat_id, "  ▸ Ab apna <b>Password</b> bhejein:"
+            )
+            return
 
     if sess_data and sess_data.get("step") == "awaiting_password":
         username = sess_data.get("username", "")
@@ -3797,40 +4555,79 @@ async def handle_text_message(
             "step": "authenticated",
             "username": username,
             "session": session,
+            "fail_streak": 0,
         }
+        GAME_SESSIONS.pop(chat_id, None)
         MENU_STATE[chat_id] = "main"
+        MENU_STACK[chat_id] = []
+        th = get_theme()
         await safe_edit_html(
             wait_msg,
-            "╔══════════════════════╗\n"
-            f"║  ∙ <b>{esc(CLIENT_NAME)}</b>\n"
-            f"║  <i>{sc('AUTHENTICATED')}</i>\n"
-            "╚══════════════════════╝\n"
-            f"{UI_TEXTURE_BAR}\n"
+            f"{themed_box('∙ ' + esc(CLIENT_NAME), sc('AUTHENTICATED'))}\n"
+            f"{th['bar']}\n"
             f"  ▸ Account   : <code>{esc(username)}</code>\n"
-            f"  ▸ Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
+            f"  ▸ Theme     : <code>{esc(th['label'])}</code>\n"
             f"  ▸ Alerts    : <code>2h → 10h → 1d (1-Time)</code>",
         )
         await safe_send_html(
             context.bot,
             chat_id,
             f"◈ <b>{esc(CLIENT_NAME)} — {sc('PANEL ACTIVE')}</b>",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=main_reply_keyboard(user_id),
         )
         return
 
-    # 2. Back to main menu button
+    # 2. Back & Main Menu navigation
     if low == "🏠 main menu":
-        MENU_STATE[chat_id] = "main"
+        MENU_STATE[chat_id] = "main" if require_auth(chat_id) else "guest"
+        MENU_STACK[chat_id] = []
         AWAITING_INPUT.pop(chat_id, None)
+        GAME_SESSIONS.pop(chat_id, None)
         await safe_send_html(
             context.bot,
             chat_id,
-            f"◈ <b>{esc(CLIENT_NAME)} — {sc('MAIN MENU')}</b>",
-            reply_markup=main_reply_keyboard(),
+            f"{themed_box(sc('MAIN MENU'))}",
+            reply_markup=current_keyboard_for_chat(chat_id, user_id),
         )
         return
 
-    # 3. Pending contextual input (custom site / custom date)
+    if low == "⬅ back":
+        await pop_menu_state(chat_id, user_id, context.bot)
+        return
+
+    # 3. Active Mini-Game turns (when not authenticated)
+    active_game = GAME_SESSIONS.get(chat_id)
+    if active_game and not require_auth(chat_id):
+        gtype = active_game.get("game")
+        if gtype == "ttt" and raw_text.isdigit():
+            reply_txt, finished = play_ttt_turn(chat_id, int(raw_text))
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                reply_txt,
+                reply_markup=guest_keyboard_for_chat(chat_id),
+            )
+            return
+        if gtype == "guess" and raw_text.isdigit():
+            reply_txt, finished = play_guess_turn(chat_id, int(raw_text))
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                reply_txt,
+                reply_markup=guest_keyboard_for_chat(chat_id),
+            )
+            return
+        if gtype == "rps" and low in ("rock", "paper", "scissors"):
+            reply_txt, finished = play_rps_turn(chat_id, raw_text)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                reply_txt,
+                reply_markup=guest_keyboard_for_chat(chat_id),
+            )
+            return
+
+    # 4. Pending contextual input
     pending = AWAITING_INPUT.get(chat_id)
     if pending:
         AWAITING_INPUT.pop(chat_id, None)
@@ -3858,8 +4655,52 @@ async def handle_text_message(
                     chat_id, raw_text, None, context.bot
                 )
             return
+        if kind == "set_refresh_val" and is_admin(user_id):
+            try:
+                sec = int(raw_text)
+                if 15 <= sec <= 3600:
+                    REFRESH_INTERVAL_SEC = sec
+                    save_setting_db("refresh_sec", str(sec))
+                    await safe_send_html(
+                        context.bot,
+                        chat_id,
+                        f"  ∙ <b>Sync Rate set to {sec}s.</b>",
+                        reply_markup=admin_sub_keyboard(),
+                    )
+                    return
+            except ValueError:
+                pass
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                "  • 15 se 3600 ke beech valid seconds bhejein.",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+        if kind == "set_maint_msg" and is_admin(user_id):
+            if low == "off":
+                MAINTENANCE_MODE = False
+                save_setting_db("maint_mode", "0")
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    "  ∙ <b>Maintenance Mode OFF.</b>",
+                    reply_markup=admin_sub_keyboard(),
+                )
+            else:
+                MAINTENANCE_MODE = True
+                MAINTENANCE_MSG = raw_text
+                save_setting_db("maint_mode", "1")
+                save_setting_db("maint_msg", MAINTENANCE_MSG)
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    f"  ◈ <b>Maintenance ON:</b> <code>{esc(MAINTENANCE_MSG)}</code>",
+                    reply_markup=admin_sub_keyboard(),
+                )
+            return
 
-    # 4. Quick numbered site buttons from dashboard sub-menu
+    # 5. Quick numbered site buttons from dashboard sub-menu
     m_quick = re.match(r"^#(\d+)\b", raw_text)
     if m_quick and MENU_STATE.get(chat_id) == "dash_menu":
         await send_site_dashboard_by_target(
@@ -3867,14 +4708,69 @@ async def handle_text_message(
         )
         return
 
-    # 5. Menu & Action Buttons
+    # 6. Theme & Notification Demo Buttons (Admin)
+    if is_admin(user_id):
+        theme_btn_map = {
+            "theme: obsidian": "obsidian",
+            "theme: minimal": "minimal",
+            "theme: cyber": "cyber",
+            "theme: royal": "royal",
+        }
+        if low in theme_btn_map:
+            ACTIVE_THEME = theme_btn_map[low]
+            save_setting_db("active_theme", ACTIVE_THEME)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"  ∙ <b>Active Theme:</b> <code>{esc(get_theme()['label'])}</code>",
+                reply_markup=theme_sub_keyboard(),
+            )
+            return
+
+        notif_btn_map = {
+            "mode: detailed": "detailed",
+            "mode: compact": "compact",
+            "mode: alerts only": "alerts_only",
+            "mode: digest": "digest",
+        }
+        if low in notif_btn_map:
+            NOTIF_STYLE = notif_btn_map[low]
+            save_setting_db("notif_style", NOTIF_STYLE)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"  ∙ <b>Notification Mode:</b> <code>{esc(NOTIF_STYLE)}</code>",
+                reply_markup=notif_demo_sub_keyboard(),
+            )
+            return
+
+        demo_btn_map = {
+            "demo: 2h down": "2h",
+            "demo: 10h down": "10h",
+            "demo: 1d down": "1d",
+            "demo: recovered": "recovered",
+        }
+        if low in demo_btn_map:
+            await send_notification_demo(
+                chat_id, demo_btn_map[low], context.bot
+            )
+            return
+
+    # 7. Menu & Action Buttons
     btn_map: dict[str, str] = {
         "🔐 login": "login",
         "📖 manual": "manual",
+        "🎮 games lounge": "games_lounge",
+        "🎲 tic-tac-toe": "game_ttt",
+        "🔢 number guess": "game_guess",
+        "✂ rock paper scissors": "game_rps",
         "◈ status": "status",
         "◈ all sites": "allsite",
         "🌐 site dashboard": "dash_menu",
         "🔎 open site by id/name": "ask_dash_target",
+        "⭐ pin site": "pin_last_site",
+        "⭐ watchlist": "watchlist",
+        "📋 shift summary": "shift_summary",
         "📡 api report": "api_menu",
         "📅 today api report": "ask_api_today",
         "🗓 custom date report": "ask_api_custom",
@@ -3892,10 +4788,18 @@ async def handle_text_message(
         "📥 export csv": "csv",
         "∙ online": "online",
         "📌 unassigned": "unassigned",
+        "❄ stale sites": "stale_sites",
         "⬅ previous": "prev",
         "next ➡": "next",
         "🤖 ai suite": "aireport",
         "🚪 logout": "logout",
+        "🛡 admin panel": "admin_menu",
+        "🎨 themes": "theme_menu",
+        "🔔 notif & demo": "notif_menu",
+        "⏱ sync interval": "ask_refresh",
+        "🛠 maintenance": "ask_maint",
+        "⚡ bot on/off": "toggle_bot",
+        "🧹 clear alerts": "clear_alerts",
     }
     action = btn_map.get(low)
 
@@ -3903,7 +4807,34 @@ async def handle_text_message(
         await send_login_prompt(chat_id, context.bot)
         return
     if action == "manual":
-        await send_manual_view(chat_id, context.bot)
+        await send_manual_view(chat_id, user_id, context.bot)
+        return
+    if action == "games_lounge":
+        await open_games_lounge(chat_id, user_id, context.bot)
+        return
+    if action == "game_ttt":
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            start_ttt_game(chat_id),
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
+        return
+    if action == "game_guess":
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            start_guess_game(chat_id),
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
+        return
+    if action == "game_rps":
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            start_rps_game(chat_id),
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
         return
     if action == "status":
         await send_status_action(chat_id, context.bot)
@@ -3920,7 +4851,7 @@ async def handle_text_message(
                 context.bot,
                 chat_id,
                 "  ▸ Pehle login karein (<code>/login</code>):",
-                reply_markup=guest_reply_keyboard(),
+                reply_markup=guest_keyboard_for_chat(chat_id),
             )
             return
         AWAITING_INPUT[chat_id] = {"kind": "dash_target"}
@@ -3930,16 +4861,40 @@ async def handle_text_message(
             "  ▸ Site ka <b>Number</b>, <b>Serial No</b>, <b>Site ID</b>, ya <b>Naam</b> bhejein:",
         )
         return
+    if action == "pin_last_site":
+        st = LAST_PAGE_STATE.get(chat_id) or {}
+        skey = str(st.get("site_key") or "").strip()
+        if not skey:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                "  ▸ Pehle koi site dashboard kholein, phir <code>⭐ Pin Site</code> dabayein.",
+            )
+            return
+        added, wlist = toggle_watchlist_site(chat_id, skey)
+        status_w = "Pinned to Watchlist" if added else "Removed from Watchlist"
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"  ∙ <b>{esc(status_w)}:</b> <code>{esc(skey)}</code> (Total: <b>{len(wlist)}</b>)",
+        )
+        return
+    if action == "watchlist":
+        await send_watchlist_view(chat_id, context.bot)
+        return
+    if action == "shift_summary":
+        await send_shift_summary(chat_id, context.bot)
+        return
     if action == "api_menu":
         await open_api_report_menu(chat_id, context.bot)
         return
     if action == "ask_api_today":
         if not require_auth(chat_id):
             await safe_send_html(
-                context.bot,
+                bot,
                 chat_id,
                 "  ▸ Pehle login karein (<code>/login</code>):",
-                reply_markup=guest_reply_keyboard(),
+                reply_markup=guest_keyboard_for_chat(chat_id),
             )
             return
         AWAITING_INPUT[chat_id] = {"kind": "api_today_target"}
@@ -3955,7 +4910,7 @@ async def handle_text_message(
                 context.bot,
                 chat_id,
                 "  ▸ Pehle login karein (<code>/login</code>):",
-                reply_markup=guest_reply_keyboard(),
+                reply_markup=guest_keyboard_for_chat(chat_id),
             )
             return
         AWAITING_INPUT[chat_id] = {"kind": "api_custom_date"}
@@ -3990,6 +4945,9 @@ async def handle_text_message(
     if action == "unassigned":
         await send_unassigned_page(chat_id, 0, context.bot)
         return
+    if action == "stale_sites":
+        await send_stale_sites_view(chat_id, context.bot)
+        return
     if action == "prev":
         await step_pagination(chat_id, -1, context.bot)
         return
@@ -4002,8 +4960,52 @@ async def handle_text_message(
     if action == "logout":
         await send_logout_action(chat_id, context.bot)
         return
+    if action == "admin_menu" and is_admin(user_id):
+        await open_admin_panel(chat_id, context.bot)
+        return
+    if action == "theme_menu" and is_admin(user_id):
+        await open_theme_menu(chat_id, context.bot)
+        return
+    if action == "notif_menu" and is_admin(user_id):
+        await open_notif_demo_menu(chat_id, context.bot)
+        return
+    if action == "ask_refresh" and is_admin(user_id):
+        AWAITING_INPUT[chat_id] = {"kind": "set_refresh_val"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"  ▸ Naya sync interval seconds mein bhejein (15–3600, current: <code>{REFRESH_INTERVAL_SEC}s</code>):",
+        )
+        return
+    if action == "ask_maint" and is_admin(user_id):
+        AWAITING_INPUT[chat_id] = {"kind": "set_maint_msg"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "  ▸ Maintenance message bhejein (ya band karne ke liye <code>OFF</code> bhejein):",
+        )
+        return
+    if action == "toggle_bot" and is_admin(user_id):
+        BOT_ENABLED = not BOT_ENABLED
+        save_setting_db("bot_enabled", "1" if BOT_ENABLED else "0")
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"  ∙ <b>Bot Status:</b> <code>{'ON' if BOT_ENABLED else 'OFF'}</code>",
+            reply_markup=admin_sub_keyboard(),
+        )
+        return
+    if action == "clear_alerts" and is_admin(user_id):
+        clear_all_alerts_for_chat(chat_id)
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "  ∙ <b>Sent stage alerts cleared.</b>",
+            reply_markup=admin_sub_keyboard(),
+        )
+        return
 
-    # 6. AI Chat Mode or Direct AI Query
+    # 8. AI Chat Mode or Direct AI Query
     if chat_id in AI_CHAT_MODE:
         await send_ai_answer_action(chat_id, raw_text, context.bot)
         return
@@ -4012,12 +5014,12 @@ async def handle_text_message(
         context.bot,
         chat_id,
         "  ▸ Menu button ya command use karein. Poori guide ke liye <code>📖 Manual</code> ya <code>/help</code> bhejein.",
-        reply_markup=current_keyboard_for_chat(chat_id),
+        reply_markup=current_keyboard_for_chat(chat_id, user_id),
     )
 
 
 # ==============================================================================
-# BACKGROUND MONITOR: 2H -> 10H -> 1D (1-TIME PER STAGE) + AUTO-RECOVERY
+# BACKGROUND MONITOR: 2H -> 10H -> 1D (1-TIME PER STAGE) + DIGEST & RECOVERY
 # ==============================================================================
 ALERT_STAGES: list[tuple[str, float, str]] = [
     ("2h", 2.0, "2ʜ ᴅᴏᴡɴ"),
@@ -4050,7 +5052,10 @@ async def background_monitor_loop(app) -> None:
                     analysis = await asyncio.to_thread(
                         run_self_analysis, session
                     )
+                    sess_data["fail_streak"] = 0
                 except Exception as exc:
+                    sess_data["fail_streak"] = sess_data.get("fail_streak", 0) + 1
+                    ensure_live_session(chat_id, sess_data)
                     logger.warning("Monitor poll error chat %s: %s", chat_id, exc)
                     continue
 
@@ -4068,23 +5073,26 @@ async def background_monitor_loop(app) -> None:
                             d.get("is_connected")
                         )
 
+                batch_lines: list[str] = []
+
                 for dev in analysis.get("all_devices", []):
                     serial = dev.get("serial_no", "N/A")
                     is_conn = bool(dev.get("is_connected"))
                     off_hrs = dev.get("offline_hours")
+                    label = format_industry_site_label(
+                        dev.get("industry", "N/A"), dev.get("site", "N/A")
+                    )
 
                     if is_conn:
                         if prev_conn_map.get(serial) is False:
                             clear_stage_alerts_for_device(chat_id, serial)
-                            if NOTIF_STYLE != "alerts_only":
+                            if NOTIF_STYLE not in ("alerts_only", "digest"):
                                 await safe_send_html(
                                     app.bot,
                                     chat_id,
                                     (
-                                        "╔══════════════════════╗\n"
-                                        f"║  ∙ <b>{sc('SITE RECOVERED')}</b>     ║\n"
-                                        "╚══════════════════════╝\n"
-                                        f"  ▸ Site   : <b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>\n"
+                                        f"{themed_box('∙ ' + sc('SITE RECOVERED'))}\n"
+                                        f"  ▸ Site   : <b>{label}</b>\n"
                                         f"  ▸ Serial : <b>{esc(serial)}</b>\n"
                                         f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
                                     ),
@@ -4105,19 +5113,35 @@ async def background_monitor_loop(app) -> None:
                                 dev.get("last_seen"),
                                 dev.get("offline_duration"),
                             )
-                            await safe_send_html(
-                                app.bot,
-                                chat_id,
-                                (
-                                    "╔══════════════════════╗\n"
-                                    f"║  • <b>{esc(stage_badge)} ALERT</b>  ║\n"
-                                    "╚══════════════════════╝\n"
-                                    f"  ▸ Site   : <b>{format_industry_site_label(dev.get('industry', 'N/A'), dev.get('site', 'N/A'))}</b>\n"
-                                    f"  ▸ Serial : <b>{esc(serial)}</b>\n"
-                                    f"  ▸ Status : <code>{esc(off_str)}</code>\n"
-                                    f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
-                                ),
-                            )
+                            if NOTIF_STYLE == "digest":
+                                batch_lines.append(
+                                    f"  • [{esc(stage_badge)}] <b>{label}</b> (<code>{esc(serial)}</code>) — <code>{esc(off_str)}</code>"
+                                )
+                            elif NOTIF_STYLE == "compact":
+                                await safe_send_html(
+                                    app.bot,
+                                    chat_id,
+                                    f"▸ • <b>{label}</b> [<code>{esc(stage_badge)}</code>] | <code>{esc(off_str)}</code>",
+                                )
+                            else:
+                                await safe_send_html(
+                                    app.bot,
+                                    chat_id,
+                                    (
+                                        f"{themed_box('• ' + esc(stage_badge) + ' ALERT')}\n"
+                                        f"  ▸ Site   : <b>{label}</b>\n"
+                                        f"  ▸ Serial : <b>{esc(serial)}</b>\n"
+                                        f"  ▸ Status : <code>{esc(off_str)}</code>\n"
+                                        f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
+                                    ),
+                                )
+
+                if batch_lines:
+                    await safe_send_html(
+                        app.bot,
+                        chat_id,
+                        f"{themed_box(sc('DIGEST ALERTS'))}\n" + "\n".join(batch_lines[:15]),
+                    )
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -4140,7 +5164,7 @@ async def post_init(app) -> None:
             BotCommand("age", "Filter bucket (<1d|1w|24d|11m|1y|gt1y>)"),
             BotCommand("next", "Next page"),
             BotCommand("prev", "Previous page"),
-            BotCommand("ai_analyze", "Groq AI telemetry & API report"),
+            BotCommand("ai_analyze", "Compact Groq AI telemetry report"),
             BotCommand("ai", "Ask Groq AI (<question>)"),
             BotCommand("health", "System & parser health"),
             BotCommand("export", "Export devices CSV"),
@@ -4187,6 +5211,7 @@ def main() -> None:
     app.add_handler(CommandHandler("exit_ai", cmd_exit_ai))
 
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("set_theme", cmd_set_theme))
     app.add_handler(CommandHandler("bot_on", cmd_bot_on))
     app.add_handler(CommandHandler("bot_off", cmd_bot_off))
     app.add_handler(CommandHandler("maint_on", cmd_maint_on))
