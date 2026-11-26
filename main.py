@@ -45,15 +45,15 @@ CLIENT_NAME: str = os.getenv("CLIENT_NAME", "BAGGI JAAT").strip() or "BAGGI JAAT
 DB_PATH: str = os.getenv("BOT_DB_PATH", "baggijaat_telemetry.db").strip()
 
 BASE_URL: str = (
-    os.getenv("ENVIRO_BASE_URL", "https://www.envirofront.com")
+    os.getenv("ENVIRO_BASE_URL", "https://www.envirofront.m2mlogger.com")
     .strip()
     .rstrip("/")
 )
 LOGIN_URL: str = (
-    os.getenv("ENVIRO_LOGIN_URL", f"{BASE_URL}/Account/Login").strip()
+    os.getenv("ENVIRO_LOGIN_URL", f"{BASE_URL}/").strip()
 )
 DEVICES_URL: str = (
-    os.getenv("ENVIRO_DEVICES_URL", f"{BASE_URL}/pae/Device/Devices").strip()
+    os.getenv("ENVIRO_DEVICES_URL", f"{BASE_URL}/pae/ControlPanel/Devices").strip()
 )
 WS_DEVICES_URL: str = (
     os.getenv("ENVIRO_WS_URL", f"{BASE_URL}/ws/Devices.ashx").strip()
