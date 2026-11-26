@@ -353,52 +353,83 @@ def login_envirofront(username: str, password: str) -> tuple[requests.Session | 
     try:
         get_resp = session.get(LOGIN_URL, timeout=25)
         get_resp.raise_for_status()
-        token = extract_verification_token(get_resp.text)
+        soup = BeautifulSoup(get_resp.text, "html.parser")
 
-        payload: dict[str, str] = {
-            "UserName": username.strip(),
-            "Password": password,
-            "RememberMe": "true",
-        }
-        if token:
-            payload["__RequestVerificationToken"] = token
+        # 1. Form ke saare hidden inputs (including __RequestVerificationToken) automatically collect karo
+        form = soup.find("form")
+        payload: dict[str, str] = {}
+        post_target = LOGIN_URL
 
-        # Strategy 1: Standard POST with redirect tracking
+        if form:
+            action = (form.get("action") or "").strip()
+            if action:
+                post_target = urljoin(BASE_URL, action)
+            for inp in form.find_all("input"):
+                name = (inp.get("name") or "").strip()
+                if not name:
+                    continue
+                itype = (inp.get("type") or "text").lower()
+                val = inp.get("value") or ""
+                if itype in ("hidden", "text", "email"):
+                    payload[name] = val
+
+        # 2. Actual username & password input field names detect karo
+        user_field = "UserName"
+        pass_field = "Password"
+        if form:
+            for inp in form.find_all("input"):
+                name = (inp.get("name") or "").strip()
+                itype = (inp.get("type") or "text").lower()
+                if itype == "password" and name:
+                    pass_field = name
+                elif itype in ("text", "email") and name and "token" not in name.lower():
+                    user_field = name
+
+        payload[user_field] = username.strip()
+        payload[pass_field] = password
+        payload.setdefault("RememberMe", "true")
+
+        # 3. POST login with redirects enabled so ASP.NET auth cookies settle properly
         post_resp = session.post(
-            LOGIN_URL,
+            post_target,
             data=payload,
             timeout=25,
-            allow_redirects=False,
+            allow_redirects=True,
         )
 
         cookies_dict = session.cookies.get_dict()
-        has_auth_cookie = any(
-            "ASPXAUTH" in k.upper() or "AUTH" in k.upper() or "ASP.NET" in k.upper()
-            for k in cookies_dict
+        final_url = (post_resp.url or "").lower()
+
+        # 4. Verify directly against Devices page & WS endpoint
+        verify = session.get(DEVICES_URL, timeout=25, allow_redirects=True)
+        v_url = (verify.url or "").lower()
+        v_low = (verify.text or "").lower()
+
+        # Agar wapas login page par nahi bheja gaya aur password input nahi hai -> SUCCESS
+        on_login_page = (
+            "returnurl=" in v_url
+            or "/account/login" in v_url
+            or 'type="password"' in v_low
+            or "forgot password?" in v_low
         )
-        loc = post_resp.headers.get("Location", "")
 
-        if post_resp.status_code in (301, 302, 303, 307):
-            target = urljoin(BASE_URL, loc or "/pae/ControlPanel/Devices")
-            verify = session.get(target, timeout=25, allow_redirects=True)
-            if verify.ok and is_authenticated_html(verify.text):
-                return session, "OK"
+        if verify.ok and not on_login_page:
+            return session, "OK"
 
-        # Strategy 2: Direct check on Devices URL if cookie was set on 200 OK
-        if has_auth_cookie or post_resp.status_code == 200:
-            verify2 = session.get(DEVICES_URL, timeout=25, allow_redirects=True)
-            if verify2.ok and is_authenticated_html(verify2.text):
-                return session, "OK"
-
-        # Strategy 3: Extract validation summary from returned HTML if login failed
-        soup = BeautifulSoup(post_resp.text or "", "html.parser")
-        err_div = soup.find(class_=re.compile(r"validation-summary-errors|text-danger", re.I))
+        # Error message extract karo agar portal ne koi message diya ho
+        v_soup = BeautifulSoup(post_resp.text or "", "html.parser")
+        err_div = v_soup.find(
+            class_=re.compile(r"validation-summary-errors|text-danger|alert-danger", re.I)
+        )
         if err_div:
             err_txt = " ".join(err_div.get_text(" ", strip=True).split())
             if err_txt:
                 return None, err_txt[:180]
 
-        return None, f"Invalid ID/Password ya session reject (HTTP {post_resp.status_code})."
+        return (
+            None,
+            f"Portal ne login page par wapas bheja (URL: {v_url or final_url}, Cookies: {list(cookies_dict.keys())}). ID/Password check karein.",
+        )
     except requests.Timeout:
         return None, "EnviroFRONT server timeout. Dobara try karein."
     except Exception as exc:
