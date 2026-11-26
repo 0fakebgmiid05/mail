@@ -110,6 +110,7 @@ AI_CHAT_MODE: set[int] = set()
 DASHBOARD_CACHE: dict[str, dict[str, Any]] = {}
 SITE_NAME_CACHE: dict[str, str] = {}
 VAT_CODE_CACHE: dict[str, list[str]] = {}
+SITE_TAGS_CACHE: dict[str, list[str]] = {}
 API_REPORT_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -291,7 +292,6 @@ _SMALL_CAPS_MAP = str.maketrans(
 )
 
 UI_TEXTURE_BAR = "▓▓▒▒░░ ◈ ░░▒▒▓▓"
-UI_DIVIDER = "──────────────────────"
 
 
 def sc(text: str) -> str:
@@ -487,7 +487,9 @@ def dashboard_sub_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
     if quick_row:
         rows.append(quick_row)
 
-    rows.append([KeyboardButton("🔎 Open Site by ID/Name"), KeyboardButton("◈ All Sites")])
+    rows.append(
+        [KeyboardButton("🔎 Open Site by ID/Name"), KeyboardButton("◈ All Sites")]
+    )
     rows.append([KeyboardButton("⬅ Previous"), KeyboardButton("Next ➡")])
     rows.append([KeyboardButton("🏠 Main Menu")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
@@ -496,8 +498,14 @@ def dashboard_sub_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
 def api_report_sub_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📅 Today API Report"), KeyboardButton("🗓 Custom Date Report")],
-            [KeyboardButton("🏭 Site API Report"), KeyboardButton("🌐 Site Dashboard")],
+            [
+                KeyboardButton("📅 Today API Report"),
+                KeyboardButton("🗓 Custom Date Report"),
+            ],
+            [
+                KeyboardButton("🏭 Site API Report"),
+                KeyboardButton("🌐 Site Dashboard"),
+            ],
             [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
@@ -508,8 +516,16 @@ def api_report_sub_keyboard() -> ReplyKeyboardMarkup:
 def aging_sub_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("◦ <1D"), KeyboardButton("▪ <1W"), KeyboardButton("• <24D")],
-            [KeyboardButton("◆ <11M"), KeyboardButton("◈ <1Y"), KeyboardButton("▸ >1Y")],
+            [
+                KeyboardButton("◦ <1D"),
+                KeyboardButton("▪ <1W"),
+                KeyboardButton("• <24D"),
+            ],
+            [
+                KeyboardButton("◆ <11M"),
+                KeyboardButton("◈ <1Y"),
+                KeyboardButton("▸ >1Y"),
+            ],
             [KeyboardButton("⬅ Previous"), KeyboardButton("Next ➡")],
             [KeyboardButton("🏠 Main Menu")],
         ],
@@ -729,7 +745,6 @@ def classify_connection(
             off_td = timedelta(0)
         off_hours = round(off_td.total_seconds() / 3600.0, 2)
 
-    # Numeric status from EnviroFRONT Devices JSON: 2 = Connected, 0 = Disconnected
     if isinstance(raw_status_val, (int, float)) and not isinstance(
         raw_status_val, bool
     ):
@@ -821,6 +836,7 @@ def _extract_list_from_json_payload(data: Any) -> list[dict[str, Any]]:
         return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict):
         for key in (
+            "aaData",
             "data",
             "Data",
             "rows",
@@ -831,7 +847,6 @@ def _extract_list_from_json_payload(data: Any) -> list[dict[str, Any]]:
             "Items",
             "result",
             "Result",
-            "aaData",
         ):
             val = data.get(key)
             if isinstance(val, list) and val:
@@ -1096,6 +1111,19 @@ def fetch_vat_codes_for_site(
     return codes
 
 
+def _safe_parse_json_str(val: Any) -> dict[str, Any]:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str) and val.strip().startswith("{"):
+        try:
+            obj = json.loads(val)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return {}
+
+
 def fetch_site_api_report(
     session: requests.Session,
     site_id: str,
@@ -1113,8 +1141,11 @@ def fetch_site_api_report(
             "total": 0,
             "success": 0,
             "failed": 0,
+            "initial_count": 0,
+            "final_count": 0,
             "latest_ts": "",
             "latest_result": "",
+            "pairs": [],
             "rows": [],
             "error": "Site ID missing",
         }
@@ -1138,7 +1169,7 @@ def fetch_site_api_report(
         "iColumns": "18",
         "sColumns": "," * 17,
         "iDisplayStart": "0",
-        "iDisplayLength": "22",
+        "iDisplayLength": "30",
         "sSearch": "",
         "bRegex": "false",
         "strReportDate": rdate,
@@ -1190,8 +1221,13 @@ def fetch_site_api_report(
             err_msg = f"HTTP {r.status_code}"
         else:
             txt = (r.text or "").strip()
-            if txt and not txt.startswith("<"):
-                parsed = json.loads(txt)
+            if txt.startswith('"') and txt.endswith('"'):
+                try:
+                    txt = json.loads(txt)
+                except Exception:
+                    pass
+            if txt and not str(txt).startswith("<"):
+                parsed = json.loads(txt) if isinstance(txt, str) else txt
                 raw_rows = _extract_list_from_json_payload(parsed)
                 if not raw_rows and isinstance(parsed, dict):
                     for k in ("aaData", "data", "rows", "Result", "result"):
@@ -1206,38 +1242,111 @@ def fetch_site_api_report(
 
     success_cnt = 0
     failed_cnt = 0
+    initial_cnt = 0
+    final_cnt = 0
     latest_ts = ""
     latest_result = ""
 
+    enriched_rows: list[dict[str, Any]] = []
+    grouped_by_req: dict[str, dict[str, Any]] = {}
+
     for item in rows:
-        st_val = str(
-            item.get("Status")
+        dec_req = _safe_parse_json_str(item.get("DecryptedRequest"))
+        dec_resp = _safe_parse_json_str(item.get("DecryptedResponse"))
+
+        proc_raw = str(
+            item.get("Process") or dec_req.get("process") or ""
+        ).strip().upper()
+        if proc_raw in ("I", "INITIAL"):
+            proc_code = "I"
+            proc_label = "INITIAL"
+            initial_cnt += 1
+        elif proc_raw in ("F", "FINAL"):
+            proc_code = "F"
+            proc_label = "FINAL"
+            final_cnt += 1
+        else:
+            proc_code = proc_raw or "?"
+            proc_label = proc_raw or "UNKNOWN"
+
+        req_id = str(
+            item.get("RequestId")
+            or dec_req.get("requestId")
+            or (dec_resp.get("data") or {}).get("RequestId")
+            or "N/A"
+        ).strip()
+        vat_c = str(
+            item.get("VatCode") or dec_req.get("vatCode") or "-"
+        ).strip()
+        unit_c = str(
+            item.get("UnitCode") or dec_req.get("unitCode") or "-"
+        ).strip()
+        req_type = str(
+            item.get("RequestType") or dec_req.get("upDown") or ""
+        ).strip()
+        ts_val = str(item.get("Timestamp") or item.get("DateTime") or "").strip()
+
+        bl_val = dec_req.get("bl")
+        len_val = dec_req.get("length")
+
+        resp_status = str(
+            dec_resp.get("userDisplayMesg")
+            or dec_resp.get("status")
             or item.get("Result")
-            or item.get("Process")
+            or item.get("Status")
             or ""
-        ).lower()
-        if any(
-            w in st_val
-            for w in ("success", "ok", "200", "completed", "approved", "valid")
+        ).strip()
+
+        st_low = f"{item.get('Status') or ''} {dec_resp.get('status') or ''} {dec_resp.get('userDisplayMesg') or ''} {item.get('Result') or ''}".lower()
+        if (
+            str(dec_resp.get("errorCode") or "") == "200"
+            or "success" in st_low
+            or re.search(r"\bs\b", st_low)
         ) and not any(
-            w in st_val
+            w in st_low
             for w in ("fail", "error", "invalid", "reject", "timeout")
         ):
             success_cnt += 1
-        elif st_val:
+        elif st_low.strip():
             failed_cnt += 1
 
-        ts_val = str(item.get("Timestamp") or item.get("DateTime") or "").strip()
-        res_val = str(
-            item.get("Result")
-            or item.get("Status")
-            or item.get("DecryptedResponse")
-            or ""
-        ).strip()
         if ts_val and not latest_ts:
             latest_ts = ts_val
-        if res_val and not latest_result:
-            latest_result = res_val[:80]
+        if resp_status and not latest_result:
+            latest_result = f"[{proc_code}] {req_id} → {resp_status}"[:90]
+
+        entry = {
+            "request_id": req_id,
+            "process": proc_code,
+            "process_label": proc_label,
+            "vat_code": vat_c,
+            "unit_code": unit_c,
+            "request_type": req_type,
+            "timestamp": ts_val,
+            "bl": bl_val,
+            "length": len_val,
+            "status_text": resp_status or "N/A",
+        }
+        enriched_rows.append(entry)
+
+        pair_key = f"{req_id}|{vat_c}"
+        pair_obj = grouped_by_req.setdefault(
+            pair_key,
+            {
+                "request_id": req_id,
+                "vat_code": vat_c,
+                "unit_code": unit_c,
+                "request_type": req_type,
+                "initial": None,
+                "final": None,
+            },
+        )
+        if req_type and not pair_obj.get("request_type"):
+            pair_obj["request_type"] = req_type
+        if proc_code == "I" and pair_obj["initial"] is None:
+            pair_obj["initial"] = entry
+        elif proc_code == "F" and pair_obj["final"] is None:
+            pair_obj["final"] = entry
 
     res_obj = {
         "ok": not bool(err_msg),
@@ -1247,9 +1356,12 @@ def fetch_site_api_report(
         "total": len(rows),
         "success": success_cnt,
         "failed": failed_cnt,
+        "initial_count": initial_cnt,
+        "final_count": final_cnt,
         "latest_ts": latest_ts,
         "latest_result": latest_result,
-        "rows": rows[:15],
+        "pairs": list(grouped_by_req.values())[:10],
+        "rows": enriched_rows[:16],
         "error": err_msg,
         "_ts": time.time(),
     }
@@ -1260,16 +1372,26 @@ def fetch_site_api_report(
 def _discover_dashboard_tags_and_page(
     session: requests.Session, site_id: str
 ) -> tuple[str, str]:
-    dash_page_url = f"{BASE_URL}/{UAC}/Site/{site_id}/Dashboard"
+    sid = str(site_id or "").strip()
+    dash_page_url = f"{BASE_URL}/{UAC}/Site/{sid}/Dashboard"
+    if sid in SITE_TAGS_CACHE and SITE_TAGS_CACHE[sid]:
+        return ",".join(SITE_TAGS_CACHE[sid]), dash_page_url
+
     discovered_tags: list[str] = []
     seen_tags: set[str] = set()
 
     def add_tag(t: str) -> None:
         clean = " ".join(str(t or "").split()).strip()
-        if clean and len(clean) <= 40 and clean not in seen_tags:
+        if (
+            clean
+            and len(clean) <= 45
+            and clean.lower() not in ("timestamps", "null", "undefined")
+            and clean not in seen_tags
+        ):
             seen_tags.add(clean)
             discovered_tags.append(clean)
 
+    # 1. Scrape Dashboard HTML & inline scripts for tag names
     try:
         r = session.get(dash_page_url, timeout=20, allow_redirects=True)
         if r.ok and "account/login" not in r.url.lower():
@@ -1277,17 +1399,40 @@ def _discover_dashboard_tags_and_page(
             for m in re.finditer(r"[?&]tags=([^&\"'\s]+)", raw, re.IGNORECASE):
                 for part in m.group(1).replace("%2C", ",").split(","):
                     add_tag(part)
-            for m in re.finditer(r"\b(EST-[A-Za-z0-9\-_]+)\b", raw):
-                add_tag(m.group(1))
+            # Distillery & Bottling common tag tokens
+            for m in re.finditer(
+                r"\b((?:EST|LT|CBH|CBT|CBV|CET|CMFM|FM|FL|BT|BL|SV|AS|T)[A-Za-z0-9\-_]*)\b",
+                raw,
+            ):
+                tok = m.group(1)
+                if len(tok) >= 3 and any(ch.isdigit() for ch in tok):
+                    add_tag(tok)
     except Exception:
         pass
 
+    # 2. If site has VAT codes, include VAT code & -BL variants
+    vat_codes = fetch_vat_codes_for_site(session, sid, dash_page_url)
+    for vc in vat_codes:
+        add_tag(vc)
+        if not vc.upper().endswith("-BL"):
+            add_tag(f"{vc}-BL")
+
+    # 3. Fallback pool covering Distillery + Bottling tags
     if not discovered_tags:
-        for t in (
-            "EST-1,EST-1-BL,EST-2,EST-2-BL,EST-3,EST-3-BL,EST-4,EST-4-BL,EST-5,EST-5-BL"
-        ).split(","):
+        fallback_pool = (
+            "EST-1,EST-1-BL,EST-2,EST-2-BL,EST-3,EST-3-BL,EST-4,EST-4-BL,EST-5,EST-5-BL,"
+            "LT2023-A,LT2023-A-BL,LT2023-B,LT2023-B-BL,LT2023-C,LT2023-C-BL,"
+            "LT706-A,LT706-A-BL,LT706-B,LT706-B-BL,"
+            "LT708-A,LT708-A-BL,LT708-B,LT708-B-BL,LT708-C,LT708-C-BL,LT708-D,LT708-D-BL,LT708-E,LT708-E-BL,LT708-F,LT708-F-BL,"
+            "CBH-1-BL,CBH-2-BL,CBH-3-BL,CBH-4-BL,CBH-5-BL,"
+            "CBT-1-BL,CBT-2-BL,CBT-4-BL,CBT-6-BL,CBT-8-BL,"
+            "CET-1,CET-1-BL,CET-2,CET-2-BL,CET-3,CET-3-BL,"
+            "CMFM-1-TOT,CMFM-2-TOT,CMFM-3-TOT,CMFM-4-TOT"
+        )
+        for t in fallback_pool.split(","):
             add_tag(t)
 
+    SITE_TAGS_CACHE[sid] = discovered_tags
     return ",".join(discovered_tags), dash_page_url
 
 
@@ -1299,12 +1444,24 @@ def _format_num(val: Any) -> str:
     return str(val).strip()
 
 
+def _classify_reading_category(tag_name: str, unit_str: str) -> str:
+    t_up = (tag_name or "").upper()
+    u_low = (unit_str or "").strip().lower()
+    if u_low == "mm":
+        return "level_mm"
+    if u_low in ("l", "ltr", "lit", "bl") or t_up.endswith(("-BL", "-L")):
+        return "volume_l"
+    if any(k in t_up for k in ("FM", "FL", "TOT", "FLOW", "METER")):
+        return "instrument"
+    return "instrument"
+
+
 def _parse_dashboard_stats_and_tags(
     payload: dict[str, Any],
 ) -> list[dict[str, str]]:
     """
     Parses EnviroFRONT Dashboard JSON structure:
-    Tags:  [["LT2023-A", "mm"], ["LT2023-A-BL", "L"], ...]
+    Tags:  [["LT2023-A", "mm"], ["LT2023-A-BL", "L"], ["CBH-1-BL", "L"], ...]
     Stats: [["LT2023-A", latest, avg, min, max], ...]
     """
     if not isinstance(payload, dict):
@@ -1351,10 +1508,14 @@ def _parse_dashboard_stats_and_tags(
 
             val_str = _format_num(chosen)
             unit_str = unit_map.get(tag_name, "")
+            if not unit_str and tag_name.upper().endswith("-BL"):
+                unit_str = "L"
+
             extra_str = ""
             if latest_val is None and avg_val is not None:
                 extra_str = "avg"
 
+            cat = _classify_reading_category(tag_name, unit_str)
             dedup = f"{tag_name.lower()}|{val_str}|{unit_str}"
             if dedup not in seen:
                 seen.add(dedup)
@@ -1364,6 +1525,7 @@ def _parse_dashboard_stats_and_tags(
                         "value": val_str[:40],
                         "unit": unit_str[:16],
                         "extra": extra_str,
+                        "category": cat,
                     }
                 )
 
@@ -1423,8 +1585,13 @@ def scrape_site_dashboard_details(
             err_msg = f"Dashboard WS HTTP {r.status_code}"
         else:
             txt = (r.text or "").strip()
-            if txt and not txt.startswith("<"):
-                payload = json.loads(txt)
+            if txt.startswith('"') and txt.endswith('"'):
+                try:
+                    txt = json.loads(txt)
+                except Exception:
+                    pass
+            if txt and not str(txt).startswith("<"):
+                payload = json.loads(txt) if isinstance(txt, str) else txt
                 instruments = _parse_dashboard_stats_and_tags(payload)
             else:
                 err_msg = "Empty or non-JSON dashboard response"
@@ -1439,7 +1606,7 @@ def scrape_site_dashboard_details(
         "site_code": site_code,
         "site_name_ws": site_name_ws,
         "url": dash_page_url,
-        "instruments": instruments[:30],
+        "instruments": instruments[:35],
         "api_report": api_report,
         "error": err_msg,
         "_ts": time.time(),
@@ -1748,6 +1915,8 @@ def enrich_context_with_live_dashboards(
                 "api_report_summary": {
                     "date": rep.get("report_date"),
                     "total": rep.get("total", 0),
+                    "initial": rep.get("initial_count", 0),
+                    "final": rep.get("final_count", 0),
                     "success": rep.get("success", 0),
                     "failed": rep.get("failed", 0),
                     "latest_result": rep.get("latest_result", ""),
@@ -1853,7 +2022,7 @@ def generate_ai_analysis(
     sys_p = (
         f"Tum {CLIENT_NAME} ke EnviroFRONT / M2M telemetry command suite ke principal AI engineer ho. "
         "Hinglish mein executive, crisp bullet points mein report do (bina markdown tables ke aur bina ** asterisks ke). "
-        "Connection health, offline aging, tank/mm/L dashboard readings aur UP Excise API Report status ko priority do."
+        "Connection health, offline aging, Distillery/Bottling mm/L/instrument readings aur UP Excise Initial/Final API Report status ko priority do."
     )
     usr_p = f"LIVE TELEMETRY & DASHBOARD DATA:\n{ctx}"
     return call_groq_ai(sys_p, usr_p, analysis)
@@ -2005,16 +2174,16 @@ async def send_manual_view(chat_id: int, bot) -> None:
         "  ▸ <code>/login</code> ya <code>🔐 Login</code> dabakar Email/ID aur Password dein.\n"
         "  ▸ Password bhejte hi security ke liye message auto-delete ho jata hai.\n\n"
         "<b>2. Dynamic Context Buttons</b>\n"
-        "  ▸ <code>🌐 Site Dashboard</code> → Quick site buttons + kisi bhi site ka dashboard open karne ka option.\n"
-        "  ▸ <code>📡 API Report</code> → Today report, custom date report, aur site-wise UP Excise logs.\n"
+        "  ▸ <code>🌐 Site Dashboard</code> → Quick site buttons + Distillery/Bottling mm/L/instrument readings.\n"
+        "  ▸ <code>📡 API Report</code> → Initial (I) &amp; Final (F) pairs, RequestId, VAT codes &amp; date logs.\n"
         "  ▸ <code>⏳ Aging</code> → Offline aging buckets (<code>&lt;1D</code>, <code>&lt;1W</code>, <code>&lt;24D</code>, <code>&lt;11M</code>, <code>&lt;1Y</code>, <code>&gt;1Y</code>).\n"
         "  ▸ <code>⚙ Ops &amp; Export</code> → System health, CSV export, online &amp; unassigned devices.\n\n"
         "<b>3. Direct Commands</b>\n"
         "  • <code>/status</code> — Live summary, aging &amp; top offline sites\n"
         "  • <code>/allsite [page]</code> — Assigned sites list\n"
-        "  • <code>/dash &lt;no/serial/name&gt;</code> — Site dashboard + API report\n"
-        "  • <code>/apireport &lt;site&gt; [DD-Mon-YYYY]</code> — Excise API logs\n"
-        "  • <code>/instruments [search]</code> — Tank / mm / L readings\n"
+        "  • <code>/dash &lt;no/serial/name&gt;</code> — Site dashboard + Initial/Final API report\n"
+        "  • <code>/apireport &lt;site&gt; [DD-Mon-YYYY]</code> — Excise API logs &amp; RequestId pairs\n"
+        "  • <code>/instruments [search]</code> — Tank / mm / L / instrument readings\n"
         "  • <code>/next</code> &amp; <code>/prev</code> — List pagination\n"
         "  • <code>/ai &lt;question&gt;</code> | <code>/ai_analyze</code> | <code>/exit_ai</code>"
     )
@@ -2057,7 +2226,11 @@ async def open_dashboard_menu(chat_id: int, bot) -> None:
         f"║  ◈ <b>{sc('SITE DASHBOARD HUB')}</b>\n"
         "╚══════════════════════╝\n"
         f"{UI_TEXTURE_BAR}\n"
-        + ("\n".join(quick_lines) if quick_lines else "  ▸ Koi site list nahi mili")
+        + (
+            "\n".join(quick_lines)
+            if quick_lines
+            else "  ▸ Koi site list nahi mili"
+        )
         + "\n\n"
         "  ▸ Upar quick button dabayein, ya <code>🔎 Open Site by ID/Name</code> / <code>/dash &lt;no/serial/name&gt;</code> use karein."
     )
@@ -2083,7 +2256,7 @@ async def open_api_report_menu(chat_id: int, bot) -> None:
         "╚══════════════════════╝\n"
         f"{UI_TEXTURE_BAR}\n"
         f"  ▸ Today Date : <code>{esc(today_ist_report_date())}</code>\n"
-        "  ▸ <code>📅 Today API Report</code> — Aaj ki report ke liye site/no/serial bhejein\n"
+        "  ▸ <code>📅 Today API Report</code> — Initial (I) &amp; Final (F) pairs + RequestId\n"
         "  ▸ <code>🗓 Custom Date Report</code> — Site aur date (<code>DD-Mon-YYYY</code>) dein\n"
         "  ▸ <code>🏭 Site API Report</code> — Kisi bhi site ka report check karein"
     )
@@ -2424,6 +2597,52 @@ async def send_allsite_page(chat_id: int, page: int, bot) -> None:
         )
 
 
+def _format_excise_pairs_and_rows(rep: dict[str, Any]) -> list[str]:
+    out: list[str] = [
+        f"\n\n<b>◈ {sc('UP EXCISE API REPORT')} ({esc(rep.get('report_date') or today_ist_report_date())})</b>",
+        f"  ▸ VAT Codes : <code>{esc(', '.join(rep.get('vat_codes') or []) or 'N/A')}</code>",
+        f"  ▸ Logs      : <b>{rep.get('total', 0)}</b> (Initial I: <b>{rep.get('initial_count', 0)}</b> | Final F: <b>{rep.get('final_count', 0)}</b>)",
+        f"  ▸ Status    : Ok <b>{rep.get('success', 0)}</b> | Err <b>{rep.get('failed', 0)}</b>",
+    ]
+    pairs = rep.get("pairs") or []
+    if pairs:
+        out.append(f"  <b>▸ {sc('RequestID Pairs (Initial → Final)')}</b>")
+        for p in pairs[:6]:
+            rid = p.get("request_id") or "N/A"
+            vc = p.get("vat_code") or "-"
+            rt = f" [{p.get('request_type')}]" if p.get("request_type") else ""
+            ini = p.get("initial")
+            fin = p.get("final")
+
+            ini_str = (
+                f"I: {ini.get('timestamp')} (mm:{ini.get('length')}, L:{ini.get('bl')})"
+                if ini
+                else "I: -"
+            )
+            fin_str = (
+                f"F: {fin.get('timestamp')} (mm:{fin.get('length')}, L:{fin.get('bl')})"
+                if fin
+                else "F: Pending"
+            )
+            out.append(
+                f"    • <code>{esc(rid)}</code> | VAT: <code>{esc(vc)}{esc(rt)}</code>\n"
+                f"      ↳ <code>{esc(ini_str)}</code>\n"
+                f"      ↳ <code>{esc(fin_str)}</code>"
+            )
+    elif rep.get("rows"):
+        for idx, row in enumerate(rep["rows"][:8], start=1):
+            out.append(
+                f"  {idx}. [<code>{esc(row.get('process'))}</code>] <code>{esc(row.get('request_id'))}</code> "
+                f"({esc(row.get('vat_code'))}) → <code>{esc(row.get('status_text'))}</code>"
+            )
+    else:
+        out.append("  ▸ <code>Is date ke liye koi API request log nahi mila.</code>")
+
+    if rep.get("error"):
+        out.append(f"  • Report Note: <code>{esc(rep.get('error'))}</code>")
+    return out
+
+
 async def send_site_dashboard_by_target(
     chat_id: int, target: str, bot
 ) -> None:
@@ -2508,10 +2727,10 @@ async def send_site_dashboard_by_target(
     )
 
     if dash.get("instruments"):
-        inst_lines = [f"<b>◈ {sc('LIVE DASHBOARD READINGS')}</b>"]
-        for i, inst in enumerate(dash["instruments"][:20], start=1):
+        inst_lines = [f"<b>◈ {sc('LIVE DASHBOARD READINGS (MM / L / INST)')}</b>"]
+        for i, inst in enumerate(dash["instruments"][:25], start=1):
             u = f" {inst['unit']}" if inst.get("unit") else ""
-            tag_note = f" ({inst['extra']})" if inst.get("extra") else ""
+            tag_note = f" [{inst['extra']}]" if inst.get("extra") else ""
             inst_lines.append(
                 f"  {i}. ▸ <b>{esc(inst['name'])}</b> : <code>{esc(inst['value'])}{esc(u)}</code>{esc(tag_note)}"
             )
@@ -2524,21 +2743,8 @@ async def send_site_dashboard_by_target(
         )
 
     rep = dash.get("api_report") or {}
-    vat_list = rep.get("vat_codes") or []
-    vat_str = ", ".join(vat_list[:6]) if vat_list else "N/A"
-    api_lines = [
-        f"\n\n<b>◈ {sc('UP EXCISE API REPORT')} ({esc(rep.get('report_date') or today_ist_report_date())})</b>",
-        f"  ▸ VAT Codes : <code>{esc(vat_str)}</code>",
-        f"  ▸ Requests  : <b>{rep.get('total', 0)}</b> | Ok: <b>{rep.get('success', 0)}</b> | Err: <b>{rep.get('failed', 0)}</b>",
-    ]
-    if rep.get("latest_ts"):
-        api_lines.append(f"  ▸ Last Req  : <code>{esc(rep.get('latest_ts'))}</code>")
-    if rep.get("latest_result"):
-        api_lines.append(f"  ▸ Result    : <code>{esc(rep.get('latest_result'))}</code>")
-    if rep.get("error"):
-        api_lines.append(f"  • Report Note: <code>{esc(rep.get('error'))}</code>")
-
-    await safe_edit_html(loader, header + inst_section + "\n".join(api_lines))
+    api_lines = _format_excise_pairs_and_rows(rep)
+    await safe_edit_html(loader, header + inst_section + "".join(api_lines))
 
 
 async def send_api_report_action(
@@ -2586,7 +2792,6 @@ async def send_api_report_action(
         fetch_site_api_report, sess_data["session"], sid, rdate
     )
 
-    vat_str = ", ".join(rep.get("vat_codes") or []) or "N/A"
     lines = [
         "╔══════════════════════╗",
         f"║  ◈ <b>{sc('API REPORT')}</b>",
@@ -2594,21 +2799,9 @@ async def send_api_report_action(
         UI_TEXTURE_BAR,
         f"  ▸ Site      : <b>{esc(dev['industry'])}</b> (ID: <code>{esc(sid)}</code>)",
         f"  ▸ Date      : <code>{esc(rdate)}</code>",
-        f"  ▸ VAT Codes : <code>{esc(vat_str)}</code>",
-        f"  ▸ Total Logs: <b>{rep.get('total', 0)}</b> | Ok: <b>{rep.get('success', 0)}</b> | Err: <b>{rep.get('failed', 0)}</b>",
     ]
-    for idx, row in enumerate(rep.get("rows", [])[:10], start=1):
-        ts = str(row.get("Timestamp") or row.get("DateTime") or "N/A")
-        vc = str(row.get("VatCode") or row.get("UnitCode") or "-")
-        st = str(row.get("Result") or row.get("Status") or "N/A")[:60]
-        lines.append(
-            f"  {idx}. <code>{esc(ts)}</code> [{esc(vc)}] → <code>{esc(st)}</code>"
-        )
-
-    if not rep.get("rows"):
-        lines.append("  ▸ <code>Is date ke liye koi API request log nahi mila.</code>")
-
-    await safe_edit_html(loader, "\n".join(lines))
+    lines.extend(_format_excise_pairs_and_rows(rep))
+    await safe_edit_html(loader, "".join(lines))
 
 
 async def send_instruments_view(
@@ -2664,7 +2857,7 @@ async def send_instruments_view(
 
     loader = await bot.send_message(
         chat_id=chat_id,
-        text="◈ Fetching dashboard tag & instrument readings...",
+        text="◈ Fetching Distillery & Bottling tag/instrument readings...",
     )
 
     blocks: list[str] = [
@@ -2688,7 +2881,7 @@ async def send_instruments_view(
         )
         insts = dash.get("instruments") or []
         if insts:
-            for item in insts[:8]:
+            for item in insts[:10]:
                 u = f" {item['unit']}" if item.get("unit") else ""
                 blocks.append(
                     f"│  • {esc(item['name'])} : <code>{esc(item['value'])}{esc(u)}</code>"
@@ -3651,8 +3844,11 @@ async def handle_text_message(
             )
             return
         if kind == "api_custom_date":
-            # Expected: "<site> <DD-Mon-YYYY>" or "<site>|<DD-Mon-YYYY>"
-            parts = re.split(r"\s*\|\s*|\s+(?=\d{2}-[A-Za-z]{3}-\d{4}$)", raw_text, maxsplit=1)
+            parts = re.split(
+                r"\s*\|\s*|\s+(?=\d{2}-[A-Za-z]{3}-\d{4}$)",
+                raw_text,
+                maxsplit=1,
+            )
             if len(parts) == 2:
                 await send_api_report_action(
                     chat_id, parts[0].strip(), parts[1].strip(), context.bot
@@ -3663,7 +3859,7 @@ async def handle_text_message(
                 )
             return
 
-    # 4. Quick numbered site buttons from dashboard sub-menu ("#1 Malbros...")
+    # 4. Quick numbered site buttons from dashboard sub-menu
     m_quick = re.match(r"^#(\d+)\b", raw_text)
     if m_quick and MENU_STATE.get(chat_id) == "dash_menu":
         await send_site_dashboard_by_target(
@@ -3937,7 +4133,7 @@ async def post_init(app) -> None:
             BotCommand("allsite", "Assigned sites list"),
             BotCommand("dash", "Site dashboard + API report"),
             BotCommand("apireport", "UP Excise API report (<site> [date])"),
-            BotCommand("instruments", "Tank / mm / L readings"),
+            BotCommand("instruments", "Tank / mm / L / instrument readings"),
             BotCommand("online", "Connected devices"),
             BotCommand("unassigned", "Unassigned N/A devices"),
             BotCommand("aging", "Aging buckets menu"),
