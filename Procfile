@@ -1,2 +1,1 @@
-worker: python main.py
-companion: python companion_bot.py
+worker: python run_bots.py
