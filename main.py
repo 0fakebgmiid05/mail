@@ -7,8 +7,10 @@ import logging
 import os
 import random
 import re
+import shutil
 import sqlite3
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urljoin
@@ -44,6 +46,8 @@ ADMIN_TG_ID: int = int(
 )
 CLIENT_NAME: str = os.getenv("CLIENT_NAME", "BAAGI JAAT").strip() or "BAAGI JAAT"
 DB_PATH: str = os.getenv("BOT_DB_PATH", "baagijaat_telemetry.db").strip()
+BACKUP_DIR: str = os.getenv("BOT_BACKUP_DIR", "backups").strip() or "backups"
+SCRIPT_PATH: str = os.path.abspath(__file__)
 
 # EnviroFRONT / M2M Logger Endpoints
 BASE_URL: str = (
@@ -101,9 +105,17 @@ REFRESH_INTERVAL_SEC: int = 60
 NOTIF_STYLE: str = "detailed"  # detailed | compact | alerts_only | digest
 ACTIVE_THEME: str = "obsidian"  # obsidian | minimal | cyber | royal
 
+# Circuit Breaker & Error / Patch State
+PORTAL_FAIL_COUNT: int = 0
+PORTAL_CIRCUIT_OPEN_UNTIL: float = 0.0
+LAST_ERROR_LOG: dict[str, Any] = {}
+PENDING_AI_PATCH: dict[str, Any] = {}
+PATCH_HISTORY: list[dict[str, Any]] = []
+
 # Session, Navigation, Watchlist, Games & Cache State
 USER_SESSIONS: dict[int, dict[str, Any]] = {}
 LAST_SNAPSHOT: dict[int, dict[str, Any]] = {}
+PREV_SNAPSHOT: dict[int, dict[str, Any]] = {}
 LAST_PAGE_STATE: dict[int, dict[str, Any]] = {}
 MENU_STACK: dict[int, list[str]] = {}
 MENU_STATE: dict[int, str] = {}
@@ -133,6 +145,16 @@ def is_admin(user_id: int | None) -> bool:
     return user_id is not None and int(user_id) == int(ADMIN_TG_ID)
 
 
+def require_auth(chat_id: int) -> dict[str, Any] | None:
+    sess_data = USER_SESSIONS.get(chat_id)
+    if not sess_data or sess_data.get("step") != "authenticated":
+        return None
+    return sess_data
+
+
+# ==============================================================================
+# PERSISTENT SQLITE DATABASE, BACKUP & AUDIT LOGS
+# ==============================================================================
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -170,6 +192,17 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS patch_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            action TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            backup_file TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -185,6 +218,28 @@ def save_setting_db(key: str, val: str) -> None:
         conn.close()
     except Exception as exc:
         logger.warning("DB save_setting failed: %s", exc)
+
+
+def log_patch_audit_db(action: str, summary: str, backup_file: str) -> None:
+    rec = {
+        "time": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
+        "action": action,
+        "summary": summary,
+        "backup": backup_file,
+    }
+    PATCH_HISTORY.append(rec)
+    if len(PATCH_HISTORY) > 25:
+        PATCH_HISTORY.pop(0)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO patch_audit(created_at, action, summary, backup_file) VALUES(?, ?, ?, ?)",
+            (rec["time"], action, summary, backup_file),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Patch audit DB log failed: %s", exc)
 
 
 def load_persisted_state() -> None:
@@ -228,9 +283,50 @@ def load_persisted_state() -> None:
             "SELECT chat_id, site_key FROM user_watchlist"
         ):
             WATCHLIST_SITES.setdefault(int(chat_id), []).append(str(site_key))
+
+        for created_at, action, summary, backup_file in cur.execute(
+            "SELECT created_at, action, summary, backup_file FROM patch_audit ORDER BY id DESC LIMIT 15"
+        ):
+            PATCH_HISTORY.append(
+                {
+                    "time": created_at,
+                    "action": action,
+                    "summary": summary,
+                    "backup": backup_file,
+                }
+            )
         conn.close()
     except Exception as exc:
         logger.warning("DB load_persisted_state failed: %s", exc)
+
+
+def create_script_backup(tag: str = "manual") -> str:
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
+        b_path = os.path.join(
+            BACKUP_DIR, f"{os.path.basename(SCRIPT_PATH)}.{stamp}.{tag}.bak"
+        )
+        shutil.copy2(SCRIPT_PATH, b_path)
+        return b_path
+    except Exception as exc:
+        logger.warning("Backup creation failed: %s", exc)
+        return ""
+
+
+def get_latest_backup_file() -> str | None:
+    if not os.path.isdir(BACKUP_DIR):
+        return None
+    files = sorted(
+        [
+            os.path.join(BACKUP_DIR, f)
+            for f in os.listdir(BACKUP_DIR)
+            if f.endswith(".bak")
+        ],
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    )
+    return files[0] if files else None
 
 
 def toggle_watchlist_site(chat_id: int, site_key: str) -> tuple[bool, list[str]]:
@@ -341,7 +437,7 @@ def save_snapshot_db(chat_id: int, analysis: dict[str, Any]) -> None:
 
 
 # ==============================================================================
-# 4 UI THEMES, TYPOGRAPHY & SAFE HTML ENGINE
+# 4 UI THEMES, TYPOGRAPHY & SAFE HTML + ANTI-LOOP ENGINE
 # ==============================================================================
 _SMALL_CAPS_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -412,6 +508,52 @@ def strip_html_tags(text: str) -> str:
     return html.unescape(txt)
 
 
+def sanitize_ai_loop(text: str) -> str:
+    """
+    Prevents AI token/phrase repetition loops (such as repeated 'samay se bahut zyada...')
+    and deduplicates consecutive repeated lines/phrases.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    raw = re.sub(
+        r"\b(\w+(?:\s+\w+){0,4})\b(?:\s+\1\b){2,}",
+        r"\1",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned_lines: list[str] = []
+    seen_line_counts: dict[str, int] = {}
+    for line in raw.splitlines():
+        ln = line.strip()
+        if not ln:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+        norm_key = re.sub(r"\W+", " ", ln.lower()).strip()
+        cnt = seen_line_counts.get(norm_key, 0) + 1
+        seen_line_counts[norm_key] = cnt
+        if cnt > 2:
+            continue
+        cleaned_lines.append(ln[:260])
+        if len(cleaned_lines) >= 18:
+            break
+
+    out = "\n".join(cleaned_lines).strip()
+    if len(out) > 1400:
+        out = out[:1400].rsplit(" ", 1)[0].strip() + "..."
+    return out
+
+
+def clean_ai_text(text: str) -> str:
+    s = sanitize_ai_loop(text)
+    s = re.sub(r"\*\*(.*?)\*\*", r"\1", s)
+    s = s.replace("**", "").replace("__", "")
+    return esc(s)
+
+
 def _split_long_html(text: str, limit: int = 3850) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -466,12 +608,6 @@ async def safe_edit_html(msg_obj, text: str) -> None:
         await msg_obj.edit_text(strip_html_tags(first))
     for extra in parts[1:]:
         await safe_send_html(msg_obj.get_bot(), msg_obj.chat_id, extra)
-
-
-def clean_ai_text(text: str) -> str:
-    s = re.sub(r"\*\*(.*?)\*\*", r"\1", str(text or ""))
-    s = s.replace("**", "").replace("__", "")
-    return esc(s)
 
 
 def small_status_dot(is_connected: bool) -> str:
@@ -554,7 +690,7 @@ def format_premium_device_block(
 
 
 # ==============================================================================
-# GUEST LOUNGE MINI-GAMES (NO BOREDOM WHILE WAITING FOR LOGIN)
+# GUEST LOUNGE MINI-GAMES
 # ==============================================================================
 def start_ttt_game(chat_id: int) -> str:
     board = [" "] * 9
@@ -563,7 +699,9 @@ def start_ttt_game(chat_id: int) -> str:
         "board": board,
         "moves": 0,
     }
-    return render_ttt_board(board, "Aap 'X' hain, Bot 'O' hai. 1 se 9 tak cell number bhejein:")
+    return render_ttt_board(
+        board, "Aap 'X' hain, Bot 'O' hai. 1 se 9 tak cell number bhejein:"
+    )
 
 
 def _check_ttt_winner(board: list[str]) -> str | None:
@@ -617,12 +755,7 @@ def play_ttt_turn(chat_id: int, cell_num: int) -> tuple[str, bool]:
     board: list[str] = st["board"]
     idx = cell_num - 1
     if idx < 0 or idx > 8 or board[idx] != " ":
-        return (
-            render_ttt_board(
-                board, "Khali cell (1–9) chuniye."
-            ),
-            False,
-        )
+        return render_ttt_board(board, "Khali cell (1–9) chuniye."), False
 
     board[idx] = "X"
     win = _check_ttt_winner(board)
@@ -634,7 +767,6 @@ def play_ttt_turn(chat_id: int, cell_num: int) -> tuple[str, bool]:
         return render_ttt_board(board, "Match Draw hua!"), True
 
     empty_cells = [i for i, v in enumerate(board) if v == " "]
-    # Smart bot: try win or block X, else random/center
     bot_move = None
     for mark in ("O", "X"):
         for c in empty_cells:
@@ -706,9 +838,7 @@ def play_guess_turn(chat_id: int, guess_num: int) -> tuple[str, bool]:
         st["high"] = min(int(st["high"]), guess_num - 1)
         hint = f"Thoda <b>CHHOTA</b> number try karein (Range: <code>{st['low']}–{st['high']}</code>)"
 
-    return (
-        f"  ▸ Try #{tries} (<code>{guess_num}</code>): {hint}"
-    ), False
+    return f"  ▸ Try #{tries} (<code>{guess_num}</code>): {hint}", False
 
 
 def start_rps_game(chat_id: int) -> str:
@@ -754,7 +884,11 @@ def play_rps_turn(chat_id: int, choice_raw: str) -> tuple[str, bool]:
         st["bot_score"] += 1
         outcome = "Bot yeh round jeeta!"
 
-    done = st["round"] >= st["max_rounds"] or st["user_score"] == 3 or st["bot_score"] == 3
+    done = (
+        st["round"] >= st["max_rounds"]
+        or st["user_score"] == 3
+        or st["bot_score"] == 3
+    )
     score_line = f"Score — Aap: <b>{st['user_score']}</b> | Bot: <b>{st['bot_score']}</b> (Round {st['round']}/{st['max_rounds']})"
 
     if done:
@@ -778,11 +912,9 @@ def play_rps_turn(chat_id: int, choice_raw: str) -> tuple[str, bool]:
 
 
 # ==============================================================================
-# CONTEXT-AWARE DYNAMIC REPLY KEYBOARDS WITH BACK & ADMIN SUB-MENUS
+# CONTEXT-AWARE DYNAMIC REPLY KEYBOARDS (BACK, NEXT & MAIN MENU EVERYWHERE)
 # ==============================================================================
 def guest_reply_keyboard() -> ReplyKeyboardMarkup:
-    st = GAME_SESSIONS.get(0)  # placeholder check overridden below
-    _ = st
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🔐 Login"), KeyboardButton("📖 Manual")],
@@ -803,7 +935,7 @@ def guest_keyboard_for_chat(chat_id: int) -> ReplyKeyboardMarkup:
                     KeyboardButton("Paper"),
                     KeyboardButton("Scissors"),
                 ],
-                [KeyboardButton("🎮 Games Lounge"), KeyboardButton("🔐 Login")],
+                [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
             ],
             resize_keyboard=True,
             is_persistent=True,
@@ -814,7 +946,7 @@ def guest_keyboard_for_chat(chat_id: int) -> ReplyKeyboardMarkup:
                 [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
                 [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")],
                 [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")],
-                [KeyboardButton("🎮 Games Lounge"), KeyboardButton("🔐 Login")],
+                [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
             ],
             resize_keyboard=True,
             is_persistent=True,
@@ -851,6 +983,16 @@ def main_reply_keyboard(user_id: int | None = None) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
+def paginated_list_keyboard(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = [
+        [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+        [KeyboardButton("🏠 Main Menu")],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton("🛡 Admin Panel")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
 def dashboard_sub_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
     snap = LAST_SNAPSHOT.get(chat_id) or {}
     devs = snap.get("assigned_devices") or []
@@ -868,8 +1010,8 @@ def dashboard_sub_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
     rows.append(
         [KeyboardButton("🔎 Open Site by ID/Name"), KeyboardButton("⭐ Pin Site")]
     )
-    rows.append([KeyboardButton("⬅ Previous"), KeyboardButton("Next ➡")])
-    rows.append([KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")])
+    rows.append([KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")])
+    rows.append([KeyboardButton("🏠 Main Menu")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
@@ -884,7 +1026,8 @@ def api_report_sub_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("🏭 Site API Report"),
                 KeyboardButton("🌐 Site Dashboard"),
             ],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -904,8 +1047,8 @@ def aging_sub_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("◈ <1Y"),
                 KeyboardButton("▸ >1Y"),
             ],
-            [KeyboardButton("⬅ Previous"), KeyboardButton("Next ➡")],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -918,7 +1061,8 @@ def ops_sub_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton("🩺 Health"), KeyboardButton("📥 Export CSV")],
             [KeyboardButton("∙ Online"), KeyboardButton("📌 Unassigned")],
             [KeyboardButton("❄ Stale Sites"), KeyboardButton("⭐ Watchlist")],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -931,7 +1075,28 @@ def admin_sub_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton("🎨 Themes"), KeyboardButton("🔔 Notif & Demo")],
             [KeyboardButton("⏱ Sync Interval"), KeyboardButton("🛠 Maintenance")],
             [KeyboardButton("⚡ Bot ON/OFF"), KeyboardButton("🧹 Clear Alerts")],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("🤖 AI Patch & Logs"), KeyboardButton("↩ Rollback Backup")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def ai_patch_sub_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("🛠 Generate AI Fix"),
+                KeyboardButton("✅ Apply AI Patch"),
+            ],
+            [
+                KeyboardButton("📋 Error & Patch Logs"),
+                KeyboardButton("↩ Rollback Backup"),
+            ],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -946,7 +1111,8 @@ def theme_sub_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("Theme: Minimal"),
             ],
             [KeyboardButton("Theme: Cyber"), KeyboardButton("Theme: Royal")],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -972,7 +1138,8 @@ def notif_demo_sub_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("Demo: 1d Down"),
                 KeyboardButton("Demo: Recovered"),
             ],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("Next ➡")],
+            [KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -996,8 +1163,12 @@ def current_keyboard_for_chat(
         return aging_sub_keyboard()
     if state == "ops_menu":
         return ops_sub_keyboard()
+    if state == "paginated_list":
+        return paginated_list_keyboard(user_id)
     if state == "admin_menu" and is_admin(user_id):
         return admin_sub_keyboard()
+    if state == "patch_menu" and is_admin(user_id):
+        return ai_patch_sub_keyboard()
     if state == "theme_menu" and is_admin(user_id):
         return theme_sub_keyboard()
     if state == "notif_menu" and is_admin(user_id):
@@ -1010,27 +1181,30 @@ def push_menu_state(chat_id: int, new_state: str) -> None:
     if cur != new_state:
         stack = MENU_STACK.setdefault(chat_id, [])
         stack.append(cur)
-        if len(stack) > 12:
+        if len(stack) > 15:
             stack.pop(0)
     MENU_STATE[chat_id] = new_state
 
 
-async def pop_menu_state(
-    chat_id: int, user_id: int | None, bot
-) -> None:
+async def pop_menu_state(chat_id: int, user_id: int | None, bot) -> None:
     AWAITING_INPUT.pop(chat_id, None)
     GAME_SESSIONS.pop(chat_id, None)
     stack = MENU_STACK.get(chat_id) or []
-    prev_state = stack.pop() if stack else "main"
+    prev_state = (
+        stack.pop() if stack else ("main" if require_auth(chat_id) else "guest")
+    )
     MENU_STATE[chat_id] = prev_state
 
     title_map = {
+        "guest": "GUEST PORTAL",
         "main": "MAIN MENU",
         "dash_menu": "SITE DASHBOARD HUB",
         "api_menu": "EXCISE API REPORT",
         "age_menu": "AGING BUCKETS",
         "ops_menu": "OPS & EXPORT",
+        "paginated_list": "PAGINATED VIEW",
         "admin_menu": "ADMIN AUTHORITY",
+        "patch_menu": "AI PATCH & LOGS",
         "theme_menu": "UI THEMES",
         "notif_menu": "NOTIFICATIONS & DEMO",
         "games_menu": "GAMES LOUNGE",
@@ -1045,7 +1219,7 @@ async def pop_menu_state(
 
 
 # ==============================================================================
-# PORTAL LOGIN & REAL ENVIROFRONT API CLIENTS
+# PORTAL LOGIN, AUTO RE-LOGIN, CIRCUIT BREAKER & REAL ENVIROFRONT API CLIENTS
 # ==============================================================================
 def _ajax_headers(referer: str) -> dict[str, str]:
     return {
@@ -1054,6 +1228,25 @@ def _ajax_headers(referer: str) -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Referer": referer,
     }
+
+
+def _record_error(source: str, exc_or_msg: Any, tb_str: str = "") -> None:
+    global LAST_ERROR_LOG, PORTAL_FAIL_COUNT, PORTAL_CIRCUIT_OPEN_UNTIL
+    LAST_ERROR_LOG = {
+        "time": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
+        "source": source,
+        "error": str(exc_or_msg)[:350],
+        "traceback": (tb_str or traceback.format_exc())[-1400:],
+    }
+    PORTAL_FAIL_COUNT += 1
+    if PORTAL_FAIL_COUNT >= 6:
+        PORTAL_CIRCUIT_OPEN_UNTIL = time.time() + 45.0
+
+
+def _reset_portal_health() -> None:
+    global PORTAL_FAIL_COUNT, PORTAL_CIRCUIT_OPEN_UNTIL
+    PORTAL_FAIL_COUNT = 0
+    PORTAL_CIRCUIT_OPEN_UNTIL = 0.0
 
 
 def login_envirofront(
@@ -1077,6 +1270,7 @@ def login_envirofront(
         r_get = sess.get(LOGIN_URL, timeout=20, allow_redirects=True)
         r_get.raise_for_status()
     except Exception as exc:
+        _record_error("login_get", exc)
         return None, f"Login page load nahi hua: {exc}"
 
     if BASE_URL.lower() not in r_get.url.lower():
@@ -1140,16 +1334,14 @@ def login_envirofront(
         )
         r_post.raise_for_status()
     except Exception as exc:
+        _record_error("login_post", exc)
         return None, f"Login submit fail: {exc}"
 
     post_lower = (r_post.text or "").lower()
-    if (
-        "account/login" in r_post.url.lower()
-        and (
-            "invalid" in post_lower
-            or "error" in post_lower
-            or "incorrect" in post_lower
-        )
+    if "account/login" in r_post.url.lower() and (
+        "invalid" in post_lower
+        or "error" in post_lower
+        or "incorrect" in post_lower
     ):
         return None, "Galat username ya password."
 
@@ -1158,8 +1350,10 @@ def login_envirofront(
         if "account/login" in r_chk.url.lower():
             return None, "Session verify nahi hua (redirect to login)."
     except Exception as exc:
+        _record_error("login_verify", exc)
         return None, f"Devices page verify fail: {exc}"
 
+    _reset_portal_health()
     return sess, "OK"
 
 
@@ -1167,12 +1361,23 @@ def ensure_live_session(
     chat_id: int, sess_data: dict[str, Any]
 ) -> requests.Session | None:
     session: requests.Session | None = sess_data.get("session")
-    if session is None:
-        return None
-    # Session auto-heal check on repeated failures
-    if sess_data.get("fail_streak", 0) >= 3:
-        logger.info("Session auto-heal triggered for chat %s", chat_id)
-        sess_data["fail_streak"] = 0
+    u = str(sess_data.get("username") or "").strip()
+    p = str(sess_data.get("password") or "").strip()
+
+    if sess_data.get("fail_streak", 0) >= 2 and u and p:
+        new_sess, err = login_envirofront(u, p)
+        if new_sess:
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            sess_data["session"] = new_sess
+            sess_data["fail_streak"] = 0
+            logger.info("Auto re-login succeeded for chat %s", chat_id)
+            return new_sess
+        logger.warning("Auto re-login failed for chat %s: %s", chat_id, err)
+
     return session
 
 
@@ -1293,10 +1498,7 @@ def normalize_device_record(
         last_seen_dt, raw_status, now_utc
     )
 
-    # Connected-but-stale flag: connected yet last seen > 30 mins ago
-    is_stale = bool(
-        is_conn and off_hours is not None and off_hours >= 0.5
-    )
+    is_stale = bool(is_conn and off_hours is not None and off_hours >= 0.5)
 
     if last_seen_dt is not None:
         display_time = last_seen_dt.astimezone(IST).strftime(
@@ -1929,7 +2131,9 @@ def _discover_dashboard_tags_and_page(
         r = session.get(dash_page_url, timeout=20, allow_redirects=True)
         if r.ok and "account/login" not in r.url.lower():
             raw = r.text or ""
-            for m in re.finditer(r"[?&]tags=([^&\"'\s]+)", raw, re.IGNORECASE):
+            for m in re.finditer(
+                r"[?&]tags=([^&\"'\s]+)", raw, re.IGNORECASE
+            ):
                 for part in m.group(1).replace("%2C", ",").split(","):
                     add_tag(part)
             for m in re.finditer(
@@ -2033,7 +2237,9 @@ def _parse_dashboard_stats_and_tags(
             if not unit_str and tag_name.upper().endswith("-BL"):
                 unit_str = "L"
 
-            extra_str = "avg" if (latest_val is None and avg_val is not None) else ""
+            extra_str = (
+                "avg" if (latest_val is None and avg_val is not None) else ""
+            )
             cat = _classify_reading_category(tag_name, unit_str)
             dedup = f"{tag_name.lower()}|{val_str}|{unit_str}"
             if dedup not in seen:
@@ -2054,12 +2260,9 @@ def _parse_dashboard_stats_and_tags(
 def group_readings_by_tank(
     instruments: list[dict[str, str]],
 ) -> list[str]:
-    """
-    Groups mm + L (-BL) + instrument/totalizer readings by base tank/tag key
-    so Distillery & Bottling tanks appear cleanly together.
-    """
     groups: dict[str, dict[str, list[str]]] = {}
     order: list[str] = []
+    anomalies: list[str] = []
 
     for item in instruments:
         raw_name = item.get("name", "")
@@ -2068,7 +2271,13 @@ def group_readings_by_tank(
         cat = item.get("category", "instrument")
         disp = f"{val_str} {unit_str}".strip()
 
-        base = re.sub(r"-(BL|L|TOT|MM)$", "", raw_name, flags=re.IGNORECASE).strip()
+        num_val = _to_float_or_none(val_str)
+        if cat == "level_mm" and num_val is not None and num_val < 0:
+            anomalies.append(f"{raw_name} ({disp} NEGATIVE/DRIFT)")
+
+        base = re.sub(
+            r"-(BL|L|TOT|MM)$", "", raw_name, flags=re.IGNORECASE
+        ).strip()
         if not base:
             base = raw_name
 
@@ -2096,6 +2305,12 @@ def group_readings_by_tank(
         lines.append(
             f"  ▸ <b>{esc(base)}</b> → <code>{esc(' | '.join(parts))}</code>"
         )
+
+    if anomalies:
+        lines.append(
+            f"  • <b>Zero/Drift Flag:</b> <code>{esc(', '.join(anomalies[:5]))}</code>"
+        )
+
     return lines
 
 
@@ -2137,12 +2352,8 @@ def scrape_site_dashboard_details(
             DASHBOARD_WS_URL,
             params={
                 "uac": UAC,
-                "site": site_id,
-                "mode": "1d",
-                "avg": "nul",
+                "siteId": site_id,
                 "tags": tags_str,
-                "tagTypes": "1",
-                "tzo": "-330",
                 "_": str(_ts_ms()),
             },
             headers=_ajax_headers(dash_page_url),
@@ -2152,2519 +2363,1539 @@ def scrape_site_dashboard_details(
             err_msg = f"Dashboard WS HTTP {r.status_code}"
         else:
             txt = (r.text or "").strip()
-            if txt.startswith('"') and txt.endswith('"'):
-                try:
-                    txt = json.loads(txt)
-                except Exception:
-                    pass
-            if txt and not str(txt).startswith("<"):
-                payload = json.loads(txt) if isinstance(txt, str) else txt
-                instruments = _parse_dashboard_stats_and_tags(payload)
-            else:
+            if not txt or txt.startswith("<"):
                 err_msg = "Empty or non-JSON dashboard response"
+            else:
+                payload = json.loads(txt)
+                if isinstance(payload, dict):
+                    instruments = _parse_dashboard_stats_and_tags(payload)
+                    if not instruments:
+                        err_msg = "No tag values returned"
+                else:
+                    err_msg = "Unexpected dashboard payload format"
     except Exception as exc:
-        err_msg = f"Dashboard WS error: {exc}"
+        err_msg = f"Dashboard fetch error: {exc}"
 
-    api_report = fetch_site_api_report(session, site_id)
+    api_rep = fetch_site_api_report(session, site_id)
 
-    res = {
-        "ok": not bool(err_msg),
+    res_obj = {
+        "ok": bool(instruments) and not err_msg,
         "site_id": site_id,
         "site_code": site_code,
         "site_name_ws": site_name_ws,
         "url": dash_page_url,
-        "instruments": instruments[:35],
-        "api_report": api_report,
         "error": err_msg,
+        "instruments": instruments,
+        "api_report": api_rep,
         "_ts": time.time(),
     }
-    DASHBOARD_CACHE[cache_key] = res
-    return res
+    DASHBOARD_CACHE[cache_key] = res_obj
+    return res_obj
 
 
-def fetch_devices_multi_strategy(
+def parse_devices_page_and_ws(
     session: requests.Session,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    now = datetime.now(timezone.utc)
-    meta: dict[str, Any] = {
-        "server_error_500": False,
-        "html_length": 0,
-        "tr_total": 0,
-        "unparsed_ts_count": 0,
-        "source": "none",
-    }
-
-    ws_devs = fetch_devices_from_ws_api(session, now)
+) -> tuple[list[dict[str, Any]], str]:
+    now_utc = datetime.now(timezone.utc)
+    ws_devs = fetch_devices_from_ws_api(session, now_utc)
     if ws_devs:
-        meta["source"] = "ws-ef-devices"
-        meta["unparsed_ts_count"] = sum(
-            1 for d in ws_devs if d["last_seen"] is None
-        )
-        return ws_devs, meta
+        _reset_portal_health()
+        return ws_devs, "OK"
 
-    resp = session.get(DEVICES_PAGE_URL, timeout=25)
-    resp.raise_for_status()
-    raw_html = resp.text or ""
-    meta["html_length"] = len(raw_html)
+    try:
+        r = session.get(DEVICES_PAGE_URL, timeout=22, allow_redirects=True)
+        r.raise_for_status()
+    except Exception as exc:
+        _record_error("devices_page", exc)
+        return [], f"Devices page load nahi hua: {exc}"
 
-    if (
-        not raw_html
-        or "500 - internal server error" in raw_html.lower()
-        or "internal server error" in raw_html.lower()
-    ):
-        meta["server_error_500"] = True
-        return [], meta
+    if "account/login" in r.url.lower():
+        return [], "Session expire ho gaya hai. Kripya dobara /login karein."
 
-    soup = BeautifulSoup(raw_html, "html.parser")
-    devs: list[dict[str, Any]] = []
-    for tr in soup.select("table tr"):
+    soup = BeautifulSoup(r.text, "html.parser")
+    devices: list[dict[str, Any]] = []
+    seen_serials: set[str] = set()
+
+    for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
-        if not tds:
+        if len(tds) < 5:
             continue
-        meta["tr_total"] += 1
         cells = [" ".join(td.get_text(" ", strip=True).split()) for td in tds]
-        if len(cells) < 2:
+        if all(c == "" for c in cells):
             continue
-        row_sid = ""
-        for a in tr.find_all("a", href=True):
-            m = re.search(r"/Site/(\d+)/Dashboard", str(a["href"]), re.IGNORECASE)
+
+        serial = cells[0] if len(cells) > 0 else "N/A"
+        industry = cells[1] if len(cells) > 1 else "N/A"
+        site_type = cells[2] if len(cells) > 2 else "N/A"
+        device_type = cells[3] if len(cells) > 3 else "N/A"
+        firmware = cells[4] if len(cells) > 4 else "N/A"
+        raw_status = cells[5] if len(cells) > 5 else ""
+        raw_last_seen = cells[6] if len(cells) > 6 else ""
+
+        sid = ""
+        link = tr.find("a", href=True)
+        if link:
+            m = re.search(r"/Site/(\d+)/", str(link["href"]), re.IGNORECASE)
             if m:
-                row_sid = m.group(1)
-                break
+                sid = m.group(1)
+
         rec = normalize_device_record(
-            serial_no=cells[1] if len(cells) > 1 else cells[0],
-            industry=cells[2] if len(cells) > 2 else "N/A",
-            site_type=cells[3] if len(cells) > 3 else "N/A",
-            device_type=cells[4] if len(cells) > 4 else "N/A",
-            firmware=cells[5] if len(cells) > 5 else "N/A",
-            raw_status=cells[-2] if len(cells) >= 2 else "",
-            raw_last_seen=cells[-1],
-            now_utc=now,
-            site_id=row_sid,
+            serial_no=serial,
+            industry=industry,
+            site_type=site_type,
+            device_type=device_type,
+            firmware=firmware,
+            raw_status=raw_status,
+            raw_last_seen=raw_last_seen,
+            now_utc=now_utc,
+            site_id=sid,
         )
-        devs.append(rec)
+        if rec["serial_no"] not in seen_serials:
+            seen_serials.add(rec["serial_no"])
+            devices.append(rec)
 
-    if devs:
-        meta["source"] = "html-table"
-        meta["unparsed_ts_count"] = sum(1 for d in devs if d["last_seen"] is None)
-        return devs, meta
+    if not devices:
+        return [], "Portal se koi device record nahi mila."
 
-    meta["source"] = "0-found"
-    return [], meta
+    _reset_portal_health()
+    return devices, "OK"
 
 
 # ==============================================================================
-# AGING RANGE FILTER & ANALYSIS
+# FLEET ANALYSIS, AGING BUCKETS & SHIFT HANDOVER INTELLIGENCE
 # ==============================================================================
-AGING_RANGE_CONFIG: dict[str, tuple[str, timedelta | None, timedelta]] = {
-    "1d": ("ᴅɪꜱᴄᴏɴɴᴇᴄᴛᴇᴅ < 1 ᴅᴀʏ (≤ 24ʜ)", None, timedelta(days=1)),
-    "1w": ("ᴅɪꜱᴄᴏɴɴᴇᴄᴛᴇᴅ < 1 ᴡᴇᴇᴋ (≤ 7ᴅ)", None, timedelta(days=7)),
-    "24d": ("ᴅɪꜱᴄᴏɴɴᴇᴄᴛᴇᴅ < 24 ᴅᴀʏꜱ (≤ 24ᴅ)", None, timedelta(days=24)),
-    "11m": ("ᴅɪꜱᴄᴏɴɴᴇᴄᴛᴇᴅ < 11 ᴍᴏɴᴛʜꜱ (≤ 330ᴅ)", None, timedelta(days=330)),
-    "1y": ("ᴅɪꜱᴄᴏɴɴᴇᴄᴛᴇᴅ < 1 ʏᴇᴀʀ (≤ 365ᴅ)", None, timedelta(days=365)),
-    "gt1y": (
-        "ᴅɪꜱᴄᴏɴɴᴇᴄᴛᴇᴅ > 1 ʏᴇᴀʀ (365ᴅ+)",
-        timedelta(days=365),
-        timedelta(days=36500),
-    ),
-}
+def analyze_devices(devices: list[dict[str, Any]]) -> dict[str, Any]:
+    now_ist = datetime.now(IST)
+    checked_at_ist = now_ist.strftime("%d-%b-%Y %I:%M:%S %p IST")
 
+    assigned_devs = [d for d in devices if not d.get("is_unassigned")]
+    unassigned_devs = [d for d in devices if d.get("is_unassigned")]
 
-def filter_devices_by_aging_range(
-    devices: list[dict[str, Any]], bucket_key: str
-) -> list[dict[str, Any]]:
-    _, min_td, max_td = AGING_RANGE_CONFIG.get(
-        bucket_key, ("", None, timedelta(days=1))
-    )
-    matched: list[dict[str, Any]] = []
-    for d in devices:
-        if d.get("is_connected"):
-            continue
-        off_td: timedelta | None = d.get("offline_duration")
-        if off_td is None or off_td <= timedelta(0):
-            continue
-        if min_td is not None and off_td <= min_td:
-            continue
-        if off_td <= max_td:
-            matched.append(d)
+    online_devs = [d for d in assigned_devs if d.get("is_connected")]
+    offline_devs = [d for d in assigned_devs if not d.get("is_connected")]
+    stale_devs = [d for d in assigned_devs if d.get("is_stale")]
 
-    matched.sort(
-        key=lambda x: x["offline_duration"].total_seconds()
-        if x.get("offline_duration")
-        else 0,
-        reverse=True,
-    )
-    return matched
+    b_lt_1d: list[dict[str, Any]] = []
+    b_lt_1w: list[dict[str, Any]] = []
+    b_lt_24d: list[dict[str, Any]] = []
+    b_lt_11m: list[dict[str, Any]] = []
+    b_lt_1y: list[dict[str, Any]] = []
+    b_gt_1y: list[dict[str, Any]] = []
 
+    for d in offline_devs:
+        oh = d.get("offline_hours")
+        if oh is None:
+            b_gt_1y.append(d)
+        elif oh < 24.0:
+            b_lt_1d.append(d)
+        elif oh < 168.0:
+            b_lt_1w.append(d)
+        elif oh < 576.0:
+            b_lt_24d.append(d)
+        elif oh < 7920.0:
+            b_lt_11m.append(d)
+        elif oh <= 8760.0:
+            b_lt_1y.append(d)
+        else:
+            b_gt_1y.append(d)
 
-def run_self_analysis(session: requests.Session) -> dict[str, Any]:
-    devices, meta = fetch_devices_multi_strategy(session)
+    def _off_sort_key(item: dict[str, Any]) -> float:
+        val = item.get("offline_hours")
+        return float(val) if val is not None else -1.0
 
-    assigned_devices = [d for d in devices if not d["is_unassigned"]]
-    unassigned_list = [d for d in devices if d["is_unassigned"]]
-    online_list = [d for d in devices if d["is_connected"]]
-    offline_list = [d for d in devices if not d["is_connected"]]
-    stale_list = [d for d in devices if d.get("is_stale")]
-
-    offline_list.sort(
-        key=lambda x: x["offline_duration"].total_seconds()
-        if x.get("offline_duration")
-        else 0,
-        reverse=True,
-    )
-
-    aging_counts = {
-        k: len(filter_devices_by_aging_range(devices, k))
-        for k in AGING_RANGE_CONFIG
-    }
-
-    site_offline_counts: dict[str, int] = {}
-    fw_counts: dict[str, int] = {}
-    type_counts: dict[str, int] = {}
-
-    for d in devices:
-        fw = d["firmware"] or "Unknown"
-        fw_counts[fw] = fw_counts.get(fw, 0) + 1
-
-        dtype = d["device_type"] or "Unknown"
-        type_counts[dtype] = type_counts.get(dtype, 0) + 1
-
-        if not d["is_connected"] and not d["is_unassigned"]:
-            site_label = (
-                f"{d['industry']}({d['site']})"
-                if d["site"] != "N/A"
-                else d["industry"]
-            )
-            site_offline_counts[site_label] = (
-                site_offline_counts.get(site_label, 0) + 1
-            )
-
-    top_sites = sorted(
-        site_offline_counts.items(), key=lambda kv: kv[1], reverse=True
-    )[:5]
+    b_lt_1d.sort(key=_off_sort_key, reverse=True)
+    b_lt_1w.sort(key=_off_sort_key, reverse=True)
+    b_lt_24d.sort(key=_off_sort_key, reverse=True)
+    b_lt_11m.sort(key=_off_sort_key, reverse=True)
+    b_lt_1y.sort(key=_off_sort_key, reverse=True)
+    b_gt_1y.sort(key=_off_sort_key, reverse=True)
 
     return {
-        "checked_at_ist": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
-        "total": len(devices),
-        "assigned_count": len(assigned_devices),
-        "connected": len(online_list),
-        "disconnected_count": len(offline_list),
-        "stale_count": len(stale_list),
-        "unassigned_count": len(unassigned_list),
-        "aging_counts": aging_counts,
+        "checked_at_ist": checked_at_ist,
+        "total_count": len(devices),
+        "assigned_count": len(assigned_devs),
+        "online_count": len(online_devs),
+        "offline_count": len(offline_devs),
+        "unassigned_count": len(unassigned_devs),
+        "stale_count": len(stale_devs),
         "all_devices": devices,
-        "assigned_devices": assigned_devices,
-        "online_list": online_list,
-        "offline_list": offline_list,
-        "stale_list": stale_list,
-        "unassigned_list": unassigned_list,
-        "top_offline_sites": top_sites,
-        "firmware_breakdown": fw_counts,
-        "device_type_breakdown": type_counts,
-        "meta": meta,
+        "assigned_devices": assigned_devs,
+        "online_list": online_devs,
+        "offline_list": offline_devs,
+        "unassigned_list": unassigned_devs,
+        "stale_list": stale_devs,
+        "buckets": {
+            "<1D": b_lt_1d,
+            "<1W": b_lt_1w,
+            "<24D": b_lt_24d,
+            "<11M": b_lt_11m,
+            "<1Y": b_lt_1y,
+            ">1Y": b_gt_1y,
+        },
+        "bucket_counts": {
+            "<1D": len(b_lt_1d),
+            "<1W": len(b_lt_1w),
+            "<24D": len(b_lt_24d),
+            "<11M": len(b_lt_11m),
+            "<1Y": len(b_lt_1y),
+            ">1Y": len(b_gt_1y),
+        },
     }
 
 
-def build_csv_bytes(devices: list[dict[str, Any]]) -> bytes:
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(
-        [
-            "Sr.No",
-            "Client",
-            "Serial No",
-            "Site ID",
-            "Site Code",
-            "Dashboard URL",
-            "Industry Name",
-            "Site Type",
-            "Assignment",
-            "Device Type",
-            "Firmware",
-            "Status",
-            "Stale",
-            "Last Seen (IST)",
-        ]
+def build_status_message(analysis: dict[str, Any]) -> str:
+    th = get_theme()
+    b = th["bullet"]
+    bc = analysis["bucket_counts"]
+    return (
+        f"{themed_box(sc(CLIENT_NAME + ' — FLEET STATUS'))}\n"
+        f"{th['bar']}\n"
+        f"  {b} Time       : <code>{esc(analysis['checked_at_ist'])}</code>\n"
+        f"  {b} Total      : <b>{analysis['total_count']}</b> | Assigned: <b>{analysis['assigned_count']}</b>\n"
+        f"  {b} Online     : {small_status_dot(True)} <b>{analysis['online_count']}</b> | "
+        f"Offline: {small_status_dot(False)} <b>{analysis['offline_count']}</b>\n"
+        f"  {b} Unassigned : <b>{analysis['unassigned_count']}</b> | "
+        f"Stale (&gt;30m): <b>{analysis['stale_count']}</b>\n"
+        f"{th['bar']}\n"
+        f"  {b} Aging : &lt;1D <b>{bc['<1D']}</b> | &lt;1W <b>{bc['<1W']}</b> | &lt;24D <b>{bc['<24D']}</b>\n"
+        f"  {b}         &lt;11M <b>{bc['<11M']}</b> | &lt;1Y <b>{bc['<1Y']}</b> | &gt;1Y <b>{bc['>1Y']}</b>"
     )
-    for idx, d in enumerate(devices, start=1):
-        writer.writerow(
-            [
-                idx,
-                CLIENT_NAME,
-                d.get("serial_no", "N/A"),
-                d.get("site_id", ""),
-                d.get("site_code", ""),
-                d.get("dashboard_url", ""),
-                d.get("industry", "N/A"),
-                d.get("site", "N/A"),
-                "UNASSIGNED" if d.get("is_unassigned") else "ASSIGNED",
-                d.get("device_type", "N/A"),
-                d.get("firmware", "N/A"),
-                d.get("conn_label", "N/A"),
-                "YES" if d.get("is_stale") else "NO",
-                d.get("display_time", "N/A"),
-            ]
-        )
-    return buf.getvalue().encode("utf-8-sig")
+
+
+def build_shift_handover_message(
+    analysis: dict[str, Any], chat_id: int | None = None
+) -> str:
+    th = get_theme()
+    b = th["bullet"]
+    bc = analysis["bucket_counts"]
+    off_list = analysis.get("offline_list") or []
+    stale_list = analysis.get("stale_list") or []
+
+    lines = [
+        themed_box(sc(CLIENT_NAME + " — SHIFT HANDOVER")),
+        th["bar"],
+        f"  {b} Time       : <code>{esc(analysis['checked_at_ist'])}</code>",
+        f"  {b} Fleet      : Total <b>{analysis['total_count']}</b> | "
+        f"{small_status_dot(True)} Online <b>{analysis['online_count']}</b> | "
+        f"{small_status_dot(False)} Off <b>{analysis['offline_count']}</b>",
+        f"  {b} Stale(&gt;30m): <b>{analysis['stale_count']}</b> | Unassigned: <b>{analysis['unassigned_count']}</b>",
+        f"  {b} Aging      : &lt;1D <b>{bc['<1D']}</b> | &lt;1W <b>{bc['<1W']}</b> | &lt;24D <b>{bc['<24D']}</b> | &lt;11M <b>{bc['<11M']}</b>",
+    ]
+
+    if chat_id is not None:
+        w_keys = WATCHLIST_SITES.get(chat_id) or []
+        if w_keys:
+            w_off = 0
+            for d in off_list:
+                hay = f"{d.get('site_id','')} {d.get('serial_no','')} {d.get('industry','')}".lower()
+                if any(wk.lower() in hay for wk in w_keys):
+                    w_off += 1
+            lines.append(
+                f"  {b} Watchlist  : <b>{len(w_keys)}</b> pinned | Offline now: <b>{w_off}</b>"
+            )
+
+    lines.append(f"\n{th['bar']}\n{b} <b>{sc('PRIORITY OFFLINE SITES')}</b>")
+    if off_list:
+        for idx, d in enumerate(off_list[:5], start=1):
+            lbl = format_industry_site_label(
+                d.get("industry", "N/A"), d.get("site", "N/A")
+            )
+            dur = format_duration_hm(d.get("offline_duration"))
+            lines.append(
+                f"  {idx}. <b>{lbl}</b> — <code>{esc(dur)}</code>"
+            )
+    else:
+        lines.append("  • Koi offline site nahi hai.")
+
+    if stale_list:
+        lines.append(f"\n{b} <b>{sc('STALE ACTIVE SITES')}</b>")
+        for d in stale_list[:4]:
+            lbl = format_industry_site_label(
+                d.get("industry", "N/A"), d.get("site", "N/A")
+            )
+            dur = format_duration_hm(d.get("offline_duration"))
+            lines.append(f"  • {lbl} — <code>{esc(dur)}</code>")
+
+    return "\n".join(lines)
 
 
 # ==============================================================================
-# PROFESSIONAL COMPACT GROQ AI ENGINE (STRICT TEXT-ONLY MODELS)
+# GROQ AI CLIENT, SAFE SCHEMA PARSER & CONTROLLED PATCH GENERATOR
 # ==============================================================================
-_BLOCKED_MODEL_TOKENS = (
-    "whisper",
-    "orpheus",
-    "arabic",
-    "saudi",
-    "tts",
-    "playai",
-    "guard",
-    "prompt-guard",
-    "embed",
-    "audio",
-    "speech",
-)
-
-_PREFERRED_TEXT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "gemma2-9b-it",
-    "qwen/qwen3-32b",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-]
-
-
-def _is_safe_text_model(model_id: str) -> bool:
-    mid = (model_id or "").strip().lower()
-    if not mid:
-        return False
-    return not any(tok in mid for tok in _BLOCKED_MODEL_TOKENS)
-
-
-def get_available_groq_models() -> list[str]:
+def _list_groq_models() -> list[str]:
     if not GROQ_API_KEY:
-        return list(_PREFERRED_TEXT_MODELS[:4])
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     try:
         r = requests.get(
             GROQ_MODELS_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            timeout=10,
+            timeout=12,
         )
         if r.ok:
-            data = r.json().get("data", [])
-            live_ids = [
-                str(m.get("id")).strip()
-                for m in data
-                if isinstance(m, dict)
-                and m.get("id")
-                and _is_safe_text_model(str(m.get("id")))
+            data = r.json()
+            ids = [
+                m.get("id")
+                for m in (data.get("data") or [])
+                if isinstance(m, dict) and m.get("id")
             ]
-            ordered = [m for m in _PREFERRED_TEXT_MODELS if m in live_ids] + [
-                m for m in live_ids if m not in _PREFERRED_TEXT_MODELS
-            ]
-            if ordered:
-                return ordered[:4]
+            if ids:
+                return ids[:6]
     except Exception:
         pass
-    return list(_PREFERRED_TEXT_MODELS[:4])
-
-
-def enrich_context_with_live_dashboards(
-    session: requests.Session | None,
-    analysis: dict[str, Any],
-    query: str = "",
-) -> dict[str, dict[str, Any]]:
-    live_readings: dict[str, dict[str, Any]] = {}
-    if not session:
-        return live_readings
-
-    q = (query or "").strip().lower()
-    candidates: list[dict[str, Any]] = []
-
-    if q:
-        for d in analysis.get("all_devices", []):
-            if (
-                q in str(d.get("industry", "")).lower()
-                or q in str(d.get("site", "")).lower()
-                or q in str(d.get("serial_no", "")).lower()
-                or q in str(d.get("site_id", "")).lower()
-                or q in str(d.get("site_code", "")).lower()
-            ):
-                candidates.append(d)
-
-    for d in analysis.get("assigned_devices", []):
-        if d not in candidates:
-            candidates.append(d)
-        if len(candidates) >= 5:
-            break
-
-    for dev in candidates[:5]:
-        try:
-            dash = scrape_site_dashboard_details(session, dev)
-            rep = dash.get("api_report") or {}
-            live_readings[dev.get("serial_no", "N/A")] = {
-                "industry": dev.get("industry"),
-                "site_type": dev.get("site"),
-                "site_id": dash.get("site_id") or dev.get("site_id"),
-                "instruments": dash.get("instruments", [])[:12],
-                "api_report": {
-                    "date": rep.get("report_date"),
-                    "total": rep.get("total", 0),
-                    "initial": rep.get("initial_count", 0),
-                    "final": rep.get("final_count", 0),
-                    "pending_final": rep.get("pending_final_count", 0),
-                    "success": rep.get("success", 0),
-                    "failed": rep.get("failed", 0),
-                },
-            }
-        except Exception:
-            continue
-
-    return live_readings
-
-
-def build_project_context(
-    analysis: dict[str, Any],
-    live_readings: dict[str, dict[str, Any]] | None = None,
-) -> str:
-    return (
-        f"Client: {CLIENT_NAME} | Checked: {analysis.get('checked_at_ist')}\n"
-        f"Total: {analysis.get('total')} | Assigned: {analysis.get('assigned_count')} | "
-        f"Connected: {analysis.get('connected')} | Disconnected: {analysis.get('disconnected_count')} | "
-        f"Stale (>30m): {analysis.get('stale_count', 0)} | Unassigned: {analysis.get('unassigned_count')}\n"
-        f"Aging: {analysis.get('aging_counts')}\n"
-        f"Top Offline Sites: {analysis.get('top_offline_sites')}\n"
-        f"Live Sample: {json.dumps(live_readings or {}, ensure_ascii=False)}"
-    )
+    return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 
 def call_groq_ai(
-    system_prompt: str, user_prompt: str, analysis: dict[str, Any]
-) -> str:
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 420,
+    temperature: float = 0.25,
+) -> tuple[bool, str]:
     if not GROQ_API_KEY:
-        return "GROQ_API_KEY set nahi hai."
+        return False, "GROQ_API_KEY set nahi hai."
 
-    models = [m for m in get_available_groq_models() if _is_safe_text_model(m)]
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    last_err = ""
+    models = _list_groq_models()
+    last_err = "Groq AI se jawab nahi mila."
 
-    for model in models:
+    for model_id in models:
         try:
             r = requests.post(
                 GROQ_CHAT_URL,
-                headers=headers,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json={
-                    "model": model,
+                    "model": model_id,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.2,
-                    "max_tokens": 550,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "frequency_penalty": 0.4,
+                    "presence_penalty": 0.2,
                 },
                 timeout=25,
             )
             if r.ok:
                 data = r.json()
-                txt = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-                if txt:
-                    return txt
+                content = (
+                    (((data.get("choices") or [{}])[0]).get("message") or {})
+                    .get("content")
+                    or ""
+                ).strip()
+                cleaned = sanitize_ai_loop(content)
+                if cleaned:
+                    return True, cleaned
+                last_err = "AI ne khali ya repeated text diya."
             else:
-                last_err = f"{model} HTTP {r.status_code}"
+                last_err = f"Groq HTTP {r.status_code}"
         except Exception as exc:
-            last_err = f"{model}: {exc}"
+            last_err = str(exc)
 
-    ages = analysis.get("aging_counts", {})
-    return (
-        f"Compact Summary ({last_err or 'Text fallback'}):\n"
-        f"• Total: {analysis.get('total', 0)} | Online: {analysis.get('connected', 0)} | Off: {analysis.get('disconnected_count', 0)}\n"
-        f"• Aging: <1D {ages.get('1d', 0)}, <1W {ages.get('1w', 0)}, <24D {ages.get('24d', 0)}, <11M {ages.get('11m', 0)}"
-    )
+    return False, last_err
 
 
-def generate_ai_analysis(
-    session: requests.Session | None, analysis: dict[str, Any]
-) -> str:
-    live = enrich_context_with_live_dashboards(session, analysis)
-    ctx = build_project_context(analysis, live)
-    sys_p = (
-        f"Aap {CLIENT_NAME} telemetry suite ke ek polite, calm, aur professional operations advisor hain. "
-        "Hinglish mein sirf 4–5 crisp main points dein—zyada lamba ya complex mat likhein. "
-        "Markdown tables ya ** asterisks bilkul use na karein."
-    )
-    usr_p = f"TELEMETRY SNAPSHOT:\n{ctx}"
-    return call_groq_ai(sys_p, usr_p, analysis)
-
-
-def answer_project_question(
-    user_question: str,
-    session: requests.Session | None,
-    analysis: dict[str, Any],
-) -> str:
-    live = enrich_context_with_live_dashboards(
-        session, analysis, query=user_question
-    )
-    ctx = build_project_context(analysis, live)
-    sys_p = (
-        f"Aap {CLIENT_NAME} telemetry bot ke professional aur helpful assistant hain. "
-        "Diye gaye live data ke hisab se seedha, saaf aur compact jawab dein. "
-        "Markdown table ya ** asterisks na lagayein."
-    )
-    usr_p = f"LIVE DATA:\n{ctx}\n\nQUESTION:\n{user_question}"
-    return call_groq_ai(sys_p, usr_p, analysis)
-
-
-def require_auth(chat_id: int) -> dict[str, Any] | None:
-    sess_data = USER_SESSIONS.get(chat_id)
-    if not sess_data or sess_data.get("step") != "authenticated":
-        return None
-    return sess_data
-
-
-def _find_device_by_target(
-    devices: list[dict[str, Any]], target: str
-) -> dict[str, Any] | None:
-    t = (target or "").strip()
-    if not t:
-        return None
-    m_hash = re.match(r"^#?(\d+)\b", t)
-    if m_hash and len(t) <= 4:
-        num = int(m_hash.group(1))
-        if 1 <= num <= len(devices):
-            return devices[num - 1]
-    if t.isdigit():
-        num = int(t)
-        if 1 <= num <= len(devices):
-            return devices[num - 1]
-        for d in devices:
-            if (
-                str(d.get("serial_no") or "") == t
-                or str(d.get("site_id") or "") == t
-                or str(d.get("site_code") or "") == t
-            ):
-                return d
-        return None
-    t_low = t.lower()
-    for d in devices:
-        if (
-            t_low in str(d.get("industry", "")).lower()
-            or t_low in str(d.get("site", "")).lower()
-            or t_low in str(d.get("serial_no", "")).lower()
-            or t_low in str(d.get("site_code", "")).lower()
-        ):
-            return d
-    return None
-
-
-# ==============================================================================
-# ACCESS & MAINTENANCE GUARD
-# ==============================================================================
-async def check_access(chat_id: int, user_id: int | None, bot) -> bool:
-    if is_admin(user_id):
-        return True
-    if not BOT_ENABLED:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"{themed_box(sc('BOT CURRENTLY OFF'))}\n{get_theme()['bar']}\n  ▸ Bot abhi temporary OFF hai.",
-        )
-        return False
-    if MAINTENANCE_MODE:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"{themed_box(sc('MAINTENANCE MODE'))}\n{get_theme()['bar']}\n  ▸ {esc(MAINTENANCE_MSG)}",
-        )
-        return False
-    return True
-
-
-# ==============================================================================
-# VIEWS, THEMES, NOTIFICATION DEMO & SHIFT SUMMARY
-# ==============================================================================
-async def send_start_view(chat_id: int, user_id: int | None, bot) -> None:
-    existing = require_auth(chat_id)
-    if existing:
-        MENU_STATE[chat_id] = "main"
-        MENU_STACK[chat_id] = []
-        AWAITING_INPUT.pop(chat_id, None)
-        th = get_theme()
-        msg = (
-            f"{themed_box(esc(CLIENT_NAME), sc('AUTHORITY TELEMETRY'))}\n"
-            f"{th['bar']}\n"
-            f"  {th['bullet']} Account   : <code>{esc(existing.get('username'))}</code>\n"
-            f"  {th['bullet']} Theme     : <code>{esc(th['label'])}</code>\n"
-            f"  {th['bullet']} Notif Mode: <code>{esc(NOTIF_STYLE)}</code>\n"
-            f"  {th['bullet']} Sync Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n\n"
-            "  ▸ Niche buttons se menus, sub-menus, watchlist aur shift summary access karein."
-        )
-        await safe_send_html(
-            bot, chat_id, msg, reply_markup=main_reply_keyboard(user_id)
-        )
-        return
-
-    USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-    th = get_theme()
-    await safe_send_html(
-        bot,
-        chat_id,
-        (
-            f"{themed_box(esc(CLIENT_NAME), sc('AUTHORITY TELEMETRY'))}\n"
-            f"{th['bar']}\n\n"
-            "  ▸ Kripya apna <b>Login ID / Email</b> bhejein (ya <code>🎮 Games Lounge</code> try karein):"
+def generate_ai_brief_text(analysis: dict[str, Any]) -> str:
+    bc = analysis["bucket_counts"]
+    off_names = [
+        d.get("industry", "N/A") for d in (analysis.get("offline_list") or [])[:6]
+    ]
+    summary_payload = {
+        "client": CLIENT_NAME,
+        "checked_at_ist": analysis["checked_at_ist"],
+        "total": analysis["total_count"],
+        "online": analysis["online_count"],
+        "offline": analysis["offline_count"],
+        "stale_gt_30m": analysis["stale_count"],
+        "unassigned": analysis["unassigned_count"],
+        "aging": bc,
+        "top_offline": off_names,
+    }
+    ok, resp = call_groq_ai(
+        system_prompt=(
+            "Tum ek crisp, grounded telemetry operations advisor ho. "
+            "Hinglish mein 4-5 short bullet points do. "
+            "Kisi shabd ya vaakyansh ko dohrana mat. Sirf diye gaye data par adharit baat karo."
         ),
-        reply_markup=guest_keyboard_for_chat(chat_id),
+        user_prompt=f"Fleet telemetry snapshot:\n{json.dumps(summary_payload)}",
+        max_tokens=320,
+        temperature=0.2,
+    )
+    if ok and resp:
+        return clean_ai_text(resp)
+
+    return (
+        f"• Offline sites: <b>{analysis['offline_count']}</b> / {analysis['assigned_count']} assigned "
+        f"(Top: <code>{esc(', '.join(off_names[:3]) or 'None')}</code>)\n"
+        f"• Stale (&gt;30m): <b>{analysis['stale_count']}</b> | Unassigned: <b>{analysis['unassigned_count']}</b>\n"
+        f"• Aging &gt;1Y: <b>{bc['>1Y']}</b> | &lt;11M: <b>{bc['<11M']}</b> | &lt;1D: <b>{bc['<1D']}</b>\n"
+        f"• AI fallback note: {esc(resp)}"
     )
 
 
-async def send_manual_view(
-    chat_id: int, user_id: int | None, bot
-) -> None:
-    th = get_theme()
-    b = th["bullet"]
-    manual_text = (
-        f"{themed_box(sc('OPERATOR MANUAL'))}\n"
-        f"{th['bar']}\n\n"
-        "<b>1. Login &amp; Guest Games Lounge</b>\n"
-        f"  {b} <code>/login</code> ya <code>🔐 Login</code> se portal login karein.\n"
-        f"  {b} Login ka wait karte waqt <code>🎮 Games Lounge</code> mein 3 mini-games khelein.\n\n"
-        "<b>2. Navigation &amp; Menus</b>\n"
-        f"  {b} Har sub-menu mein <code>⬅ Back</code> aur <code>🏠 Main Menu</code> milta hai.\n"
-        f"  {b} <code>🌐 Site Dashboard</code> → Tanks (`mm` + `L` grouped) &amp; Excise `I`→`F` report.\n"
-        f"  {b} <code>📡 API Report</code> → `RequestId` pairs, Initial/Final &amp; net delta.\n"
-        f"  {b} <code>⭐ Watchlist</code> &amp; <code>📋 Shift Summary</code> → Quick ops.\n\n"
-        "<b>3. Commands</b>\n"
-        "  • <code>/status</code> | <code>/allsite</code> | <code>/dash &lt;site&gt;</code> | <code>/apireport &lt;site&gt; [date]</code>\n"
-        "  • <code>/instruments</code> | <code>/age 1d</code> | <code>/ai &lt;question&gt;</code> | <code>/ai_analyze</code>"
-    )
-    await safe_send_html(
-        bot,
-        chat_id,
-        manual_text,
-        reply_markup=current_keyboard_for_chat(chat_id, user_id),
-    )
-
-
-async def open_games_lounge(
-    chat_id: int, user_id: int | None, bot
-) -> None:
-    push_menu_state(chat_id, "games_menu")
-    GAME_SESSIONS.pop(chat_id, None)
-    msg = (
-        f"{themed_box(sc('GUEST GAMES LOUNGE'))}\n"
-        f"{get_theme()['bar']}\n"
-        "  ▸ <code>🎲 Tic-Tac-Toe</code> — 3x3 vs Smart Bot\n"
-        "  ▸ <code>🔢 Number Guess</code> — 1 se 100 secret number\n"
-        "  ▸ <code>✂ Rock Paper Scissors</code> — Best of 5 rounds"
-    )
-    await safe_send_html(
-        bot, chat_id, msg, reply_markup=games_lounge_keyboard()
-    )
-
-
-async def open_dashboard_menu(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    push_menu_state(chat_id, "dash_menu")
-
-    devs = analysis.get("assigned_devices") or []
-    quick_lines = []
-    for i, d in enumerate(devs[:6], start=1):
-        dot = small_status_dot(bool(d.get("is_connected")))
-        sid = f" [ID:{d['site_id']}]" if d.get("site_id") else ""
-        quick_lines.append(
-            f"  {i}. {dot} <b>{esc(d.get('industry'))}</b>{sid}"
-        )
-
-    msg = (
-        f"{themed_box(sc('SITE DASHBOARD HUB'))}\n"
-        f"{get_theme()['bar']}\n"
-        + (
-            "\n".join(quick_lines)
-            if quick_lines
-            else "  ▸ Koi site list nahi mili"
-        )
-        + "\n\n"
-        "  ▸ Quick button dabayein, <code>🔎 Open Site by ID/Name</code>, ya <code>⬅ Back</code>."
-    )
-    await safe_send_html(
-        bot, chat_id, msg, reply_markup=dashboard_sub_keyboard(chat_id)
-    )
-
-
-async def open_api_report_menu(chat_id: int, bot) -> None:
-    if not require_auth(chat_id):
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    push_menu_state(chat_id, "api_menu")
-    msg = (
-        f"{themed_box(sc('EXCISE API REPORT'))}\n"
-        f"{get_theme()['bar']}\n"
-        f"  ▸ Today Date : <code>{esc(today_ist_report_date())}</code>\n"
-        "  ▸ <code>📅 Today API Report</code> — Initial (I) &amp; Final (F) pairs + ΔL/Δmm\n"
-        "  ▸ <code>🗓 Custom Date Report</code> — Site aur date (<code>DD-Mon-YYYY</code>)\n"
-        "  ▸ <code>🏭 Site API Report</code> — Quick site report"
-    )
-    await safe_send_html(
-        bot, chat_id, msg, reply_markup=api_report_sub_keyboard()
-    )
-
-
-async def open_aging_menu(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    push_menu_state(chat_id, "age_menu")
-    ages = analysis.get("aging_counts", {})
-
-    msg = (
-        f"{themed_box(sc('AGING BUCKETS'))}\n"
-        f"{get_theme()['bar']}\n"
-        f"  ◦ <code>&lt; 1 Day (≤24h)    : {ages.get('1d', 0)}</code>\n"
-        f"  ▪ <code>&lt; 1 Week (≤7d)    : {ages.get('1w', 0)}</code>\n"
-        f"  • <code>&lt; 24 Days (≤24d)  : {ages.get('24d', 0)}</code>\n"
-        f"  ◆ <code>&lt; 11 Months(≤330d): {ages.get('11m', 0)}</code>\n"
-        f"  ◈ <code>&lt; 1 Year (≤365d)  : {ages.get('1y', 0)}</code>\n"
-        f"  ▸ <code>&gt; 1 Year (365d+)  : {ages.get('gt1y', 0)}</code>"
-    )
-    await safe_send_html(
-        bot, chat_id, msg, reply_markup=aging_sub_keyboard()
-    )
-
-
-async def open_ops_menu(chat_id: int, bot) -> None:
-    if not require_auth(chat_id):
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    push_menu_state(chat_id, "ops_menu")
-    msg = (
-        f"{themed_box(sc('OPS & EXPORT'))}\n"
-        f"{get_theme()['bar']}\n"
-        "  ▸ <code>🩺 Health</code> | <code>📥 Export CSV</code>\n"
-        "  ▸ <code>∙ Online</code> | <code>📌 Unassigned</code> | <code>❄ Stale Sites</code>"
-    )
-    await safe_send_html(bot, chat_id, msg, reply_markup=ops_sub_keyboard())
-
-
-async def open_admin_panel(chat_id: int, bot) -> None:
-    push_menu_state(chat_id, "admin_menu")
-    th = get_theme()
-    msg = (
-        f"{themed_box(sc('ADMIN AUTHORITY'))}\n"
-        f"{th['bar']}\n"
-        f"  ▸ Bot Status   : <code>{'ON' if BOT_ENABLED else 'OFF'}</code>\n"
-        f"  ▸ Maintenance  : <code>{'ON' if MAINTENANCE_MODE else 'OFF'}</code>\n"
-        f"  ▸ UI Theme     : <code>{esc(th['label'])}</code>\n"
-        f"  ▸ Notif Style  : <code>{esc(NOTIF_STYLE)}</code>\n"
-        f"  ▸ Refresh Rate : <code>{REFRESH_INTERVAL_SEC}s</code>\n"
-        f"  ▸ Active Chats : <code>{len(USER_SESSIONS)}</code>"
-    )
-    await safe_send_html(bot, chat_id, msg, reply_markup=admin_sub_keyboard())
-
-
-async def open_theme_menu(chat_id: int, bot) -> None:
-    push_menu_state(chat_id, "theme_menu")
-    cur_label = get_theme()["label"]
-    msg = (
-        f"{themed_box(sc('UI THEMES'))}\n"
-        f"{get_theme()['bar']}\n"
-        f"  ▸ Current Theme: <b>{esc(cur_label)}</b>\n"
-        "  • <b>Obsidian</b> — Deep dark authority frames\n"
-        "  • <b>Minimal</b> — Clean executive lines\n"
-        "  • <b>Cyber</b> — Technical telemetry grid\n"
-        "  • <b>Royal</b> — Decorative royal border"
-    )
-    await safe_send_html(bot, chat_id, msg, reply_markup=theme_sub_keyboard())
-
-
-async def open_notif_demo_menu(chat_id: int, bot) -> None:
-    push_menu_state(chat_id, "notif_menu")
-    msg = (
-        f"{themed_box(sc('NOTIFICATIONS & DEMO'))}\n"
-        f"{get_theme()['bar']}\n"
-        f"  ▸ Active Mode: <code>{esc(NOTIF_STYLE)}</code>\n"
-        "  • Modes: <code>Detailed</code>, <code>Compact</code>, <code>Alerts Only</code>, <code>Digest</code>\n"
-        "  • Niche <code>Demo: ...</code> buttons se live alert preview bhejein."
-    )
-    await safe_send_html(
-        bot, chat_id, msg, reply_markup=notif_demo_sub_keyboard()
-    )
-
-
-async def send_notification_demo(chat_id: int, demo_kind: str, bot) -> None:
-    sample_site = "Malbros / Sample Unit (Distillery)"
-    sample_serial = "2210100999"
-    sample_seen = datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST")
-
-    if demo_kind == "recovered":
-        txt = (
-            f"{themed_box('∙ ' + sc('DEMO: SITE RECOVERED'))}\n"
-            f"  ▸ Site   : <b>{esc(sample_site)}</b>\n"
-            f"  ▸ Serial : <b>{esc(sample_serial)}</b>\n"
-            f"  ▸ Seen   : <code>{esc(sample_seen)}</code>"
-        )
-    else:
-        badge_map = {
-            "2h": "2ʜ ᴅᴏᴡɴ ALERT",
-            "10h": "10ʜ ᴅᴏᴡɴ ALERT",
-            "1d": "1ᴅ ᴅᴏᴡɴ ALERT",
-        }
-        badge = badge_map.get(demo_kind, "2ʜ ᴅᴏᴡɴ ALERT")
-        if NOTIF_STYLE == "compact":
-            txt = f"▸ • <b>{esc(sample_site)}</b> [<code>{esc(badge)}</code>] | Serial: <code>{esc(sample_serial)}</code>"
-        else:
-            txt = (
-                f"{themed_box('• ' + esc('DEMO: ' + badge))}\n"
-                f"  ▸ Site   : <b>{esc(sample_site)}</b>\n"
-                f"  ▸ Serial : <b>{esc(sample_serial)}</b>\n"
-                f"  ▸ Seen   : <code>{esc(sample_seen)}</code>"
+def answer_groq_query(query_text: str, analysis: dict[str, Any]) -> str:
+    q = (query_text or "").strip()
+    m_site = re.search(r"\b(\d{7,12})\b", q)
+    if m_site:
+        sid = m_site.group(1)
+        cached = API_REPORT_CACHE.get(f"{sid}:{today_ist_report_date()}") or {}
+        if cached:
+            return (
+                f"Site <code>{esc(sid)}</code> ({esc(cached.get('report_date',''))}): "
+                f"Total <b>{cached.get('total', 0)}</b> | I: <b>{cached.get('initial_count', 0)}</b> | "
+                f"F: <b>{cached.get('final_count', 0)}</b> | Pending F: <b>{cached.get('pending_final_count', 0)}</b> | "
+                f"Success: <b>{cached.get('success', 0)}</b> | Failed: <b>{cached.get('failed', 0)}</b>"
             )
 
-    await safe_send_html(
-        bot, chat_id, txt, reply_markup=notif_demo_sub_keyboard()
+    ctx = {
+        "checked_at_ist": analysis.get("checked_at_ist", ""),
+        "total": analysis.get("total_count", 0),
+        "online": analysis.get("online_count", 0),
+        "offline": analysis.get("offline_count", 0),
+        "stale": analysis.get("stale_count", 0),
+        "unassigned": analysis.get("unassigned_count", 0),
+        "aging": analysis.get("bucket_counts", {}),
+    }
+    ok, resp = call_groq_ai(
+        system_prompt=(
+            "Tum ek helpful telemetry assistant ho. Hinglish mein seedha, saaf aur bina repetition ke jawab do. "
+            "Diye gaye fleet context ke bahar galat data mat banao."
+        ),
+        user_prompt=f"Context: {json.dumps(ctx)}\nQuestion: {q}",
+        max_tokens=300,
+        temperature=0.25,
     )
+    if ok and resp:
+        return clean_ai_text(resp)
+    return f"AI query response available nahi: {esc(resp)}"
 
 
-async def send_shift_summary(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
+def prepare_ai_error_patch() -> tuple[bool, str]:
+    global PENDING_AI_PATCH
+    if not LAST_ERROR_LOG:
+        return False, "Koi recent error log recorded nahi hai."
+
+    err_info = {
+        "source": LAST_ERROR_LOG.get("source", ""),
+        "error": LAST_ERROR_LOG.get("error", ""),
+        "traceback": LAST_ERROR_LOG.get("traceback", ""),
+    }
+    ok, ai_out = call_groq_ai(
+        system_prompt=(
+            "Tum Python telemetry bot ke liye safe patch advisor ho. "
+            "JSON output do with keys: summary, target_snippet, replacement_snippet. "
+            "Sirf chhota, safe bugfix suggest karo; bina zaroorat bada rewrite mat karo."
+        ),
+        user_prompt=f"Error details:\n{json.dumps(err_info)}",
+        max_tokens=450,
+        temperature=0.15,
+    )
+    if not ok:
+        return False, f"AI patch generation fail: {ai_out}"
+
+    summary = "AI suggested recovery check"
+    old_snip = ""
+    new_snip = ""
+    try:
+        m_json = re.search(r"\{.*\}", ai_out, flags=re.DOTALL)
+        if m_json:
+            obj = json.loads(m_json.group(0))
+            if isinstance(obj, dict):
+                summary = str(obj.get("summary") or summary).strip()[:160]
+                old_snip = str(obj.get("target_snippet") or "")
+                new_snip = str(obj.get("replacement_snippet") or "")
+    except Exception:
+        summary = ai_out[:160]
+
+    PENDING_AI_PATCH = {
+        "created_at": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
+        "source": LAST_ERROR_LOG.get("source", ""),
+        "summary": summary,
+        "target_snippet": old_snip,
+        "replacement_snippet": new_snip,
+        "raw_ai": ai_out[:700],
+    }
+    return True, summary
+
+
+def apply_pending_ai_patch() -> tuple[bool, str]:
+    global PENDING_AI_PATCH
+    if not PENDING_AI_PATCH:
+        return False, "Apply karne ke liye koi pending AI patch nahi hai."
+
+    old_snip = PENDING_AI_PATCH.get("target_snippet") or ""
+    new_snip = PENDING_AI_PATCH.get("replacement_snippet") or ""
+    summary = PENDING_AI_PATCH.get("summary") or "AI patch"
+
+    backup_file = create_script_backup("pre_ai_patch")
+    if not backup_file:
+        return False, "Backup create nahi ho saka; patch abort kiya gaya."
+
+    if not old_snip or not new_snip:
+        log_patch_audit_db("ADVISORY_ONLY", summary, backup_file)
+        PENDING_AI_PATCH = {}
+        return (
+            True,
+            f"Backup bana ({os.path.basename(backup_file)}). Patch advisory-only tha, koi file overwrite nahi hui.",
         )
-        return
 
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
+    try:
+        with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+            src = f.read()
+        if src.count(old_snip) != 1:
+            return (
+                False,
+                "Target snippet unique match nahi hua (0 ya >1 matches). Safe abort kiya gaya.",
+            )
+        patched_src = src.replace(old_snip, new_snip, 1)
+        compile(patched_src, SCRIPT_PATH, "exec")
+        with open(SCRIPT_PATH, "w", encoding="utf-8") as f:
+            f.write(patched_src)
+        log_patch_audit_db("APPLIED", summary, backup_file)
+        PENDING_AI_PATCH = {}
+        return (
+            True,
+            f"Patch apply aur syntax-verify ho gaya! Backup: {os.path.basename(backup_file)}",
+        )
+    except SyntaxError as se:
+        return False, f"SyntaxError aaya; file edit nahi ki gayi: {se}"
+    except Exception as exc:
+        _record_error("apply_patch", exc)
+        return False, f"Patch apply fail: {exc}"
+
+
+def rollback_latest_backup() -> tuple[bool, str]:
+    b_file = get_latest_backup_file()
+    if not b_file:
+        return False, "Koi backup file nahi mili."
+    try:
+        with open(b_file, "r", encoding="utf-8") as f:
+            b_src = f.read()
+        compile(b_src, SCRIPT_PATH, "exec")
+        shutil.copy2(b_file, SCRIPT_PATH)
+        log_patch_audit_db("ROLLBACK", f"Restored {os.path.basename(b_file)}", b_file)
+        return True, f"Rollback safaltapoorvak ho gaya: {os.path.basename(b_file)}"
+    except Exception as exc:
+        return False, f"Rollback fail: {exc}"
+
+
+# ==============================================================================
+# DISPLAY FORMATTERS (ALL SITES, INSTRUMENTS, API REPORT, AGING, HEALTH, CSV)
+# ==============================================================================
+def build_all_sites_page(
+    analysis: dict[str, Any], page: int = 1, page_size: int = 5
+) -> tuple[str, int, int]:
+    devs = analysis.get("all_devices") or []
+    total_items = len(devs)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    chunk = devs[start:end]
+
+    th = get_theme()
+    header = (
+        f"{themed_box(sc('ALL FLEET SITES'), f'Page {page}/{total_pages} • Total {total_items}')}\n"
+        f"{th['bar']}\n"
+        f"  {th['bullet']} Checked: <code>{esc(analysis['checked_at_ist'])}</code>\n"
     )
-    LAST_SNAPSHOT[chat_id] = analysis
-    ages = analysis.get("aging_counts", {})
+    if not chunk:
+        return header + "\n  • Koi site record nahi mila.", page, total_pages
+
+    blocks = [header]
+    for idx, d in enumerate(chunk, start=start + 1):
+        blocks.append(format_premium_device_block(d, index=idx))
+
+    return "\n\n".join(blocks), page, total_pages
+
+
+def build_filtered_devices_page(
+    devices: list[dict[str, Any]],
+    title: str,
+    checked_at: str,
+    page: int = 1,
+    page_size: int = 5,
+) -> tuple[str, int, int]:
+    total_items = len(devices)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+    chunk = devices[start:end]
+
+    th = get_theme()
+    header = (
+        f"{themed_box(sc(title), f'Page {page}/{total_pages} • Count {total_items}')}\n"
+        f"{th['bar']}\n"
+        f"  {th['bullet']} Checked: <code>{esc(checked_at)}</code>\n"
+    )
+    if not chunk:
+        return header + "\n  • Is category mein koi record nahi hai.", page, total_pages
+
+    blocks = [header]
+    for idx, d in enumerate(chunk, start=start + 1):
+        blocks.append(format_premium_device_block(d, index=idx))
+    return "\n\n".join(blocks), page, total_pages
+
+
+def build_instruments_page(
+    session: requests.Session,
+    analysis: dict[str, Any],
+    page: int = 1,
+    page_size: int = 5,
+) -> tuple[str, int, int]:
+    devs = analysis.get("assigned_devices") or []
+    total_items = len(devs)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    chunk = devs[start:end]
+
     th = get_theme()
     b = th["bullet"]
-
-    top_lines = (
-        "\n".join(
-            f"  {i}. {esc(s)} — <code>{c} off</code>"
-            for i, (s, c) in enumerate(analysis.get("top_offline_sites", []), 1)
-        )
-        or "  <code>Koi offline site nahi</code>"
-    )
-
-    msg = (
-        f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('SHIFT HANDOVER'))}\n"
+    header = (
+        f"{themed_box(sc('INSTRUMENTS & TANKS'), f'Page {page}/{total_pages}')}\n"
         f"{th['bar']}\n"
-        f"  {b} Time      : <i>{esc(analysis.get('checked_at_ist'))}</i>\n"
-        f"  {b} Fleet     : Total <b>{analysis.get('total', 0)}</b> | ∙ Online <b>{analysis.get('connected', 0)}</b> | • Off <b>{analysis.get('disconnected_count', 0)}</b>\n"
-        f"  {b} Stale (>30m): <b>{analysis.get('stale_count', 0)}</b> | Unassigned: <b>{analysis.get('unassigned_count', 0)}</b>\n"
-        f"  {b} Aging     : &lt;1D <code>{ages.get('1d', 0)}</code> | &lt;1W <code>{ages.get('1w', 0)}</code> | &lt;24D <code>{ages.get('24d', 0)}</code> | &lt;11M <code>{ages.get('11m', 0)}</code>\n\n"
-        f"<b>{b} {sc('Priority Offline Sites')}</b>\n{top_lines}"
+        f"  {b} Checked: <code>{esc(analysis['checked_at_ist'])}</code>\n"
     )
+    if not chunk:
+        return header + "\n  • Koi assigned site nahi mili.", page, total_pages
+
+    blocks = [header]
+    for idx, d in enumerate(chunk, start=start + 1):
+        lbl = format_industry_site_label(
+            d.get("industry", "N/A"), d.get("site", "N/A")
+        )
+        dot = small_status_dot(bool(d.get("is_connected")))
+        st_word = "CONNECTED" if d.get("is_connected") else "DISCONNECTED"
+        sid = d.get("site_id") or "N/A"
+        ser = d.get("serial_no") or "N/A"
+
+        card_lines = [
+            f"┌─ #{idx} <b>{lbl}</b>",
+            f"│  {b} Serial : <code>{esc(ser)}</code> | SiteID: <code>{esc(sid)}</code> | {dot} <b>{st_word}</b>",
+        ]
+
+        if str(sid).isdigit():
+            dash = scrape_site_dashboard_details(session, d)
+            insts = dash.get("instruments") or []
+            if insts:
+                card_lines.extend(group_readings_by_tank(insts))
+            else:
+                reason = dash.get("error") or "No tag values returned"
+                card_lines.append(f"│  • Readings: <code>{esc(reason)}</code>")
+        else:
+            card_lines.append("│  • Readings: <code>Site ID missing</code>")
+
+        card_lines.append("└──────────────────────")
+        blocks.append("\n".join(card_lines))
+
+    return "\n\n".join(blocks), page, total_pages
+
+
+def build_site_dashboard_card(
+    session: requests.Session,
+    dev: dict[str, Any],
+    index: int | None = None,
+    chat_id: int | None = None,
+) -> str:
+    th = get_theme()
+    b = th["bullet"]
+    lbl = format_industry_site_label(
+        dev.get("industry", "N/A"), dev.get("site", "N/A")
+    )
+    dot = small_status_dot(bool(dev.get("is_connected")))
+    st_word = "CONNECTED" if dev.get("is_connected") else "DISCONNECTED"
+    off_txt = (
+        "(Active)"
+        if dev.get("is_connected")
+        else format_off_since_text(
+            dev.get("last_seen"), dev.get("offline_duration")
+        )
+    )
+    prefix = f"#{index} " if index is not None else ""
+    sid = str(dev.get("site_id") or "").strip()
+    ser = str(dev.get("serial_no") or "N/A").strip()
+
+    pinned_badge = ""
+    if chat_id is not None:
+        w_list = WATCHLIST_SITES.get(chat_id) or []
+        if any(
+            k.lower() in f"{sid} {ser} {dev.get('industry','')}".lower()
+            for k in w_list
+        ):
+            pinned_badge = " [PINNED]"
+
+    lines = [
+        themed_box(sc(prefix + lbl + pinned_badge)),
+        th["bar"],
+        f"  {b} Serial : <b>{esc(ser)}</b> | SiteID: <code>{esc(sid or 'N/A')}</code>",
+        f"  {b} Status : {dot} <b>{st_word}</b> | Seen: <code>{esc(dev.get('display_time', 'N/A'))}</code>",
+        f"  {b} Off    : <code>{esc(off_txt)}</code>",
+    ]
+
+    if sid.isdigit():
+        dash = scrape_site_dashboard_details(session, dev)
+        if dash.get("url"):
+            lines.append(f"  {b} URL    : <code>{esc(dash['url'])}</code>")
+        insts = dash.get("instruments") or []
+        if insts:
+            lines.append(f"\n  {b} <b>{sc('LIVE TAGS & TANKS')}</b>")
+            lines.extend(group_readings_by_tank(insts))
+        else:
+            lines.append(
+                f"  • Readings: <code>{esc(dash.get('error') or 'No tag values')}</code>"
+            )
+
+        rep = dash.get("api_report") or {}
+        if rep:
+            lines.append(
+                f"  {b} Excise ({esc(rep.get('report_date',''))}): "
+                f"Total <b>{rep.get('total', 0)}</b> | I: <b>{rep.get('initial_count', 0)}</b> | "
+                f"F: <b>{rep.get('final_count', 0)}</b> | Pending F: <b>{rep.get('pending_final_count', 0)}</b> | "
+                f"OK: <b>{rep.get('success', 0)}</b> / Fail: <b>{rep.get('failed', 0)}</b>"
+            )
+            if rep.get("latest_result"):
+                lines.append(
+                    f"  {b} Latest : <code>{esc(rep['latest_result'])}</code>"
+                )
+    else:
+        lines.append("  • Dashboard / Excise WS ke liye Site ID available nahi hai.")
+
+    return "\n".join(lines)
+
+
+def build_api_report_card(
+    session: requests.Session,
+    dev: dict[str, Any],
+    report_date: str | None = None,
+    vat_code: str = "",
+) -> str:
+    th = get_theme()
+    b = th["bullet"]
+    lbl = format_industry_site_label(
+        dev.get("industry", "N/A"), dev.get("site", "N/A")
+    )
+    sid = str(dev.get("site_id") or "").strip()
+    rdate = (report_date or today_ist_report_date()).strip()
+
+    if not sid.isdigit():
+        return (
+            f"{themed_box(sc('EXCISE API REPORT'))}\n"
+            f"  • <b>{lbl}</b>: Site ID nahi mila."
+        )
+
+    rep = fetch_site_api_report(session, sid, report_date=rdate, vat_code=vat_code)
+    v_list = rep.get("vat_codes") or []
+    v_disp = ", ".join(v_list[:8]) if v_list else "None"
+
+    lines = [
+        themed_box(sc("EXCISE API REPORT"), f"{lbl} • {rdate}"),
+        th["bar"],
+        f"  {b} SiteID    : <code>{esc(sid)}</code> | VATs: <code>{esc(v_disp)}</code>",
+        f"  {b} Total Reqs: <b>{rep.get('total', 0)}</b> | "
+        f"Initial (I): <b>{rep.get('initial_count', 0)}</b> | "
+        f"Final (F): <b>{rep.get('final_count', 0)}</b> | "
+        f"Pending F: <b>{rep.get('pending_final_count', 0)}</b>",
+        f"  {b} Success   : <b>{rep.get('success', 0)}</b> | Failed: <b>{rep.get('failed', 0)}</b>",
+    ]
+    if rep.get("latest_ts"):
+        lines.append(f"  {b} Latest TS : <code>{esc(rep['latest_ts'])}</code>")
+    if rep.get("latest_result"):
+        lines.append(f"  {b} Latest Res: <code>{esc(rep['latest_result'])}</code>")
+
+    pairs = rep.get("pairs") or []
+    if pairs:
+        lines.append(f"\n  {b} <b>{sc('REQUEST PAIRS (I → F)')}</b>")
+        for p in pairs[:6]:
+            has_i = "I" if p.get("initial") else "-"
+            has_f = "F" if p.get("final") else "-"
+            lines.append(
+                f"  • Req <code>{esc(p.get('request_id','N/A'))}</code> "
+                f"[{esc(p.get('vat_code','-'))}] ({has_i}→{has_f}): "
+                f"<code>{esc(p.get('delta_text',''))}</code>"
+            )
+    elif rep.get("error"):
+        lines.append(f"  • Note: <code>{esc(rep['error'])}</code>")
+    else:
+        lines.append("  • Is date ke liye koi API request record nahi mila.")
+
+    return "\n".join(lines)
+
+
+def build_health_report(analysis: dict[str, Any]) -> str:
+    th = get_theme()
+    b = th["bullet"]
+    cb_status = (
+        f"OPEN (until {datetime.fromtimestamp(PORTAL_CIRCUIT_OPEN_UNTIL, tz=IST).strftime('%I:%M:%S %p')})"
+        if time.time() < PORTAL_CIRCUIT_OPEN_UNTIL
+        else "CLOSED (Healthy)"
+    )
+    return (
+        f"{themed_box(sc('SYSTEM & PORTAL HEALTH'))}\n"
+        f"{th['bar']}\n"
+        f"  {b} Theme          : <b>{esc(get_theme()['label'])}</b> ({esc(ACTIVE_THEME)})\n"
+        f"  {b} Notif Mode     : <b>{esc(NOTIF_STYLE)}</b>\n"
+        f"  {b} Poll Interval  : <b>{REFRESH_INTERVAL_SEC}s</b>\n"
+        f"  {b} Bot / Maint    : <b>{'ON' if BOT_ENABLED else 'OFF'}</b> / <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>\n"
+        f"  {b} Circuit Breaker: <code>{esc(cb_status)}</code> (Fails: {PORTAL_FAIL_COUNT})\n"
+        f"  {b} Cache Counts   : Dash={len(DASHBOARD_CACHE)} | API={len(API_REPORT_CACHE)} | Tags={len(SITE_TAGS_CACHE)}\n"
+        f"  {b} DB & Backups   : <code>{esc(DB_PATH)}</code> | <code>{esc(BACKUP_DIR)}</code>"
+    )
+
+
+def build_fleet_csv_bytes(analysis: dict[str, Any]) -> io.BytesIO:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "SerialNo",
+            "SiteId",
+            "SiteCode",
+            "Industry",
+            "SiteType",
+            "Status",
+            "IsStale",
+            "IsUnassigned",
+            "DeviceType",
+            "Firmware",
+            "OfflineDuration",
+            "LastSeenIST",
+        ]
+    )
+    for d in analysis.get("all_devices") or []:
+        writer.writerow(
+            [
+                d.get("serial_no", ""),
+                d.get("site_id", ""),
+                d.get("site_code", ""),
+                d.get("industry", ""),
+                d.get("site", ""),
+                d.get("conn_label", ""),
+                "YES" if d.get("is_stale") else "NO",
+                "YES" if d.get("is_unassigned") else "NO",
+                d.get("device_type", ""),
+                d.get("firmware", ""),
+                format_duration_hm(d.get("offline_duration")),
+                d.get("display_time", ""),
+            ]
+        )
+    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    out.name = f"baagijaat_fleet_{datetime.now(IST).strftime('%Y%m%d_%H%M')}.csv"
+    out.seek(0)
+    return out
+
+
+# ==============================================================================
+# DEMO ALERT SIMULATOR & BACKGROUND POLLING LOOP
+# ==============================================================================
+async def run_demo_alert(bot, chat_id: int, demo_kind: str) -> None:
+    snap = LAST_SNAPSHOT.get(chat_id) or {}
+    devs = snap.get("assigned_devices") or []
+    sample = devs[0] if devs else {
+        "industry": "DEMO DISTILLERY UNIT",
+        "site": "Distillery",
+        "serial_no": "2210100999",
+        "site_id": "2210100999",
+        "device_type": "M2M-PRO",
+        "firmware": "v4.2",
+        "is_connected": False,
+        "is_stale": False,
+        "display_time": datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST"),
+        "last_seen": datetime.now(timezone.utc) - timedelta(hours=3),
+        "offline_duration": timedelta(hours=3),
+    }
+
+    lbl = format_industry_site_label(
+        sample.get("industry", "DEMO SITE"), sample.get("site", "Unit")
+    )
+    ser = esc(sample.get("serial_no", "N/A"))
+
+    if demo_kind == "2h":
+        msg = (
+            f"{themed_box(sc('DEMO ALERT — 2H DOWN'))}\n"
+            f"  ▸ Site   : <b>{lbl}</b> (Serial: <code>{ser}</code>)\n"
+            f"  ▸ Stage  : 2h offline threshold triggered."
+        )
+    elif demo_kind == "10h":
+        msg = (
+            f"{themed_box(sc('DEMO ALERT — 10H DOWN'))}\n"
+            f"  ▸ Site   : <b>{lbl}</b> (Serial: <code>{ser}</code>)\n"
+            f"  ▸ Stage  : 10h prolonged outage warning."
+        )
+    elif demo_kind == "1d":
+        msg = (
+            f"{themed_box(sc('DEMO ALERT — 1D CRITICAL'))}\n"
+            f"  ▸ Site   : <b>{lbl}</b> (Serial: <code>{ser}</code>)\n"
+            f"  ▸ Stage  : 24h+ critical downtime escalation."
+        )
+    else:
+        msg = (
+            f"{themed_box(sc('DEMO ALERT — RECOVERED'))}\n"
+            f"  ▸ Site   : <b>{lbl}</b> (Serial: <code>{ser}</code>)\n"
+            f"  ▸ Status : {small_status_dot(True)} <b>CONNECTED</b> — telemetry restored."
+        )
+
     await safe_send_html(bot, chat_id, msg)
 
 
-async def send_watchlist_view(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
+async def _emit_alert_or_digest(bot, chat_id: int, html_msg: str) -> None:
+    if NOTIF_STYLE == "digest":
+        DIGEST_QUEUE.setdefault(chat_id, []).append(html_msg)
+        return
+    await safe_send_html(bot, chat_id, html_msg)
+
+
+async def background_poll_loop(app) -> None:
+    await asyncio.sleep(5)
+    while True:
+        try:
+            if not BOT_ENABLED or MAINTENANCE_MODE:
+                await asyncio.sleep(max(15, REFRESH_INTERVAL_SEC))
+                continue
+
+            if time.time() < PORTAL_CIRCUIT_OPEN_UNTIL:
+                await asyncio.sleep(15)
+                continue
+
+            for chat_id, sess_data in list(USER_SESSIONS.items()):
+                if sess_data.get("step") != "authenticated":
+                    continue
+
+                session = ensure_live_session(chat_id, sess_data)
+                if not session:
+                    continue
+
+                devs, err = await asyncio.to_thread(
+                    parse_devices_page_and_ws, session
+                )
+                if not devs or err != "OK":
+                    sess_data["fail_streak"] = sess_data.get("fail_streak", 0) + 1
+                    continue
+
+                sess_data["fail_streak"] = 0
+                analysis = analyze_devices(devs)
+                PREV_SNAPSHOT[chat_id] = LAST_SNAPSHOT.get(chat_id) or {}
+                LAST_SNAPSHOT[chat_id] = analysis
+                save_snapshot_db(chat_id, analysis)
+
+                for d in analysis.get("assigned_devices") or []:
+                    ser = str(d.get("serial_no") or "")
+                    if not ser:
+                        continue
+                    lbl = format_industry_site_label(
+                        d.get("industry", "N/A"), d.get("site", "N/A")
+                    )
+                    w_keys = WATCHLIST_SITES.get(chat_id) or []
+                    is_pinned = any(
+                        wk.lower()
+                        in f"{d.get('site_id','')} {ser} {d.get('industry','')}".lower()
+                        for wk in w_keys
+                    )
+                    pin_tag = " [PINNED]" if is_pinned else ""
+
+                    if d.get("is_connected"):
+                        had_down = any(
+                            k.startswith(f"{chat_id}:{ser}:down_")
+                            for k in SENT_STAGE_ALERTS
+                        )
+                        clear_stage_alerts_for_device(chat_id, ser)
+                        if had_down or is_pinned:
+                            if NOTIF_STYLE != "alerts_only" or is_pinned:
+                                await _emit_alert_or_digest(
+                                    app.bot,
+                                    chat_id,
+                                    f"∙ <b>RECOVERED{esc(pin_tag)}:</b> <b>{lbl}</b> (<code>{esc(ser)}</code>) is back online.",
+                                )
+                    else:
+                        oh = d.get("offline_hours") or 0.0
+                        stage = None
+                        if oh >= 24.0:
+                            stage = "down_1d"
+                        elif oh >= 10.0:
+                            stage = "down_10h"
+                        elif oh >= 2.0 or is_pinned:
+                            stage = "down_2h"
+
+                        if stage:
+                            st_key = f"{chat_id}:{ser}:{stage}"
+                            if st_key not in SENT_STAGE_ALERTS:
+                                mark_stage_alert_sent(st_key)
+                                dur = format_duration_hm(
+                                    d.get("offline_duration")
+                                )
+                                await _emit_alert_or_digest(
+                                    app.bot,
+                                    chat_id,
+                                    f"• <b>OFFLINE{esc(pin_tag)} ({esc(stage.replace('down_',''))}):</b> "
+                                    f"<b>{lbl}</b> (<code>{esc(ser)}</code>) — Off <code>{esc(dur)}</code>",
+                                )
+
+                if NOTIF_STYLE == "digest":
+                    q_list = DIGEST_QUEUE.get(chat_id) or []
+                    if len(q_list) >= 5:
+                        DIGEST_QUEUE[chat_id] = []
+                        digest_body = (
+                            f"{themed_box(sc('DIGEST ALERTS'))}\n"
+                            + "\n".join(q_list[:12])
+                        )
+                        await safe_send_html(app.bot, chat_id, digest_body)
+
+        except Exception as exc:
+            _record_error("background_poll_loop", exc)
+            logger.warning("Background poll error: %s", exc)
+
+        await asyncio.sleep(max(15, REFRESH_INTERVAL_SEC))
+
+
+# ==============================================================================
+# COMMAND & MESSAGE HANDLERS
+# ==============================================================================
+def _check_bot_gate(user_id: int | None) -> str | None:
+    if is_admin(user_id):
+        return None
+    if not BOT_ENABLED:
+        return "Bot filhal offline/disabled hai."
+    if MAINTENANCE_MODE:
+        return MAINTENANCE_MSG
+    return None
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    gate_err = _check_bot_gate(user_id)
+    if gate_err:
+        await safe_send_html(context.bot, chat_id, esc(gate_err))
         return
 
-    wlist = WATCHLIST_SITES.get(chat_id) or []
-    if not wlist:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"{themed_box(sc('WATCHLIST'))}\n  ▸ Watchlist khali hai. Dashboard menu se <code>⭐ Pin Site</code> use karein.",
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    devs = analysis.get("assigned_devices", [])
-
-    lines = [
-        themed_box(sc("PINNED WATCHLIST") + f" ({len(wlist)})"),
-        get_theme()["bar"],
-    ]
-    for idx, key in enumerate(wlist[:10], start=1):
-        dev = _find_device_by_target(devs, key)
-        if dev:
-            dot = small_status_dot(bool(dev.get("is_connected")))
-            lines.append(
-                f"  {idx}. {dot} <b>{esc(dev.get('industry'))}</b> "
-                f"[ID:<code>{esc(dev.get('site_id') or '-')}</code>] | <code>{esc(dev.get('conn_label'))}</code>"
-            )
-        else:
-            lines.append(f"  {idx}. <code>{esc(key)}</code>")
-
-    await safe_send_html(bot, chat_id, "\n".join(lines))
-
-
-async def send_stale_sites_view(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    stale = analysis.get("stale_list") or []
-    if not stale:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"{themed_box(sc('STALE TELEMETRY'))}\n  ∙ <code>Koi connected-but-stale site (&gt;30m) nahi mili.</code>",
-        )
-        return
-
-    lines = [
-        themed_box(sc("CONNECTED BUT STALE") + f" ({len(stale)})"),
-        get_theme()["bar"],
-    ]
-    for idx, d in enumerate(stale[:10], start=1):
-        lines.append(format_premium_device_block(d, idx))
-    await safe_send_html(bot, chat_id, "\n".join(lines))
-
-
-async def send_login_prompt(chat_id: int, bot) -> None:
-    AI_CHAT_MODE.discard(chat_id)
     AWAITING_INPUT.pop(chat_id, None)
     GAME_SESSIONS.pop(chat_id, None)
-    USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
+    AI_CHAT_MODE.discard(chat_id)
+
+    if require_auth(chat_id):
+        MENU_STATE[chat_id] = "main"
+        MENU_STACK[chat_id] = ["main"]
+        snap = LAST_SNAPSHOT.get(chat_id)
+        if snap:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                build_status_message(snap),
+                reply_markup=main_reply_keyboard(user_id),
+            )
+        else:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc(CLIENT_NAME + ' — COMMAND CENTER'), 'Authenticated Session Active')}",
+                reply_markup=main_reply_keyboard(user_id),
+            )
+        return
+
+    MENU_STATE[chat_id] = "guest"
+    MENU_STACK[chat_id] = ["guest"]
+    welcome = (
+        f"{themed_box(sc(CLIENT_NAME + ' — TELEMETRY SUITE'), 'EnviroFRONT & Excise Operations')}\n"
+        f"{get_theme()['bar']}\n"
+        "  ▸ Portal access ke liye <b>🔐 Login</b> dabayein ya <code>/login</code> bhejein.\n"
+        "  ▸ Login se pehle <b>📖 Manual</b> dekhein ya <b>🎮 Games Lounge</b> mein mini-games khelein."
+    )
     await safe_send_html(
-        bot,
+        context.bot,
         chat_id,
-        (
-            f"{themed_box(sc('PORTAL LOGIN'))}\n"
-            f"{get_theme()['bar']}\n"
-            "  ▸ Kripya apna <b>Login ID / Email</b> bhejein:"
-        ),
+        welcome,
+        reply_markup=guest_reply_keyboard(),
+    )
+
+
+async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    gate_err = _check_bot_gate(user_id)
+    if gate_err:
+        await safe_send_html(context.bot, chat_id, esc(gate_err))
+        return
+
+    GAME_SESSIONS.pop(chat_id, None)
+    USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
+    AWAITING_INPUT[chat_id] = {"action": "login_user"}
+    await safe_send_html(
+        context.bot,
+        chat_id,
+        f"{themed_box(sc('PORTAL LOGIN'))}\n  ▸ Apna EnviroFRONT <b>Username</b> bhejein:",
         reply_markup=guest_keyboard_for_chat(chat_id),
     )
 
 
-async def send_logout_action(chat_id: int, bot) -> None:
-    AI_CHAT_MODE.discard(chat_id)
-    AWAITING_INPUT.pop(chat_id, None)
-    GAME_SESSIONS.pop(chat_id, None)
-    MENU_STATE.pop(chat_id, None)
-    MENU_STACK.pop(chat_id, None)
-    LAST_PAGE_STATE.pop(chat_id, None)
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     sess_data = USER_SESSIONS.pop(chat_id, None)
-    LAST_SNAPSHOT.pop(chat_id, None)
-    clear_all_alerts_for_chat(chat_id)
-
     if sess_data and sess_data.get("session"):
         try:
             sess_data["session"].close()
         except Exception:
             pass
-
-    await safe_send_html(
-        bot,
-        chat_id,
-        (
-            f"{themed_box(sc('LOGGED OUT'))}\n"
-            f"{get_theme()['bar']}\n"
-            "  ▸ Session aur alerts band kar diye gaye hain."
-        ),
-        reply_markup=guest_keyboard_for_chat(chat_id),
-    )
-
-
-async def send_status_action(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text="◈ Fetching live telemetry status...",
-    )
-    try:
-        analysis = await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        sess_data["fail_streak"] = 0
-        LAST_SNAPSHOT[chat_id] = analysis
-        save_snapshot_db(chat_id, analysis)
-
-        if analysis["meta"]["server_error_500"]:
-            await safe_edit_html(
-                loader,
-                f"{themed_box('• SERVER HTTP 500')}\n  ▸ Portal ne <code>500 Internal Server Error</code> diya hai.",
-            )
-            return
-
-        th = get_theme()
-        b = th["bullet"]
-        sites_lines = (
-            "\n".join(
-                f"  {i}. • <b>{esc(s)}</b> — <code>{c} off</code>"
-                for i, (s, c) in enumerate(
-                    analysis["top_offline_sites"], start=1
-                )
-            )
-            if analysis["top_offline_sites"]
-            else "  ∙ <code>Koi critical offline site nahi</code>"
-        )
-        ages = analysis["aging_counts"]
-
-        msg = (
-            f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('STATUS'))}\n"
-            f"{th['bar']}\n"
-            f"  {b} Time         : <i>{esc(analysis['checked_at_ist'])}</i>\n"
-            f"  {b} Source       : <code>{esc(analysis['meta'].get('source', 'none'))}</code>\n"
-            f"  {b} Total        : <b>{analysis['total']}</b>\n"
-            f"  {b} Assigned     : <b>{analysis['assigned_count']}</b> | Unassigned: <b>{analysis['unassigned_count']}</b>\n"
-            f"  {b} Connected    : ∙ <b>{analysis['connected']}</b> (Stale: <b>{analysis.get('stale_count', 0)}</b>)\n"
-            f"  {b} Disconnected : • <b>{analysis['disconnected_count']}</b>\n\n"
-            f"<b>{b} {sc('Aging Buckets (< Range)')}</b>\n"
-            f"  ◦ <code>&lt;1D: {ages['1d']}</code> | ▪ <code>&lt;1W: {ages['1w']}</code> | • <code>&lt;24D: {ages['24d']}</code>\n"
-            f"  ◆ <code>&lt;11M: {ages['11m']}</code> | ◈ <code>&lt;1Y: {ages['1y']}</code> | ▸ <code>&gt;1Y: {ages['gt1y']}</code>\n\n"
-            f"<b>{b} {sc('Top Disconnected Sites')}</b>\n"
-            f"{sites_lines}"
-        )
-        await safe_edit_html(loader, msg)
-    except Exception as exc:
-        sess_data["fail_streak"] = sess_data.get("fail_streak", 0) + 1
-        ensure_live_session(chat_id, sess_data)
-        await safe_edit_html(
-            loader,
-            f"  • <b>Status Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def send_aging_bucket_page(
-    chat_id: int, bucket_key: str, page: int, bot
-) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    title = AGING_RANGE_CONFIG.get(
-        bucket_key, ("DISCONNECTED", None, timedelta(days=1))
-    )[0]
-    try:
-        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        matched = filter_devices_by_aging_range(
-            analysis["all_devices"], bucket_key
-        )
-
-        if not matched:
-            await safe_send_html(
-                bot,
-                chat_id,
-                (
-                    f"{themed_box(esc(title))}\n"
-                    "  ▸ <code>Is range mein koi disconnected site nahi hai.</code>"
-                ),
-                reply_markup=aging_sub_keyboard(),
-            )
-            return
-
-        per_page = 6
-        total_pages = max(1, (len(matched) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        LAST_PAGE_STATE[chat_id] = {
-            "view": "age",
-            "bucket": bucket_key,
-            "page": page,
-            "total_pages": total_pages,
-        }
-        start = page * per_page
-        subset = matched[start : start + per_page]
-
-        lines = [
-            themed_box(esc(title) + f" ({len(matched)})", f"Page {page + 1}/{total_pages}"),
-            get_theme()["bar"],
-        ]
-        for offset, d in enumerate(subset):
-            lines.append(format_premium_device_block(d, start + offset + 1))
-
-        lines.append(
-            f"\n  ▸ Navigation: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
-        )
-        await safe_send_html(
-            bot, chat_id, "\n".join(lines), reply_markup=aging_sub_keyboard()
-        )
-    except Exception as exc:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • <b>Bucket Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def send_allsite_page(chat_id: int, page: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    try:
-        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        assigned_devs = analysis["assigned_devices"]
-
-        if not assigned_devs:
-            await safe_send_html(
-                bot,
-                chat_id,
-                "  ▸ <code>Koi assigned site nahi mili.</code>",
-            )
-            return
-
-        per_page = 6
-        total_pages = max(1, (len(assigned_devs) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        LAST_PAGE_STATE[chat_id] = {
-            "view": "sites",
-            "page": page,
-            "total_pages": total_pages,
-        }
-        start = page * per_page
-        subset = assigned_devs[start : start + per_page]
-
-        lines = [
-            themed_box(
-                sc("ALL SITES") + f" ({len(assigned_devs)})",
-                f"Page {page + 1}/{total_pages}",
-            ),
-            get_theme()["bar"],
-        ]
-        for offset, d in enumerate(subset):
-            g_idx = start + offset
-            lines.append(format_premium_device_block(d, g_idx + 1))
-
-        lines.append(
-            "\n  ▸ Dashboard: <code>/dash &lt;no/serial/name&gt;</code> | Pages: <code>/prev</code> / <code>/next</code>"
-        )
-        await safe_send_html(bot, chat_id, "\n".join(lines))
-    except Exception as exc:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • <b>All Sites Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-def _format_excise_pairs_and_rows(rep: dict[str, Any]) -> list[str]:
-    out: list[str] = [
-        f"\n\n<b>◈ {sc('UP EXCISE API REPORT')} ({esc(rep.get('report_date') or today_ist_report_date())})</b>",
-        f"  ▸ VAT Codes : <code>{esc(', '.join(rep.get('vat_codes') or []) or 'N/A')}</code>",
-        f"  ▸ Logs      : <b>{rep.get('total', 0)}</b> (Initial I: <b>{rep.get('initial_count', 0)}</b> | Final F: <b>{rep.get('final_count', 0)}</b> | Pending F: <b>{rep.get('pending_final_count', 0)}</b>)",
-        f"  ▸ Status    : Ok <b>{rep.get('success', 0)}</b> | Err <b>{rep.get('failed', 0)}</b>",
-    ]
-    pairs = rep.get("pairs") or []
-    if pairs:
-        out.append(f"  <b>▸ {sc('RequestID Pairs (Initial → Final)')}</b>")
-        for p in pairs[:6]:
-            rid = p.get("request_id") or "N/A"
-            vc = p.get("vat_code") or "-"
-            rt = f" [{p.get('request_type')}]" if p.get("request_type") else ""
-            delta_t = p.get("delta_text") or ""
-            ini = p.get("initial")
-            fin = p.get("final")
-
-            ini_str = (
-                f"I: {ini.get('timestamp')} (mm:{ini.get('length')}, L:{ini.get('bl')})"
-                if ini
-                else "I: -"
-            )
-            fin_str = (
-                f"F: {fin.get('timestamp')} (mm:{fin.get('length')}, L:{fin.get('bl')})"
-                if fin
-                else "F: Pending"
-            )
-            delta_line = (
-                f"\n      ↳ Delta: <code>{esc(delta_t)}</code>" if delta_t else ""
-            )
-            out.append(
-                f"    • <code>{esc(rid)}</code> | VAT: <code>{esc(vc)}{esc(rt)}</code>\n"
-                f"      ↳ <code>{esc(ini_str)}</code>\n"
-                f"      ↳ <code>{esc(fin_str)}</code>{delta_line}"
-            )
-    elif rep.get("rows"):
-        for idx, row in enumerate(rep["rows"][:8], start=1):
-            out.append(
-                f"  {idx}. [<code>{esc(row.get('process'))}</code>] <code>{esc(row.get('request_id'))}</code> "
-                f"({esc(row.get('vat_code'))}) → <code>{esc(row.get('status_text'))}</code>"
-            )
-    else:
-        out.append("  ▸ <code>Is date ke liye koi API request log nahi mila.</code>")
-
-    if rep.get("error"):
-        out.append(f"  • Report Note: <code>{esc(rep.get('error'))}</code>")
-    return out
-
-
-async def send_site_dashboard_by_target(
-    chat_id: int, target: str, bot
-) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Session expire ho gaya hai, dobara login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    assigned_devs = analysis["assigned_devices"]
-
-    dev = _find_device_by_target(assigned_devs, target)
-    if not dev:
-        await safe_send_html(
-            bot,
-            chat_id,
-            (
-                f"  • <b>Reason:</b> Site '<code>{esc(target or 'empty')}</code>' nahi mili. "
-                "Pehle <code>/allsite</code> check karein ya <code>/dash &lt;number/serial/name&gt;</code> bhejein."
-            ),
-        )
-        return
-
-    LAST_PAGE_STATE[chat_id] = {
-        "view": "last_site",
-        "site_key": dev.get("site_id") or dev.get("serial_no") or dev.get("industry"),
-    }
-
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text=f"◈ Opening dashboard & API report: {dev['industry']}...",
-    )
-
-    try:
-        dash = await asyncio.to_thread(
-            scrape_site_dashboard_details, sess_data["session"], dev
-        )
-    except Exception as exc:
-        dash = {
-            "ok": False,
-            "site_id": dev.get("site_id", ""),
-            "site_code": dev.get("site_code", ""),
-            "site_name_ws": "",
-            "url": dev.get("dashboard_url", ""),
-            "error": f"Exception: {exc}",
-            "instruments": [],
-            "api_report": None,
-        }
-
-    dot = small_status_dot(dev["is_connected"])
-    conn_word = "CONNECTED" if dev["is_connected"] else "DISCONNECTED"
-    off_info = (
-        "(Active)"
-        if dev["is_connected"]
-        else format_off_since_text(
-            dev.get("last_seen"), dev.get("offline_duration")
-        )
-    )
-    ws_name_line = (
-        f"\n  ▸ WS Name   : <code>{esc(dash.get('site_name_ws'))}</code>"
-        if dash.get("site_name_ws")
-        else ""
-    )
-    code_line = (
-        f"\n  ▸ Site Code : <code>{esc(dash.get('site_code'))}</code>"
-        if dash.get("site_code")
-        else ""
-    )
-
-    header = (
-        f"{themed_box(esc(dev['industry']))}\n"
-        f"{get_theme()['bar']}\n"
-        f"  ▸ Site Type : <code>{esc(dev['site'])}</code>\n"
-        f"  ▸ Serial No : <b>{esc(dev['serial_no'])}</b>\n"
-        f"  ▸ Site ID   : <code>{esc(dash.get('site_id') or 'N/A')}</code>{code_line}{ws_name_line}\n"
-        f"  ▸ Status    : {dot} <b>{conn_word}</b> (<code>{esc(dev['display_time'])}</code>)/(<code>{esc(off_info)}</code>)\n\n"
-    )
-
-    if dash.get("instruments"):
-        grouped_lines = group_readings_by_tank(dash["instruments"])
-        inst_section = (
-            f"<b>◈ {sc('GROUPED TANK & INSTRUMENT READINGS (MM / L / INST)')}</b>\n"
-            + "\n".join(grouped_lines)
-        )
-    else:
-        reason = dash.get("error") or "Dashboard WS mein koi tag value nahi mili."
-        inst_section = (
-            f"<b>◈ {sc('LIVE DASHBOARD READINGS')}</b>\n"
-            f"  • Info      : <code>{esc(reason)}</code>"
-        )
-
-    rep = dash.get("api_report") or {}
-    api_lines = _format_excise_pairs_and_rows(rep)
-    await safe_edit_html(loader, header + inst_section + "".join(api_lines))
-
-
-async def send_api_report_action(
-    chat_id: int, target: str, report_date: str | None, bot
-) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    devs = analysis.get("assigned_devices", [])
-    dev = _find_device_by_target(devs, target)
-    if not dev:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Use: <code>/apireport &lt;no/serial/name&gt; [DD-Mon-YYYY]</code>",
-        )
-        return
-
-    sid = str(dev.get("site_id") or "").strip()
-    if not sid.isdigit():
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • <b>{esc(dev['industry'])}</b> ke liye Site ID nahi mila.",
-        )
-        return
-
-    rdate = (report_date or today_ist_report_date()).strip()
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text=f"◈ Fetching UP Excise API Report ({rdate}) for {dev['industry']}...",
-    )
-    rep = await asyncio.to_thread(
-        fetch_site_api_report, sess_data["session"], sid, rdate
-    )
-
-    lines = [
-        themed_box(sc("API REPORT")),
-        get_theme()["bar"],
-        f"  ▸ Site      : <b>{esc(dev['industry'])}</b> (ID: <code>{esc(sid)}</code>)",
-        f"  ▸ Date      : <code>{esc(rdate)}</code>",
-    ]
-    lines.extend(_format_excise_pairs_and_rows(rep))
-    await safe_edit_html(loader, "".join(lines))
-
-
-async def send_instruments_view(
-    chat_id: int, bot, page: int = 0, query: str = ""
-) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    devs = analysis.get("assigned_devices", [])
-
-    q = (query or "").strip().lower()
-    if q:
-        devs = [
-            d
-            for d in devs
-            if q in str(d.get("industry", "")).lower()
-            or q in str(d.get("site", "")).lower()
-            or q in str(d.get("serial_no", "")).lower()
-            or q in str(d.get("site_id", "")).lower()
-            or q in str(d.get("site_code", "")).lower()
-        ]
-
-    if not devs:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  ▸ <code>'{esc(query or 'sites')}' ke liye koi site nahi mili.</code>",
-        )
-        return
-
-    per_page = 5
-    total_pages = max(1, (len(devs) + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    LAST_PAGE_STATE[chat_id] = {
-        "view": "inst",
-        "page": page,
-        "total_pages": total_pages,
-        "query": query,
-    }
-    start = page * per_page
-    subset = devs[start : start + per_page]
-
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text="◈ Fetching Distillery & Bottling tag/instrument readings...",
-    )
-
-    blocks: list[str] = [
-        themed_box(sc("INSTRUMENTS & TANKS"), f"Page {page + 1}/{total_pages}"),
-        get_theme()["bar"],
-    ]
-
-    for offset, d in enumerate(subset):
-        idx = start + offset + 1
-        dash = await asyncio.to_thread(
-            scrape_site_dashboard_details, sess_data["session"], d
-        )
-        dot = small_status_dot(d["is_connected"])
-        conn_word = "CONNECTED" if d["is_connected"] else "DISCONNECTED"
-        blocks.append(
-            f"┌─ #{idx} <b>{format_industry_site_label(d['industry'], d['site'])}</b>\n"
-            f"│  ▸ Serial : <b>{esc(d['serial_no'])}</b> | {dot} <b>{conn_word}</b>"
-        )
-        insts = dash.get("instruments") or []
-        if insts:
-            for gline in group_readings_by_tank(insts)[:8]:
-                blocks.append(f"│  {gline.lstrip()}")
-        else:
-            blocks.append(
-                f"│  • Readings: <code>{esc(dash.get('error') or 'No tag values returned')}</code>"
-            )
-        blocks.append("└──────────────────────")
-
-    blocks.append(
-        f"\n  ▸ Pages: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
-    )
-    await safe_edit_html(loader, "\n".join(blocks))
-
-
-async def send_online_page(chat_id: int, page: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    try:
-        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        online_list = analysis["online_list"]
-
-        if not online_list:
-            await safe_send_html(
-                bot,
-                chat_id,
-                "  ▸ <code>Koi connected device nahi mila.</code>",
-            )
-            return
-
-        per_page = 6
-        total_pages = max(1, (len(online_list) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        LAST_PAGE_STATE[chat_id] = {
-            "view": "online",
-            "page": page,
-            "total_pages": total_pages,
-        }
-        start = page * per_page
-        subset = online_list[start : start + per_page]
-
-        lines = [
-            themed_box(
-                sc("CONNECTED") + f" ({len(online_list)})",
-                f"Page {page + 1}/{total_pages}",
-            ),
-            get_theme()["bar"],
-        ]
-        for offset, d in enumerate(subset):
-            lines.append(format_premium_device_block(d, start + offset + 1))
-
-        lines.append(
-            f"\n  ▸ Pages: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
-        )
-        await safe_send_html(bot, chat_id, "\n".join(lines))
-    except Exception as exc:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • <b>Online Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def send_unassigned_page(chat_id: int, page: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    try:
-        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        unassigned_list = analysis["unassigned_list"]
-
-        if not unassigned_list:
-            await safe_send_html(
-                bot,
-                chat_id,
-                "  ▸ <code>Koi N/A unassigned device nahi mila.</code>",
-            )
-            return
-
-        per_page = 6
-        total_pages = max(1, (len(unassigned_list) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        LAST_PAGE_STATE[chat_id] = {
-            "view": "unass",
-            "page": page,
-            "total_pages": total_pages,
-        }
-        start = page * per_page
-        subset = unassigned_list[start : start + per_page]
-
-        lines = [
-            themed_box(
-                sc("UNASSIGNED N/A") + f" ({len(unassigned_list)})",
-                f"Page {page + 1}/{total_pages}",
-            ),
-            get_theme()["bar"],
-        ]
-        for offset, d in enumerate(subset):
-            lines.append(format_premium_device_block(d, start + offset + 1))
-
-        lines.append(
-            f"\n  ▸ Pages: <code>/prev</code> / <code>/next</code> (Page {page + 1}/{total_pages})"
-        )
-        await safe_send_html(bot, chat_id, "\n".join(lines))
-    except Exception as exc:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • <b>Unassigned Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def step_pagination(chat_id: int, delta: int, bot) -> None:
-    st = LAST_PAGE_STATE.get(chat_id)
-    if not st:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  • <b>Reason:</b> Koi active paginated list nahi hai. Pehle <code>/allsite</code>, <code>/online</code>, <code>/unassigned</code>, ya <code>/instruments</code> chalayein.",
-        )
-        return
-
-    next_p = int(st.get("page", 0)) + delta
-    total_p = int(st.get("total_pages", 1))
-    if next_p < 0:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  • Aap pehle hi <b>Page 1</b> par hain.",
-        )
-        return
-    if next_p >= total_p:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • Aap aakhri <b>Page {total_p}</b> par hain.",
-        )
-        return
-
-    view = st.get("view")
-    if view == "sites":
-        await send_allsite_page(chat_id, next_p, bot)
-    elif view == "online":
-        await send_online_page(chat_id, next_p, bot)
-    elif view == "unass":
-        await send_unassigned_page(chat_id, next_p, bot)
-    elif view == "inst":
-        await send_instruments_view(
-            chat_id, bot, page=next_p, query=str(st.get("query") or "")
-        )
-    elif view == "age":
-        await send_aging_bucket_page(
-            chat_id, str(st.get("bucket") or "1d"), next_p, bot
-        )
-
-
-async def send_health_action(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    try:
-        analysis = await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        meta = analysis["meta"]
-        th = get_theme()
-        b = th["bullet"]
-
-        type_lines = (
-            "\n".join(
-                f"  {b} <code>{esc(dt)} : {cnt}</code>"
-                for dt, cnt in sorted(
-                    analysis["device_type_breakdown"].items(),
-                    key=lambda x: -x[1],
-                )
-            )
-            or "  <code>No device type data</code>"
-        )
-        fw_lines = (
-            "\n".join(
-                f"  {b} <code>FW {esc(fw)} : {cnt}</code>"
-                for fw, cnt in sorted(
-                    analysis["firmware_breakdown"].items(), key=lambda x: -x[1]
-                )
-            )
-            or "  <code>No firmware data</code>"
-        )
-
-        msg = (
-            f"{themed_box(sc('SYSTEM HEALTH'))}\n"
-            f"{th['bar']}\n"
-            f"  {b} Client      : <code>{esc(CLIENT_NAME)}</code>\n"
-            f"  {b} Source      : <code>{esc(meta.get('source', 'none'))}</code>\n"
-            f"  {b} Theme / Sync: <code>{esc(th['label'])}</code> / <code>{REFRESH_INTERVAL_SEC}s</code>\n"
-            f"  {b} HTTP 500    : <code>{'YES' if meta['server_error_500'] else 'NO'}</code>\n"
-            f"  {b} Total / N/A : <b>{analysis['total']} / {analysis['unassigned_count']}</b>\n\n"
-            f"<b>{b} {sc('Device Types')}</b>\n{type_lines}\n\n"
-            f"<b>{b} {sc('Firmware')}</b>\n{fw_lines}"
-        )
-        await safe_send_html(bot, chat_id, msg)
-    except Exception as exc:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • <b>Health Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def send_export_csv_action(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text="◈ Generating CSV report...",
-    )
-    try:
-        analysis = await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        csv_bytes = build_csv_bytes(analysis["all_devices"])
-        ts_tag = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
-        fname = f"{CLIENT_NAME.lower().replace(' ', '_')}_devices_{ts_tag}.csv"
-        await bot.send_document(
-            chat_id=chat_id,
-            document=io.BytesIO(csv_bytes),
-            filename=fname,
-            caption=(
-                f"{CLIENT_NAME} — {sc('CSV EXPORT')}\n"
-                f"▸ Total: {analysis['total']} | "
-                f"Assigned: {analysis['assigned_count']} | "
-                f"Unassigned: {analysis['unassigned_count']}"
-            ),
-        )
-        await loader.delete()
-    except Exception as exc:
-        await safe_edit_html(
-            loader,
-            f"  • <b>CSV Export Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def send_site_search_action(
-    chat_id: int, query: str, bot
-) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    q = (query or "").strip().lower()
-    if not q:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Use: <code>/site &lt;industry / site / serial / code&gt;</code>",
-        )
-        return
-
-    analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-        run_self_analysis, sess_data["session"]
-    )
-    LAST_SNAPSHOT[chat_id] = analysis
-    matches = [
-        d
-        for d in analysis["all_devices"]
-        if q in str(d.get("industry", "")).lower()
-        or q in str(d.get("site", "")).lower()
-        or q in str(d.get("serial_no", "")).lower()
-        or q in str(d.get("site_id", "")).lower()
-        or q in str(d.get("site_code", "")).lower()
-    ]
-    if not matches:
-        await safe_send_html(
-            bot,
-            chat_id,
-            f"  • '<code>{esc(query)}</code>' ke liye koi match nahi mila.",
-        )
-        return
-
-    lines = [
-        themed_box(sc("SEARCH RESULT") + f" ({len(matches)})"),
-        get_theme()["bar"],
-    ]
-    for i, d in enumerate(matches[:10], start=1):
-        lines.append(format_premium_device_block(d, i))
-    await safe_send_html(bot, chat_id, "\n".join(lines))
-
-
-async def send_ai_analyze_action(chat_id: int, bot) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text="◈ Groq AI compact telemetry report tayar kar raha hai...",
-    )
-    try:
-        analysis = await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        save_snapshot_db(chat_id, analysis)
-
-        report_txt = await asyncio.to_thread(
-            generate_ai_analysis, sess_data["session"], analysis
-        )
-        msg = (
-            f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('AI BRIEF'))}\n"
-            f"{get_theme()['bar']}\n"
-            f"  ▸ Time: <i>{esc(analysis['checked_at_ist'])}</i>\n\n"
-            f"{clean_ai_text(report_txt)}"
-        )
-        await safe_edit_html(loader, msg)
-    except Exception as exc:
-        await safe_edit_html(
-            loader,
-            f"  • <b>AI Analyze Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-async def send_ai_answer_action(
-    chat_id: int, question: str, bot
-) -> None:
-    sess_data = require_auth(chat_id)
-    if not sess_data:
-        await safe_send_html(
-            bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-
-    loader = await bot.send_message(
-        chat_id=chat_id,
-        text="◈ Groq AI jawab de raha hai...",
-    )
-    try:
-        analysis = LAST_SNAPSHOT.get(chat_id) or await asyncio.to_thread(
-            run_self_analysis, sess_data["session"]
-        )
-        LAST_SNAPSHOT[chat_id] = analysis
-        ans = await asyncio.to_thread(
-            answer_project_question, question, sess_data["session"], analysis
-        )
-        msg = (
-            f"{themed_box(esc(CLIENT_NAME) + ' — ' + sc('GROQ AI'))}\n"
-            f"{get_theme()['bar']}\n"
-            f"{clean_ai_text(ans)}"
-        )
-        await safe_edit_html(loader, msg)
-    except Exception as exc:
-        await safe_edit_html(
-            loader,
-            f"  • <b>Groq AI Error:</b> <code>{esc(exc)}</code>",
-        )
-
-
-# ==============================================================================
-# TELEGRAM COMMAND HANDLERS
-# ==============================================================================
-async def cmd_start(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    if not await check_access(chat_id, user_id, context.bot):
-        return
+    AWAITING_INPUT.pop(chat_id, None)
     AI_CHAT_MODE.discard(chat_id)
-    await send_start_view(chat_id, user_id, context.bot)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    if not await check_access(chat_id, user_id, context.bot):
-        return
-    await send_manual_view(chat_id, user_id, context.bot)
-
-
-async def cmd_login(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await send_login_prompt(chat_id, context.bot)
-
-
-async def cmd_logout(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await send_logout_action(chat_id, context.bot)
-
-
-async def cmd_status(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await send_status_action(chat_id, context.bot)
-
-
-async def cmd_allsite(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    page = 0
-    if context.args:
-        try:
-            page = max(0, int(context.args[0]) - 1)
-        except ValueError:
-            page = 0
-    await send_allsite_page(chat_id, page, context.bot)
-
-
-async def cmd_dash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    target = " ".join(context.args).strip() if context.args else ""
-    if not target:
-        await open_dashboard_menu(chat_id, context.bot)
-        return
-    await send_site_dashboard_by_target(chat_id, target, context.bot)
-
-
-async def cmd_apireport(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    args = list(context.args or [])
-    rdate: str | None = None
-    if args and re.fullmatch(r"\d{2}-[A-Za-z]{3}-\d{4}", args[-1]):
-        rdate = args.pop()
-    target = " ".join(args).strip()
-    if not target:
-        await open_api_report_menu(chat_id, context.bot)
-        return
-    await send_api_report_action(chat_id, target, rdate, context.bot)
-
-
-async def cmd_instruments(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    q = " ".join(context.args).strip() if context.args else ""
-    await send_instruments_view(chat_id, context.bot, page=0, query=q)
-
-
-async def cmd_online(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    page = 0
-    if context.args:
-        try:
-            page = max(0, int(context.args[0]) - 1)
-        except ValueError:
-            page = 0
-    await send_online_page(chat_id, page, context.bot)
-
-
-async def cmd_unassigned(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    page = 0
-    if context.args:
-        try:
-            page = max(0, int(context.args[0]) - 1)
-        except ValueError:
-            page = 0
-    await send_unassigned_page(chat_id, page, context.bot)
-
-
-async def cmd_aging(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await open_aging_menu(chat_id, context.bot)
-
-
-async def cmd_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    if not context.args:
-        await open_aging_menu(chat_id, context.bot)
-        return
-    bucket = context.args[0].strip().lower()
-    if bucket not in AGING_RANGE_CONFIG:
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ▸ Use: <code>/age 1d</code>, <code>/age 1w</code>, <code>/age 24d</code>, <code>/age 11m</code>, <code>/age 1y</code>, ya <code>/age gt1y</code>",
-        )
-        return
-    await send_aging_bucket_page(chat_id, bucket, 0, context.bot)
-
-
-async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await step_pagination(chat_id, +1, context.bot)
-
-
-async def cmd_prev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await step_pagination(chat_id, -1, context.bot)
-
-
-async def cmd_health(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await send_health_action(chat_id, context.bot)
-
-
-async def cmd_export(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await send_export_csv_action(chat_id, context.bot)
-
-
-async def cmd_site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    q = " ".join(context.args).strip() if context.args else ""
-    await send_site_search_action(chat_id, q, context.bot)
-
-
-async def cmd_ai_analyze(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    await send_ai_analyze_action(chat_id, context.bot)
-
-
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    if not await check_access(chat_id, update.effective_user.id, context.bot):
-        return
-    if not require_auth(chat_id):
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ▸ Pehle login karein (<code>/login</code>):",
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-    q = " ".join(context.args).strip() if context.args else ""
-    if not q:
-        AI_CHAT_MODE.add(chat_id)
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ▸ <b>Groq AI Mode ON</b> — Apna sawal bhejein. Band karne ke liye <code>/exit_ai</code> bhejein.",
-        )
-        return
-    await send_ai_answer_action(chat_id, q, context.bot)
-
-
-async def cmd_exit_ai(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    AI_CHAT_MODE.discard(chat_id)
+    MENU_STATE[chat_id] = "guest"
+    MENU_STACK[chat_id] = ["guest"]
     await safe_send_html(
         context.bot,
         chat_id,
-        "  ▸ <b>Groq AI Mode OFF</b>.",
+        f"{themed_box(sc('LOGGED OUT'))}\n  ▸ Session band kar diya gaya hai.",
+        reply_markup=guest_reply_keyboard(),
+    )
+
+
+async def cmd_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    manual_txt = (
+        f"{themed_box(sc('OPERATOR MANUAL'))}\n"
+        f"{get_theme()['bar']}\n"
+        "  ▸ <b>◈ Status / ◈ All Sites</b>: Fleet overview aur paginated site list.\n"
+        "  ▸ <b>🌐 Site Dashboard</b>: Live tank `mm` / `L` readings, tags aur Excise summary.\n"
+        "  ▸ <b>📡 API Report</b>: Today / Custom Date / Site Excise API (`I` → `F`) report.\n"
+        "  ▸ <b>📐 Instruments</b>: Sabhi sites ke instruments & tanks (with zero/drift flags).\n"
+        "  ▸ <b>⏳ Aging</b>: Offline buckets (<code>&lt;1D</code> se <code>&gt;1Y</code>).\n"
+        "  ▸ <b>⭐ Watchlist</b>: Priority pinned sites & alerts.\n"
+        "  ▸ <b>🤖 AI Suite</b>: Grounded AI brief aur Q&amp;A (anti-loop protected).\n"
+        "  ▸ <b>⬅ Back / Next ➡ / 🏠 Main Menu</b>: Har view mein direct navigation."
+    )
+    await safe_send_html(
+        context.bot,
+        chat_id,
+        manual_txt,
         reply_markup=current_keyboard_for_chat(chat_id, user_id),
     )
 
 
-# ==============================================================================
-# ADMIN COMMANDS (ONLY ADMIN_TG_ID)
-# ==============================================================================
-async def cmd_admin(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    await open_admin_panel(update.effective_chat.id, context.bot)
+async def _refresh_or_get_snapshot(
+    chat_id: int, sess_data: dict[str, Any], bot
+) -> dict[str, Any] | None:
+    cached = LAST_SNAPSHOT.get(chat_id)
+    if cached and cached.get("all_devices"):
+        return cached
 
-
-async def cmd_set_theme(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global ACTIVE_THEME
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    th_key = (context.args[0].strip().lower() if context.args else "")
-    if th_key not in THEME_CONFIGS:
+    session = ensure_live_session(chat_id, sess_data)
+    if not session:
         await safe_send_html(
-            context.bot,
-            update.effective_chat.id,
-            "  ▸ Use: <code>/set_theme obsidian | minimal | cyber | royal</code>",
+            bot, chat_id, "Session available nahi hai. Kripya dobara login karein."
         )
-        return
-    ACTIVE_THEME = th_key
-    save_setting_db("active_theme", ACTIVE_THEME)
-    await safe_send_html(
-        context.bot,
-        update.effective_chat.id,
-        f"  ∙ <b>Theme set to:</b> <code>{esc(get_theme()['label'])}</code>",
+        return None
+
+    wait_msg = await bot.send_message(
+        chat_id=chat_id, text="Portal se live fleet data fetch ho raha hai..."
     )
+    devs, err = await asyncio.to_thread(parse_devices_page_and_ws, session)
+    if not devs or err != "OK":
+        sess_data["fail_streak"] = sess_data.get("fail_streak", 0) + 1
+        await safe_edit_html(wait_msg, f"Fetch error: <code>{esc(err)}</code>")
+        return None
 
-
-async def cmd_bot_on(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global BOT_ENABLED
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    BOT_ENABLED = True
-    save_setting_db("bot_enabled", "1")
-    await safe_send_html(
-        context.bot,
-        update.effective_chat.id,
-        "  ∙ <b>Bot ON kar diya gaya hai.</b>",
-    )
-
-
-async def cmd_bot_off(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global BOT_ENABLED
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    BOT_ENABLED = False
-    save_setting_db("bot_enabled", "0")
-    await safe_send_html(
-        context.bot,
-        update.effective_chat.id,
-        "  • <b>Bot OFF kar diya gaya hai.</b>",
-    )
-
-
-async def cmd_maint_on(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global MAINTENANCE_MODE, MAINTENANCE_MSG
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    MAINTENANCE_MODE = True
-    if context.args:
-        MAINTENANCE_MSG = " ".join(context.args).strip()
-    save_setting_db("maint_mode", "1")
-    save_setting_db("maint_msg", MAINTENANCE_MSG)
-    await safe_send_html(
-        context.bot,
-        update.effective_chat.id,
-        f"  ◈ <b>Maintenance Mode ON:</b> <code>{esc(MAINTENANCE_MSG)}</code>",
-    )
-
-
-async def cmd_maint_off(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global MAINTENANCE_MODE
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    MAINTENANCE_MODE = False
-    save_setting_db("maint_mode", "0")
-    await safe_send_html(
-        context.bot,
-        update.effective_chat.id,
-        "  ∙ <b>Maintenance Mode OFF.</b>",
-    )
-
-
-async def cmd_set_refresh(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global REFRESH_INTERVAL_SEC
-    if not update.effective_chat or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    if not context.args:
-        await safe_send_html(
-            context.bot,
-            update.effective_chat.id,
-            "  ▸ Use: <code>/set_refresh 30</code> (15 se 3600 seconds)",
-        )
-        return
+    sess_data["fail_streak"] = 0
+    analysis = analyze_devices(devs)
+    LAST_SNAPSHOT[chat_id] = analysis
+    save_snapshot_db(chat_id, analysis)
     try:
-        sec = int(context.args[0])
-        if sec < 15 or sec > 3600:
-            raise ValueError()
-        REFRESH_INTERVAL_SEC = sec
-        save_setting_db("refresh_sec", str(sec))
-        await safe_send_html(
-            context.bot,
-            update.effective_chat.id,
-            f"  ∙ <b>Sync Rate set to {sec}s.</b>",
-        )
-    except ValueError:
-        await safe_send_html(
-            context.bot,
-            update.effective_chat.id,
-            "  • 15 se 3600 ke beech valid seconds dein.",
-        )
+        await wait_msg.delete()
+    except Exception:
+        pass
+    return analysis
 
 
-async def cmd_set_notif(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+async def _force_fresh_snapshot(
+    chat_id: int, sess_data: dict[str, Any], bot
+) -> dict[str, Any] | None:
+    session = ensure_live_session(chat_id, sess_data)
+    if not session:
+        return None
+    devs, err = await asyncio.to_thread(parse_devices_page_and_ws, session)
+    if not devs or err != "OK":
+        return LAST_SNAPSHOT.get(chat_id)
+    analysis = analyze_devices(devs)
+    PREV_SNAPSHOT[chat_id] = LAST_SNAPSHOT.get(chat_id) or {}
+    LAST_SNAPSHOT[chat_id] = analysis
+    save_snapshot_db(chat_id, analysis)
+    return analysis
+
+
+async def _render_paginated_state(
+    chat_id: int, user_id: int | None, sess_data: dict[str, Any], bot, delta: int = 0
 ) -> None:
-    global NOTIF_STYLE
-    if not update.effective_chat or not update.effective_user:
+    st = LAST_PAGE_STATE.get(chat_id) or {"kind": "all_sites", "page": 1}
+    kind = st.get("kind", "all_sites")
+    page = max(1, int(st.get("page", 1)) + delta)
+
+    analysis = await _refresh_or_get_snapshot(chat_id, sess_data, bot)
+    if not analysis:
         return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("  • Admin access required.")
-        return
-    if not context.args or context.args[0].lower() not in (
-        "detailed",
-        "compact",
-        "alerts_only",
-        "digest",
-    ):
-        await safe_send_html(
-            context.bot,
-            update.effective_chat.id,
-            "  ▸ Use: <code>/set_notif detailed | compact | alerts_only | digest</code>",
+
+    session = sess_data.get("session")
+
+    if kind == "all_sites":
+        txt, page, total_p = build_all_sites_page(analysis, page=page, page_size=5)
+    elif kind == "online":
+        txt, page, total_p = build_filtered_devices_page(
+            analysis.get("online_list") or [],
+            "ONLINE SITES",
+            analysis["checked_at_ist"],
+            page=page,
+            page_size=5,
         )
-        return
-    NOTIF_STYLE = context.args[0].lower()
-    save_setting_db("notif_style", NOTIF_STYLE)
-    await safe_send_html(
-        context.bot,
-        update.effective_chat.id,
-        f"  ∙ <b>Notification Style set to:</b> <code>{esc(NOTIF_STYLE)}</code>",
-    )
-
-
-# ==============================================================================
-# TEXT ROUTER (LOGIN FLOW, GAMES, CONTEXT MENUS, ADMIN CONTROLS, AI CHAT)
-# ==============================================================================
-async def handle_text_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    global BOT_ENABLED, MAINTENANCE_MODE, REFRESH_INTERVAL_SEC, NOTIF_STYLE, ACTIVE_THEME
-
-    if (
-        not update.effective_chat
-        or not update.effective_user
-        or not update.message
-        or not update.message.text
-    ):
-        return
-
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    raw_text = update.message.text.strip()
-    low = raw_text.lower()
-
-    if not await check_access(chat_id, user_id, context.bot):
-        return
-
-    # 1. Login sequence
-    sess_data = USER_SESSIONS.get(chat_id)
-    if sess_data and sess_data.get("step") == "awaiting_username":
-        if low in ("🎮 games lounge", "🎲 tic-tac-toe", "🔢 number guess", "✂ rock paper scissors", "📖 manual"):
-            pass
-        else:
-            USER_SESSIONS[chat_id] = {
-                "step": "awaiting_password",
-                "username": raw_text,
-            }
-            await safe_send_html(
-                context.bot, chat_id, "  ▸ Ab apna <b>Password</b> bhejein:"
-            )
+    elif kind == "unassigned":
+        txt, page, total_p = build_filtered_devices_page(
+            analysis.get("unassigned_list") or [],
+            "UNASSIGNED DEVICES",
+            analysis["checked_at_ist"],
+            page=page,
+            page_size=5,
+        )
+    elif kind == "stale":
+        txt, page, total_p = build_filtered_devices_page(
+            analysis.get("stale_list") or [],
+            "STALE SITES (>30m)",
+            analysis["checked_at_ist"],
+            page=page,
+            page_size=5,
+        )
+    elif kind == "bucket":
+        b_name = st.get("bucket", "<1D")
+        b_list = (analysis.get("buckets") or {}).get(b_name) or []
+        txt, page, total_p = build_filtered_devices_page(
+            b_list,
+            f"AGING {b_name}",
+            analysis["checked_at_ist"],
+            page=page,
+            page_size=5,
+        )
+    elif kind == "instruments":
+        if not session:
             return
-
-    if sess_data and sess_data.get("step") == "awaiting_password":
-        username = sess_data.get("username", "")
-        password = raw_text
+        msg_w = await bot.send_message(
+            chat_id=chat_id,
+            text=f"Instruments & tanks load ho rahe hain (Page {page})...",
+        )
+        txt, page, total_p = await asyncio.to_thread(
+            build_instruments_page, session, analysis, page=page, page_size=5
+        )
         try:
-            await update.message.delete()
+            await msg_w.delete()
         except Exception:
             pass
-
-        wait_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="◈ EnviroFRONT portal par login ho raha hai...",
-        )
-
-        session, err = await asyncio.to_thread(
-            login_envirofront, username, password
-        )
-        if not session:
-            USER_SESSIONS[chat_id] = {"step": "awaiting_username"}
-            await safe_edit_html(
-                wait_msg,
-                f"  • <b>Login Failed:</b> <code>{esc(err)}</code>\n  ▸ Dobara <b>Login ID / Email</b> bhejein:",
+    elif kind == "dashboard":
+        devs = analysis.get("assigned_devices") or []
+        if not devs:
+            txt = "Koi assigned site nahi mili."
+            page, total_p = 1, 1
+        else:
+            total_p = len(devs)
+            page = max(1, min(page, total_p))
+            dev_obj = devs[page - 1]
+            msg_w = await bot.send_message(
+                chat_id=chat_id,
+                text=f"Site dashboard fetch ho raha hai (#{page}/{total_p})...",
             )
-            return
+            txt = await asyncio.to_thread(
+                build_site_dashboard_card,
+                session,
+                dev_obj,
+                index=page,
+                chat_id=chat_id,
+            )
+            try:
+                await msg_w.delete()
+            except Exception:
+                pass
+    else:
+        txt, page, total_p = build_all_sites_page(analysis, page=1, page_size=5)
 
-        USER_SESSIONS[chat_id] = {
-            "step": "authenticated",
-            "username": username,
-            "session": session,
-            "fail_streak": 0,
-        }
-        GAME_SESSIONS.pop(chat_id, None)
-        MENU_STATE[chat_id] = "main"
-        MENU_STACK[chat_id] = []
-        th = get_theme()
-        await safe_edit_html(
-            wait_msg,
-            f"{themed_box('∙ ' + esc(CLIENT_NAME), sc('AUTHENTICATED'))}\n"
-            f"{th['bar']}\n"
-            f"  ▸ Account   : <code>{esc(username)}</code>\n"
-            f"  ▸ Theme     : <code>{esc(th['label'])}</code>\n"
-            f"  ▸ Alerts    : <code>2h → 10h → 1d (1-Time)</code>",
-        )
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            f"◈ <b>{esc(CLIENT_NAME)} — {sc('PANEL ACTIVE')}</b>",
-            reply_markup=main_reply_keyboard(user_id),
-        )
+    st["page"] = page
+    st["total_pages"] = total_p
+    LAST_PAGE_STATE[chat_id] = st
+
+    kb = (
+        dashboard_sub_keyboard(chat_id)
+        if kind == "dashboard"
+        else paginated_list_keyboard(user_id)
+    )
+    await safe_send_html(bot, chat_id, txt, reply_markup=kb)
+
+
+async def handle_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.message or not update.message.text:
+        return
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    user_id = user.id if user else None
+    text = update.message.text.strip()
+    low = text.lower()
+
+    gate_err = _check_bot_gate(user_id)
+    if gate_err:
+        await safe_send_html(context.bot, chat_id, esc(gate_err))
         return
 
-    # 2. Back & Main Menu navigation
-    if low == "🏠 main menu":
-        MENU_STATE[chat_id] = "main" if require_auth(chat_id) else "guest"
-        MENU_STACK[chat_id] = []
+    # Universal Main Menu & Back shortcuts
+    if text in ("🏠 Main Menu", "Main Menu", "/menu"):
         AWAITING_INPUT.pop(chat_id, None)
         GAME_SESSIONS.pop(chat_id, None)
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            f"{themed_box(sc('MAIN MENU'))}",
-            reply_markup=current_keyboard_for_chat(chat_id, user_id),
-        )
+        AI_CHAT_MODE.discard(chat_id)
+        if require_auth(chat_id):
+            MENU_STATE[chat_id] = "main"
+            MENU_STACK[chat_id] = ["main"]
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('MAIN MENU'))}",
+                reply_markup=main_reply_keyboard(user_id),
+            )
+        else:
+            MENU_STATE[chat_id] = "guest"
+            MENU_STACK[chat_id] = ["guest"]
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('GUEST PORTAL'))}",
+                reply_markup=guest_reply_keyboard(),
+            )
         return
 
-    if low == "⬅ back":
+    if text in ("⬅ Back", "Back", "🔙 Back"):
         await pop_menu_state(chat_id, user_id, context.bot)
         return
 
-    # 3. Active Mini-Game turns (when not authenticated)
-    active_game = GAME_SESSIONS.get(chat_id)
-    if active_game and not require_auth(chat_id):
-        gtype = active_game.get("game")
-        if gtype == "ttt" and raw_text.isdigit():
-            reply_txt, finished = play_ttt_turn(chat_id, int(raw_text))
+    # Awaiting user input flow
+    awaiting = AWAITING_INPUT.get(chat_id)
+    if awaiting:
+        action = awaiting.get("action")
+        AWAITING_INPUT.pop(chat_id, None)
+
+        if action == "login_user":
+            USER_SESSIONS[chat_id] = {
+                "step": "awaiting_password",
+                "username": text,
+            }
+            AWAITING_INPUT[chat_id] = {"action": "login_pass"}
             await safe_send_html(
                 context.bot,
                 chat_id,
-                reply_txt,
-                reply_markup=guest_keyboard_for_chat(chat_id),
-            )
-            return
-        if gtype == "guess" and raw_text.isdigit():
-            reply_txt, finished = play_guess_turn(chat_id, int(raw_text))
-            await safe_send_html(
-                context.bot,
-                chat_id,
-                reply_txt,
-                reply_markup=guest_keyboard_for_chat(chat_id),
-            )
-            return
-        if gtype == "rps" and low in ("rock", "paper", "scissors"):
-            reply_txt, finished = play_rps_turn(chat_id, raw_text)
-            await safe_send_html(
-                context.bot,
-                chat_id,
-                reply_txt,
+                "Ab apna EnviroFRONT <b>Password</b> bhejein:",
                 reply_markup=guest_keyboard_for_chat(chat_id),
             )
             return
 
-    # 4. Pending contextual input
-    pending = AWAITING_INPUT.get(chat_id)
-    if pending:
-        AWAITING_INPUT.pop(chat_id, None)
-        kind = pending.get("kind")
-        if kind == "dash_target":
-            await send_site_dashboard_by_target(chat_id, raw_text, context.bot)
-            return
-        if kind == "api_today_target":
-            await send_api_report_action(
-                chat_id, raw_text, today_ist_report_date(), context.bot
+        if action == "login_pass":
+            sess_tmp = USER_SESSIONS.get(chat_id) or {}
+            uname = str(sess_tmp.get("username") or "").strip()
+            pword = text
+            wait_m = await context.bot.send_message(
+                chat_id=chat_id, text="EnviroFRONT portal mein login ho raha hai..."
             )
-            return
-        if kind == "api_custom_date":
-            parts = re.split(
-                r"\s*\|\s*|\s+(?=\d{2}-[A-Za-z]{3}-\d{4}$)",
-                raw_text,
-                maxsplit=1,
+            sess_obj, err = await asyncio.to_thread(
+                login_envirofront, uname, pword
             )
-            if len(parts) == 2:
-                await send_api_report_action(
-                    chat_id, parts[0].strip(), parts[1].strip(), context.bot
+            if not sess_obj:
+                USER_SESSIONS[chat_id] = {"step": "guest"}
+                await safe_edit_html(
+                    wait_m,
+                    f"Login fail: <code>{esc(err)}</code>\nDobara <b>🔐 Login</b> dabayein.",
+                )
+                return
+
+            devs, d_err = await asyncio.to_thread(
+                parse_devices_page_and_ws, sess_obj
+            )
+            USER_SESSIONS[chat_id] = {
+                "step": "authenticated",
+                "username": uname,
+                "password": pword,
+                "session": sess_obj,
+                "fail_streak": 0,
+            }
+            MENU_STATE[chat_id] = "main"
+            MENU_STACK[chat_id] = ["main"]
+
+            if devs and d_err == "OK":
+                analysis = analyze_devices(devs)
+                LAST_SNAPSHOT[chat_id] = analysis
+                save_snapshot_db(chat_id, analysis)
+                try:
+                    await wait_m.delete()
+                except Exception:
+                    pass
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    build_status_message(analysis),
+                    reply_markup=main_reply_keyboard(user_id),
                 )
             else:
-                await send_api_report_action(
-                    chat_id, raw_text, None, context.bot
+                await safe_edit_html(
+                    wait_m,
+                    f"Login ho gaya, par initial fleet fetch note: <code>{esc(d_err)}</code>",
+                )
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    f"{themed_box(sc('MAIN MENU'))}",
+                    reply_markup=main_reply_keyboard(user_id),
                 )
             return
-        if kind == "set_refresh_val" and is_admin(user_id):
+
+        sess_data = require_auth(chat_id)
+        if not sess_data:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                "Session expired. Kripya login karein.",
+                reply_markup=guest_reply_keyboard(),
+            )
+            return
+
+        session = ensure_live_session(chat_id, sess_data)
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+
+        if action == "open_site_query":
+            devs = (analysis or {}).get("assigned_devices") or []
+            matched_idx = None
+            matched_dev = None
+            for idx, d in enumerate(devs, start=1):
+                hay = f"{d.get('site_id','')} {d.get('serial_no','')} {d.get('industry','')} {d.get('site','')}".lower()
+                if text.lower() in hay:
+                    matched_idx = idx
+                    matched_dev = d
+                    break
+            if matched_dev and session:
+                card = await asyncio.to_thread(
+                    build_site_dashboard_card,
+                    session,
+                    matched_dev,
+                    index=matched_idx,
+                    chat_id=chat_id,
+                )
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    card,
+                    reply_markup=dashboard_sub_keyboard(chat_id),
+                )
+            else:
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    f"Koi site match nahi hui: <code>{esc(text)}</code>",
+                    reply_markup=dashboard_sub_keyboard(chat_id),
+                )
+            return
+
+        if action == "pin_site_query":
+            added, lst = toggle_watchlist_site(chat_id, text)
+            state_txt = "pinned to Watchlist" if added else "removed from Watchlist"
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"<code>{esc(text)}</code> {state_txt}. Total pinned: <b>{len(lst)}</b>",
+                reply_markup=dashboard_sub_keyboard(chat_id),
+            )
+            return
+
+        if action == "custom_date_report":
+            devs = (analysis or {}).get("assigned_devices") or []
+            target = next(
+                (d for d in devs if str(d.get("site_id") or "").strip().isdigit()),
+                None,
+            )
+            if target and session:
+                card = await asyncio.to_thread(
+                    build_api_report_card,
+                    session,
+                    target,
+                    report_date=text,
+                )
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    card,
+                    reply_markup=api_report_sub_keyboard(),
+                )
+            else:
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    "Site ID available nahi hai.",
+                    reply_markup=api_report_sub_keyboard(),
+                )
+            return
+
+        if action == "site_api_report":
+            devs = (analysis or {}).get("assigned_devices") or []
+            target = next(
+                (
+                    d
+                    for d in devs
+                    if text.lower()
+                    in f"{d.get('site_id','')} {d.get('industry','')} {d.get('serial_no','')}".lower()
+                ),
+                None,
+            )
+            if target and session:
+                card = await asyncio.to_thread(
+                    build_api_report_card,
+                    session,
+                    target,
+                    report_date=today_ist_report_date(),
+                )
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    card,
+                    reply_markup=api_report_sub_keyboard(),
+                )
+            else:
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    f"Site nahi mili: <code>{esc(text)}</code>",
+                    reply_markup=api_report_sub_keyboard(),
+                )
+            return
+
+        if action == "ai_ask":
+            ans = await asyncio.to_thread(
+                answer_groq_query, text, analysis or {}
+            )
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc(CLIENT_NAME + ' — GROQ AI'))}\n{get_theme()['bar']}\n{ans}",
+                reply_markup=main_reply_keyboard(user_id),
+            )
+            return
+
+        if action == "admin_sync_sec" and is_admin(user_id):
+            global REFRESH_INTERVAL_SEC
             try:
-                sec = int(raw_text)
+                sec = int(text)
                 if 15 <= sec <= 3600:
                     REFRESH_INTERVAL_SEC = sec
                     save_setting_db("refresh_sec", str(sec))
                     await safe_send_html(
                         context.bot,
                         chat_id,
-                        f"  ∙ <b>Sync Rate set to {sec}s.</b>",
+                        f"Poll interval set to <b>{sec}s</b>.",
                         reply_markup=admin_sub_keyboard(),
                     )
                     return
@@ -4673,510 +3904,672 @@ async def handle_text_message(
             await safe_send_html(
                 context.bot,
                 chat_id,
-                "  • 15 se 3600 ke beech valid seconds bhejein.",
+                "15 se 3600 ke beech valid seconds bhejein.",
                 reply_markup=admin_sub_keyboard(),
             )
             return
-        if kind == "set_maint_msg" and is_admin(user_id):
-            if low == "off":
-                MAINTENANCE_MODE = False
-                save_setting_db("maint_mode", "0")
-                await safe_send_html(
-                    context.bot,
-                    chat_id,
-                    "  ∙ <b>Maintenance Mode OFF.</b>",
-                    reply_markup=admin_sub_keyboard(),
-                )
-            else:
-                MAINTENANCE_MODE = True
-                MAINTENANCE_MSG = raw_text
-                save_setting_db("maint_mode", "1")
-                save_setting_db("maint_msg", MAINTENANCE_MSG)
-                await safe_send_html(
-                    context.bot,
-                    chat_id,
-                    f"  ◈ <b>Maintenance ON:</b> <code>{esc(MAINTENANCE_MSG)}</code>",
-                    reply_markup=admin_sub_keyboard(),
-                )
-            return
 
-    # 5. Quick numbered site buttons from dashboard sub-menu
-    m_quick = re.match(r"^#(\d+)\b", raw_text)
-    if m_quick and MENU_STATE.get(chat_id) == "dash_menu":
-        await send_site_dashboard_by_target(
-            chat_id, m_quick.group(1), context.bot
-        )
-        return
-
-    # 6. Theme & Notification Demo Buttons (Admin)
-    if is_admin(user_id):
-        theme_btn_map = {
-            "theme: obsidian": "obsidian",
-            "theme: minimal": "minimal",
-            "theme: cyber": "cyber",
-            "theme: royal": "royal",
-        }
-        if low in theme_btn_map:
-            ACTIVE_THEME = theme_btn_map[low]
-            save_setting_db("active_theme", ACTIVE_THEME)
+        if action == "admin_maint_msg" and is_admin(user_id):
+            global MAINTENANCE_MSG
+            MAINTENANCE_MSG = text[:240]
+            save_setting_db("maint_msg", MAINTENANCE_MSG)
             await safe_send_html(
                 context.bot,
                 chat_id,
-                f"  ∙ <b>Active Theme:</b> <code>{esc(get_theme()['label'])}</code>",
+                f"Maintenance message updated: <code>{esc(MAINTENANCE_MSG)}</code>",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+
+    # Guest & Games Lounge flow
+    if not require_auth(chat_id):
+        g_sess = GAME_SESSIONS.get(chat_id)
+        if g_sess:
+            g_type = g_sess.get("game")
+            if g_type == "ttt" and text in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
+                out, _ = play_ttt_turn(chat_id, int(text))
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    out,
+                    reply_markup=guest_keyboard_for_chat(chat_id),
+                )
+                return
+            if g_type == "guess" and text.isdigit():
+                out, _ = play_guess_turn(chat_id, int(text))
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    out,
+                    reply_markup=guest_keyboard_for_chat(chat_id),
+                )
+                return
+            if g_type == "rps" and any(
+                w in low for w in ("rock", "paper", "scissor")
+            ):
+                out, _ = play_rps_turn(chat_id, text)
+                await safe_send_html(
+                    context.bot,
+                    chat_id,
+                    out,
+                    reply_markup=guest_keyboard_for_chat(chat_id),
+                )
+                return
+
+        if text == "🔐 Login":
+            await cmd_login(update, context)
+            return
+        if text == "📖 Manual":
+            await cmd_manual(update, context)
+            return
+        if text == "🎮 Games Lounge":
+            push_menu_state(chat_id, "games_menu")
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('GAMES LOUNGE'))}\n  ▸ Koi mini-game chuniye:",
+                reply_markup=games_lounge_keyboard(),
+            )
+            return
+        if text == "🎲 Tic-Tac-Toe":
+            out = start_ttt_game(chat_id)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                out,
+                reply_markup=guest_keyboard_for_chat(chat_id),
+            )
+            return
+        if text == "🔢 Number Guess":
+            out = start_guess_game(chat_id)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                out,
+                reply_markup=guest_keyboard_for_chat(chat_id),
+            )
+            return
+        if text == "✂ Rock Paper Scissors":
+            out = start_rps_game(chat_id)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                out,
+                reply_markup=guest_keyboard_for_chat(chat_id),
+            )
+            return
+
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "Kripya <b>🔐 Login</b> dabayein ya <b>🎮 Games Lounge</b> chuniye.",
+            reply_markup=guest_keyboard_for_chat(chat_id),
+        )
+        return
+
+    # Authenticated flow
+    sess_data = require_auth(chat_id)
+    assert sess_data is not None
+
+    if text in ("Next ➡", "Next", "/next"):
+        if MENU_STATE.get(chat_id) == "paginated_list":
+            await _render_paginated_state(
+                chat_id, user_id, sess_data, context.bot, delta=1
+            )
+        else:
+            push_menu_state(chat_id, "paginated_list")
+            LAST_PAGE_STATE[chat_id] = {"kind": "all_sites", "page": 2}
+            await _render_paginated_state(
+                chat_id, user_id, sess_data, context.bot, delta=0
+            )
+        return
+
+    if text == "🚪 Logout":
+        await cmd_logout(update, context)
+        return
+
+    if text == "📖 Manual":
+        await cmd_manual(update, context)
+        return
+
+    if text == "◈ Status":
+        fresh = await _force_fresh_snapshot(chat_id, sess_data, context.bot)
+        if fresh:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                build_status_message(fresh),
+                reply_markup=main_reply_keyboard(user_id),
+            )
+        return
+
+    if text == "◈ All Sites":
+        push_menu_state(chat_id, "paginated_list")
+        LAST_PAGE_STATE[chat_id] = {"kind": "all_sites", "page": 1}
+        await _render_paginated_state(
+            chat_id, user_id, sess_data, context.bot, delta=0
+        )
+        return
+
+    if text == "🌐 Site Dashboard":
+        push_menu_state(chat_id, "dash_menu")
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        devs = (analysis or {}).get("assigned_devices") or []
+        if devs and sess_data.get("session"):
+            card = await asyncio.to_thread(
+                build_site_dashboard_card,
+                sess_data["session"],
+                devs[0],
+                index=1,
+                chat_id=chat_id,
+            )
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                card,
+                reply_markup=dashboard_sub_keyboard(chat_id),
+            )
+        else:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('SITE DASHBOARD HUB'))}",
+                reply_markup=dashboard_sub_keyboard(chat_id),
+            )
+        return
+
+    m_quick = re.match(r"^#(\d+)\s+", text)
+    if m_quick and MENU_STATE.get(chat_id) == "dash_menu":
+        idx = int(m_quick.group(1))
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        devs = (analysis or {}).get("assigned_devices") or []
+        if 1 <= idx <= len(devs) and sess_data.get("session"):
+            card = await asyncio.to_thread(
+                build_site_dashboard_card,
+                sess_data["session"],
+                devs[idx - 1],
+                index=idx,
+                chat_id=chat_id,
+            )
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                card,
+                reply_markup=dashboard_sub_keyboard(chat_id),
+            )
+        return
+
+    if text == "🔎 Open Site by ID/Name":
+        AWAITING_INPUT[chat_id] = {"action": "open_site_query"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "Site ID, Serial No, ya Site/Industry ka naam bhejein:",
+            reply_markup=dashboard_sub_keyboard(chat_id),
+        )
+        return
+
+    if text == "⭐ Pin Site":
+        AWAITING_INPUT[chat_id] = {"action": "pin_site_query"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "Pin/Unpin karne ke liye Site ID, Serial, ya Site Name bhejein:",
+            reply_markup=dashboard_sub_keyboard(chat_id),
+        )
+        return
+
+    if text == "📡 API Report":
+        push_menu_state(chat_id, "api_menu")
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"{themed_box(sc('EXCISE API REPORT HUB'))}\n  ▸ Report option chuniye:",
+            reply_markup=api_report_sub_keyboard(),
+        )
+        return
+
+    if text == "📅 Today API Report":
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        devs = (analysis or {}).get("assigned_devices") or []
+        target = next(
+            (d for d in devs if str(d.get("site_id") or "").strip().isdigit()),
+            None,
+        )
+        if target and sess_data.get("session"):
+            card = await asyncio.to_thread(
+                build_api_report_card,
+                sess_data["session"],
+                target,
+                report_date=today_ist_report_date(),
+            )
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                card,
+                reply_markup=api_report_sub_keyboard(),
+            )
+        return
+
+    if text == "🗓 Custom Date Report":
+        AWAITING_INPUT[chat_id] = {"action": "custom_date_report"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"Date bhejein (e.g. <code>{esc(today_ist_report_date())}</code>):",
+            reply_markup=api_report_sub_keyboard(),
+        )
+        return
+
+    if text == "🏭 Site API Report":
+        AWAITING_INPUT[chat_id] = {"action": "site_api_report"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "Site ID ya Site Name bhejein:",
+            reply_markup=api_report_sub_keyboard(),
+        )
+        return
+
+    if text == "📐 Instruments":
+        push_menu_state(chat_id, "paginated_list")
+        LAST_PAGE_STATE[chat_id] = {"kind": "instruments", "page": 1}
+        await _render_paginated_state(
+            chat_id, user_id, sess_data, context.bot, delta=0
+        )
+        return
+
+    if text == "⏳ Aging":
+        push_menu_state(chat_id, "age_menu")
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        bc = (analysis or {}).get("bucket_counts") or {}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"{themed_box(sc('AGING BUCKETS'))}\n"
+            f"  ▸ &lt;1D: <b>{bc.get('<1D',0)}</b> | &lt;1W: <b>{bc.get('<1W',0)}</b> | &lt;24D: <b>{bc.get('<24D',0)}</b>\n"
+            f"  ▸ &lt;11M: <b>{bc.get('<11M',0)}</b> | &lt;1Y: <b>{bc.get('<1Y',0)}</b> | &gt;1Y: <b>{bc.get('>1Y',0)}</b>",
+            reply_markup=aging_sub_keyboard(),
+        )
+        return
+
+    bucket_map = {
+        "◦ <1D": "<1D",
+        "▪ <1W": "<1W",
+        "• <24D": "<24D",
+        "◆ <11M": "<11M",
+        "◈ <1Y": "<1Y",
+        "▸ >1Y": ">1Y",
+    }
+    if text in bucket_map:
+        push_menu_state(chat_id, "paginated_list")
+        LAST_PAGE_STATE[chat_id] = {
+            "kind": "bucket",
+            "bucket": bucket_map[text],
+            "page": 1,
+        }
+        await _render_paginated_state(
+            chat_id, user_id, sess_data, context.bot, delta=0
+        )
+        return
+
+    if text == "⭐ Watchlist":
+        w_list = WATCHLIST_SITES.get(chat_id) or []
+        if not w_list:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('WATCHLIST'))}\n  • Watchlist abhi khali hai. Site Dashboard se <b>⭐ Pin Site</b> dabayein.",
+                reply_markup=main_reply_keyboard(user_id),
+            )
+            return
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        all_d = (analysis or {}).get("all_devices") or []
+        matched = [
+            d
+            for d in all_d
+            if any(
+                wk.lower()
+                in f"{d.get('site_id','')} {d.get('serial_no','')} {d.get('industry','')}".lower()
+                for wk in w_list
+            )
+        ]
+        blocks = [
+            f"{themed_box(sc('WATCHLIST SITES'), f'Pinned: {len(w_list)}')}"
+        ]
+        for idx, d in enumerate(matched[:10], start=1):
+            blocks.append(format_premium_device_block(d, index=idx))
+        if not matched:
+            blocks.append(
+                f"  • Pinned keys: <code>{esc(', '.join(w_list))}</code>"
+            )
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            "\n\n".join(blocks),
+            reply_markup=main_reply_keyboard(user_id),
+        )
+        return
+
+    if text == "📋 Shift Summary":
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        if analysis:
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                build_shift_handover_message(analysis, chat_id=chat_id),
+                reply_markup=main_reply_keyboard(user_id),
+            )
+        return
+
+    if text == "🤖 AI Suite":
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        brief_html = await asyncio.to_thread(
+            generate_ai_brief_text, analysis or {}
+        )
+        AWAITING_INPUT[chat_id] = {"action": "ai_ask"}
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"{themed_box(sc(CLIENT_NAME + ' — AI BRIEF'))}\n{get_theme()['bar']}\n{brief_html}\n\n"
+            "  ▸ Koi sawaal poochhna ho to abhi type karein:",
+            reply_markup=main_reply_keyboard(user_id),
+        )
+        return
+
+    if text == "⚙ Ops & Export":
+        push_menu_state(chat_id, "ops_menu")
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            f"{themed_box(sc('OPS & EXPORT'))}",
+            reply_markup=ops_sub_keyboard(),
+        )
+        return
+
+    if text == "🩺 Health":
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        await safe_send_html(
+            context.bot,
+            chat_id,
+            build_health_report(analysis or {}),
+            reply_markup=ops_sub_keyboard(),
+        )
+        return
+
+    if text == "📥 Export CSV":
+        analysis = await _refresh_or_get_snapshot(
+            chat_id, sess_data, context.bot
+        )
+        csv_io = build_fleet_csv_bytes(analysis or {})
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=csv_io,
+            caption=f"{CLIENT_NAME} Fleet CSV Export",
+            reply_markup=ops_sub_keyboard(),
+        )
+        return
+
+    if text == "∙ Online":
+        push_menu_state(chat_id, "paginated_list")
+        LAST_PAGE_STATE[chat_id] = {"kind": "online", "page": 1}
+        await _render_paginated_state(
+            chat_id, user_id, sess_data, context.bot, delta=0
+        )
+        return
+
+    if text == "📌 Unassigned":
+        push_menu_state(chat_id, "paginated_list")
+        LAST_PAGE_STATE[chat_id] = {"kind": "unassigned", "page": 1}
+        await _render_paginated_state(
+            chat_id, user_id, sess_data, context.bot, delta=0
+        )
+        return
+
+    if text == "❄ Stale Sites":
+        push_menu_state(chat_id, "paginated_list")
+        LAST_PAGE_STATE[chat_id] = {"kind": "stale", "page": 1}
+        await _render_paginated_state(
+            chat_id, user_id, sess_data, context.bot, delta=0
+        )
+        return
+
+    # Admin Panel & Sub-menus
+    if is_admin(user_id):
+        global BOT_ENABLED, MAINTENANCE_MODE, NOTIF_STYLE, ACTIVE_THEME
+
+        if text == "🛡 Admin Panel":
+            push_menu_state(chat_id, "admin_menu")
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('ADMIN AUTHORITY PANEL'))}",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+
+        if text == "🎨 Themes":
+            push_menu_state(chat_id, "theme_menu")
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('UI THEMES'), 'Current: ' + get_theme()['label'])}",
                 reply_markup=theme_sub_keyboard(),
             )
             return
 
-        notif_btn_map = {
-            "mode: detailed": "detailed",
-            "mode: compact": "compact",
-            "mode: alerts only": "alerts_only",
-            "mode: digest": "digest",
+        theme_btn_map = {
+            "Theme: Obsidian": "obsidian",
+            "Theme: Minimal": "minimal",
+            "Theme: Cyber": "cyber",
+            "Theme: Royal": "royal",
         }
-        if low in notif_btn_map:
-            NOTIF_STYLE = notif_btn_map[low]
-            save_setting_db("notif_style", NOTIF_STYLE)
+        if text in theme_btn_map:
+            ACTIVE_THEME = theme_btn_map[text]
+            save_setting_db("active_theme", ACTIVE_THEME)
             await safe_send_html(
                 context.bot,
                 chat_id,
-                f"  ∙ <b>Notification Mode:</b> <code>{esc(NOTIF_STYLE)}</code>",
+                f"{themed_box(sc('THEME APPLIED'), get_theme()['label'])}",
+                reply_markup=theme_sub_keyboard(),
+            )
+            return
+
+        if text == "🔔 Notif & Demo":
+            push_menu_state(chat_id, "notif_menu")
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('NOTIFICATIONS & DEMO'), 'Mode: ' + NOTIF_STYLE)}",
                 reply_markup=notif_demo_sub_keyboard(),
             )
             return
 
-        demo_btn_map = {
-            "demo: 2h down": "2h",
-            "demo: 10h down": "10h",
-            "demo: 1d down": "1d",
-            "demo: recovered": "recovered",
+        mode_btn_map = {
+            "Mode: Detailed": "detailed",
+            "Mode: Compact": "compact",
+            "Mode: Alerts Only": "alerts_only",
+            "Mode: Digest": "digest",
         }
-        if low in demo_btn_map:
-            await send_notification_demo(
-                chat_id, demo_btn_map[low], context.bot
-            )
-            return
-
-    # 7. Menu & Action Buttons
-    btn_map: dict[str, str] = {
-        "🔐 login": "login",
-        "📖 manual": "manual",
-        "🎮 games lounge": "games_lounge",
-        "🎲 tic-tac-toe": "game_ttt",
-        "🔢 number guess": "game_guess",
-        "✂ rock paper scissors": "game_rps",
-        "◈ status": "status",
-        "◈ all sites": "allsite",
-        "🌐 site dashboard": "dash_menu",
-        "🔎 open site by id/name": "ask_dash_target",
-        "⭐ pin site": "pin_last_site",
-        "⭐ watchlist": "watchlist",
-        "📋 shift summary": "shift_summary",
-        "📡 api report": "api_menu",
-        "📅 today api report": "ask_api_today",
-        "🗓 custom date report": "ask_api_custom",
-        "🏭 site api report": "ask_api_today",
-        "📐 instruments": "instruments",
-        "⏳ aging": "age_menu",
-        "◦ <1d": "age_1d",
-        "▪ <1w": "age_1w",
-        "• <24d": "age_24d",
-        "◆ <11m": "age_11m",
-        "◈ <1y": "age_1y",
-        "▸ >1y": "age_gt1y",
-        "⚙ ops & export": "ops_menu",
-        "🩺 health": "health",
-        "📥 export csv": "csv",
-        "∙ online": "online",
-        "📌 unassigned": "unassigned",
-        "❄ stale sites": "stale_sites",
-        "⬅ previous": "prev",
-        "next ➡": "next",
-        "🤖 ai suite": "aireport",
-        "🚪 logout": "logout",
-        "🛡 admin panel": "admin_menu",
-        "🎨 themes": "theme_menu",
-        "🔔 notif & demo": "notif_menu",
-        "⏱ sync interval": "ask_refresh",
-        "🛠 maintenance": "ask_maint",
-        "⚡ bot on/off": "toggle_bot",
-        "🧹 clear alerts": "clear_alerts",
-    }
-    action = btn_map.get(low)
-
-    if action == "login":
-        await send_login_prompt(chat_id, context.bot)
-        return
-    if action == "manual":
-        await send_manual_view(chat_id, user_id, context.bot)
-        return
-    if action == "games_lounge":
-        await open_games_lounge(chat_id, user_id, context.bot)
-        return
-    if action == "game_ttt":
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            start_ttt_game(chat_id),
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-    if action == "game_guess":
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            start_guess_game(chat_id),
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-    if action == "game_rps":
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            start_rps_game(chat_id),
-            reply_markup=guest_keyboard_for_chat(chat_id),
-        )
-        return
-    if action == "status":
-        await send_status_action(chat_id, context.bot)
-        return
-    if action == "allsite":
-        await send_allsite_page(chat_id, 0, context.bot)
-        return
-    if action == "dash_menu":
-        await open_dashboard_menu(chat_id, context.bot)
-        return
-    if action == "ask_dash_target":
-        if not require_auth(chat_id):
+        if text in mode_btn_map:
+            NOTIF_STYLE = mode_btn_map[text]
+            save_setting_db("notif_style", NOTIF_STYLE)
             await safe_send_html(
                 context.bot,
                 chat_id,
-                "  ▸ Pehle login karein (<code>/login</code>):",
-                reply_markup=guest_keyboard_for_chat(chat_id),
+                f"Notification mode set to <b>{esc(NOTIF_STYLE)}</b>.",
+                reply_markup=notif_demo_sub_keyboard(),
             )
             return
-        AWAITING_INPUT[chat_id] = {"kind": "dash_target"}
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ▸ Site ka <b>Number</b>, <b>Serial No</b>, <b>Site ID</b>, ya <b>Naam</b> bhejein:",
-        )
-        return
-    if action == "pin_last_site":
-        st = LAST_PAGE_STATE.get(chat_id) or {}
-        skey = str(st.get("site_key") or "").strip()
-        if not skey:
-            await safe_send_html(
-                context.bot,
-                chat_id,
-                "  ▸ Pehle koi site dashboard kholein, phir <code>⭐ Pin Site</code> dabayein.",
-            )
-            return
-        added, wlist = toggle_watchlist_site(chat_id, skey)
-        status_w = "Pinned to Watchlist" if added else "Removed from Watchlist"
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            f"  ∙ <b>{esc(status_w)}:</b> <code>{esc(skey)}</code> (Total: <b>{len(wlist)}</b>)",
-        )
-        return
-    if action == "watchlist":
-        await send_watchlist_view(chat_id, context.bot)
-        return
-    if action == "shift_summary":
-        await send_shift_summary(chat_id, context.bot)
-        return
-    if action == "api_menu":
-        await open_api_report_menu(chat_id, context.bot)
-        return
-    if action == "ask_api_today":
-        if not require_auth(chat_id):
-            await safe_send_html(
-                bot,
-                chat_id,
-                "  ▸ Pehle login karein (<code>/login</code>):",
-                reply_markup=guest_keyboard_for_chat(chat_id),
-            )
-            return
-        AWAITING_INPUT[chat_id] = {"kind": "api_today_target"}
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            f"  ▸ Today (<code>{esc(today_ist_report_date())}</code>) API report ke liye site ka <b>Number / Serial / Name</b> bhejein:",
-        )
-        return
-    if action == "ask_api_custom":
-        if not require_auth(chat_id):
-            await safe_send_html(
-                context.bot,
-                chat_id,
-                "  ▸ Pehle login karein (<code>/login</code>):",
-                reply_markup=guest_keyboard_for_chat(chat_id),
-            )
-            return
-        AWAITING_INPUT[chat_id] = {"kind": "api_custom_date"}
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ▸ Site aur date bhejein (format: <code>Malbros 26-Nov-2026</code>):",
-        )
-        return
-    if action == "instruments":
-        await send_instruments_view(chat_id, context.bot, page=0, query="")
-        return
-    if action == "age_menu":
-        await open_aging_menu(chat_id, context.bot)
-        return
-    if action and action.startswith("age_"):
-        bucket = action.replace("age_", "", 1)
-        await send_aging_bucket_page(chat_id, bucket, 0, context.bot)
-        return
-    if action == "ops_menu":
-        await open_ops_menu(chat_id, context.bot)
-        return
-    if action == "health":
-        await send_health_action(chat_id, context.bot)
-        return
-    if action == "csv":
-        await send_export_csv_action(chat_id, context.bot)
-        return
-    if action == "online":
-        await send_online_page(chat_id, 0, context.bot)
-        return
-    if action == "unassigned":
-        await send_unassigned_page(chat_id, 0, context.bot)
-        return
-    if action == "stale_sites":
-        await send_stale_sites_view(chat_id, context.bot)
-        return
-    if action == "prev":
-        await step_pagination(chat_id, -1, context.bot)
-        return
-    if action == "next":
-        await step_pagination(chat_id, +1, context.bot)
-        return
-    if action == "aireport":
-        await send_ai_analyze_action(chat_id, context.bot)
-        return
-    if action == "logout":
-        await send_logout_action(chat_id, context.bot)
-        return
-    if action == "admin_menu" and is_admin(user_id):
-        await open_admin_panel(chat_id, context.bot)
-        return
-    if action == "theme_menu" and is_admin(user_id):
-        await open_theme_menu(chat_id, context.bot)
-        return
-    if action == "notif_menu" and is_admin(user_id):
-        await open_notif_demo_menu(chat_id, context.bot)
-        return
-    if action == "ask_refresh" and is_admin(user_id):
-        AWAITING_INPUT[chat_id] = {"kind": "set_refresh_val"}
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            f"  ▸ Naya sync interval seconds mein bhejein (15–3600, current: <code>{REFRESH_INTERVAL_SEC}s</code>):",
-        )
-        return
-    if action == "ask_maint" and is_admin(user_id):
-        AWAITING_INPUT[chat_id] = {"kind": "set_maint_msg"}
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ▸ Maintenance message bhejein (ya band karne ke liye <code>OFF</code> bhejein):",
-        )
-        return
-    if action == "toggle_bot" and is_admin(user_id):
-        BOT_ENABLED = not BOT_ENABLED
-        save_setting_db("bot_enabled", "1" if BOT_ENABLED else "0")
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            f"  ∙ <b>Bot Status:</b> <code>{'ON' if BOT_ENABLED else 'OFF'}</code>",
-            reply_markup=admin_sub_keyboard(),
-        )
-        return
-    if action == "clear_alerts" and is_admin(user_id):
-        clear_all_alerts_for_chat(chat_id)
-        await safe_send_html(
-            context.bot,
-            chat_id,
-            "  ∙ <b>Sent stage alerts cleared.</b>",
-            reply_markup=admin_sub_keyboard(),
-        )
-        return
 
-    # 8. AI Chat Mode or Direct AI Query
-    if chat_id in AI_CHAT_MODE:
-        await send_ai_answer_action(chat_id, raw_text, context.bot)
-        return
+        if text == "Demo: 2h Down":
+            await run_demo_alert(context.bot, chat_id, "2h")
+            return
+        if text == "Demo: 10h Down":
+            await run_demo_alert(context.bot, chat_id, "10h")
+            return
+        if text == "Demo: 1d Down":
+            await run_demo_alert(context.bot, chat_id, "1d")
+            return
+        if text == "Demo: Recovered":
+            await run_demo_alert(context.bot, chat_id, "recovered")
+            return
+
+        if text == "⏱ Sync Interval":
+            AWAITING_INPUT[chat_id] = {"action": "admin_sync_sec"}
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"Current interval: <b>{REFRESH_INTERVAL_SEC}s</b>. Naya interval (15–3600s) bhejein:",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+
+        if text == "🛠 Maintenance":
+            MAINTENANCE_MODE = not MAINTENANCE_MODE
+            save_setting_db("maint_mode", "1" if MAINTENANCE_MODE else "0")
+            AWAITING_INPUT[chat_id] = {"action": "admin_maint_msg"}
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"Maintenance mode: <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>.\n"
+                "Naya maintenance message bhejein (ya <b>⬅ Back</b> dabayein):",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+
+        if text == "⚡ Bot ON/OFF":
+            BOT_ENABLED = not BOT_ENABLED
+            save_setting_db("bot_enabled", "1" if BOT_ENABLED else "0")
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"Bot global state: <b>{'ENABLED (ON)' if BOT_ENABLED else 'DISABLED (OFF)'}</b>.",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+
+        if text == "🧹 Clear Alerts":
+            clear_all_alerts_for_chat(chat_id)
+            DIGEST_QUEUE.pop(chat_id, None)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                "Sabhi sent stage alerts aur digest queue clear kar diye gaye hain.",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
+
+        if text == "🤖 AI Patch & Logs":
+            push_menu_state(chat_id, "patch_menu")
+            err_src = LAST_ERROR_LOG.get("source") or "None"
+            err_msg = LAST_ERROR_LOG.get("error") or "No error logged"
+            patch_sum = PENDING_AI_PATCH.get("summary") or "None"
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"{themed_box(sc('AI PATCH & ERROR LOGS'))}\n"
+                f"  ▸ Last Error : <code>{esc(err_src)}</code> — {esc(err_msg)}\n"
+                f"  ▸ Pending Fix: <code>{esc(patch_sum)}</code>",
+                reply_markup=ai_patch_sub_keyboard(),
+            )
+            return
+
+        if text == "🛠 Generate AI Fix":
+            ok, info = await asyncio.to_thread(prepare_ai_error_patch)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"  ▸ {'AI Fix Ready' if ok else 'Fix Note'}: <code>{esc(info)}</code>",
+                reply_markup=ai_patch_sub_keyboard(),
+            )
+            return
+
+        if text == "✅ Apply AI Patch":
+            ok, info = await asyncio.to_thread(apply_pending_ai_patch)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"  ▸ {'Applied' if ok else 'Blocked'}: <code>{esc(info)}</code>",
+                reply_markup=ai_patch_sub_keyboard(),
+            )
+            return
+
+        if text == "📋 Error & Patch Logs":
+            lines = [f"{themed_box(sc('ERROR & PATCH AUDIT'))}"]
+            if LAST_ERROR_LOG:
+                lines.append(
+                    f"  ▸ Last Err ({esc(LAST_ERROR_LOG.get('time',''))}): "
+                    f"<code>{esc(LAST_ERROR_LOG.get('source',''))}</code> — {esc(LAST_ERROR_LOG.get('error',''))}"
+                )
+            else:
+                lines.append("  ▸ Koi error log nahi hai.")
+            for rec in reversed(PATCH_HISTORY[-6:]):
+                lines.append(
+                    f"  • [{esc(rec.get('action',''))}] {esc(rec.get('summary',''))} "
+                    f"(<code>{esc(os.path.basename(rec.get('backup','')))}</code>)"
+                )
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                "\n".join(lines),
+                reply_markup=ai_patch_sub_keyboard(),
+            )
+            return
+
+        if text == "↩ Rollback Backup":
+            ok, info = await asyncio.to_thread(rollback_latest_backup)
+            await safe_send_html(
+                context.bot,
+                chat_id,
+                f"  ▸ {esc(info)}",
+                reply_markup=admin_sub_keyboard(),
+            )
+            return
 
     await safe_send_html(
         context.bot,
         chat_id,
-        "  ▸ Menu button ya command use karein. Poori guide ke liye <code>📖 Manual</code> ya <code>/help</code> bhejein.",
+        "Kripya menu button ka use karein ya <b>🏠 Main Menu</b> dabayein.",
         reply_markup=current_keyboard_for_chat(chat_id, user_id),
     )
 
 
-# ==============================================================================
-# BACKGROUND MONITOR: 2H -> 10H -> 1D (1-TIME PER STAGE) + DIGEST & RECOVERY
-# ==============================================================================
-ALERT_STAGES: list[tuple[str, float, str]] = [
-    ("2h", 2.0, "2ʜ ᴅᴏᴡɴ"),
-    ("10h", 10.0, "10ʜ ᴅᴏᴡɴ"),
-    ("1d", 24.0, "1ᴅ ᴅᴏᴡɴ"),
-]
-
-
-async def background_monitor_loop(app) -> None:
-    tick_counter = 0
-    while True:
-        try:
-            await asyncio.sleep(5)
-            tick_counter += 5
-            if tick_counter < REFRESH_INTERVAL_SEC:
-                continue
-            tick_counter = 0
-
-            if not BOT_ENABLED or MAINTENANCE_MODE:
-                continue
-
-            for chat_id, sess_data in list(USER_SESSIONS.items()):
-                if sess_data.get("step") != "authenticated":
-                    continue
-                session = sess_data.get("session")
-                if not session:
-                    continue
-
-                try:
-                    analysis = await asyncio.to_thread(
-                        run_self_analysis, session
-                    )
-                    sess_data["fail_streak"] = 0
-                except Exception as exc:
-                    sess_data["fail_streak"] = sess_data.get("fail_streak", 0) + 1
-                    ensure_live_session(chat_id, sess_data)
-                    logger.warning("Monitor poll error chat %s: %s", chat_id, exc)
-                    continue
-
-                if analysis["meta"]["server_error_500"]:
-                    continue
-
-                prev_analysis = LAST_SNAPSHOT.get(chat_id)
-                LAST_SNAPSHOT[chat_id] = analysis
-                save_snapshot_db(chat_id, analysis)
-
-                prev_conn_map: dict[str, bool] = {}
-                if prev_analysis:
-                    for d in prev_analysis.get("all_devices", []):
-                        prev_conn_map[d["serial_no"]] = bool(
-                            d.get("is_connected")
-                        )
-
-                batch_lines: list[str] = []
-
-                for dev in analysis.get("all_devices", []):
-                    serial = dev.get("serial_no", "N/A")
-                    is_conn = bool(dev.get("is_connected"))
-                    off_hrs = dev.get("offline_hours")
-                    label = format_industry_site_label(
-                        dev.get("industry", "N/A"), dev.get("site", "N/A")
-                    )
-
-                    if is_conn:
-                        if prev_conn_map.get(serial) is False:
-                            clear_stage_alerts_for_device(chat_id, serial)
-                            if NOTIF_STYLE not in ("alerts_only", "digest"):
-                                await safe_send_html(
-                                    app.bot,
-                                    chat_id,
-                                    (
-                                        f"{themed_box('∙ ' + sc('SITE RECOVERED'))}\n"
-                                        f"  ▸ Site   : <b>{label}</b>\n"
-                                        f"  ▸ Serial : <b>{esc(serial)}</b>\n"
-                                        f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
-                                    ),
-                                )
-                        continue
-
-                    if off_hrs is None:
-                        continue
-
-                    for stage_code, threshold_h, stage_badge in ALERT_STAGES:
-                        stage_key = f"{chat_id}:{serial}:{stage_code}"
-                        if (
-                            off_hrs >= threshold_h
-                            and stage_key not in SENT_STAGE_ALERTS
-                        ):
-                            mark_stage_alert_sent(stage_key)
-                            off_str = format_off_since_text(
-                                dev.get("last_seen"),
-                                dev.get("offline_duration"),
-                            )
-                            if NOTIF_STYLE == "digest":
-                                batch_lines.append(
-                                    f"  • [{esc(stage_badge)}] <b>{label}</b> (<code>{esc(serial)}</code>) — <code>{esc(off_str)}</code>"
-                                )
-                            elif NOTIF_STYLE == "compact":
-                                await safe_send_html(
-                                    app.bot,
-                                    chat_id,
-                                    f"▸ • <b>{label}</b> [<code>{esc(stage_badge)}</code>] | <code>{esc(off_str)}</code>",
-                                )
-                            else:
-                                await safe_send_html(
-                                    app.bot,
-                                    chat_id,
-                                    (
-                                        f"{themed_box('• ' + esc(stage_badge) + ' ALERT')}\n"
-                                        f"  ▸ Site   : <b>{label}</b>\n"
-                                        f"  ▸ Serial : <b>{esc(serial)}</b>\n"
-                                        f"  ▸ Status : <code>{esc(off_str)}</code>\n"
-                                        f"  ▸ Seen   : <code>{esc(dev.get('display_time', 'N/A'))}</code>"
-                                    ),
-                                )
-
-                if batch_lines:
-                    await safe_send_html(
-                        app.bot,
-                        chat_id,
-                        f"{themed_box(sc('DIGEST ALERTS'))}\n" + "\n".join(batch_lines[:15]),
-                    )
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("Monitor loop unexpected error: %s", exc)
-
-
-async def post_init(app) -> None:
-    await app.bot.set_my_commands(
+async def post_init(application) -> None:
+    init_db()
+    load_persisted_state()
+    await application.bot.set_my_commands(
         [
-            BotCommand("start", "Authority panel & login"),
-            BotCommand("help", "Operator manual & guide"),
-            BotCommand("status", "Live status & aging summary"),
-            BotCommand("allsite", "Assigned sites list"),
-            BotCommand("dash", "Site dashboard + API report"),
-            BotCommand("apireport", "UP Excise API report (<site> [date])"),
-            BotCommand("instruments", "Tank / mm / L / instrument readings"),
-            BotCommand("online", "Connected devices"),
-            BotCommand("unassigned", "Unassigned N/A devices"),
-            BotCommand("aging", "Aging buckets menu"),
-            BotCommand("age", "Filter bucket (<1d|1w|24d|11m|1y|gt1y>)"),
-            BotCommand("next", "Next page"),
-            BotCommand("prev", "Previous page"),
-            BotCommand("ai_analyze", "Compact Groq AI telemetry report"),
-            BotCommand("ai", "Ask Groq AI (<question>)"),
-            BotCommand("health", "System & parser health"),
-            BotCommand("export", "Export devices CSV"),
-            BotCommand("admin", "Admin authority settings"),
+            BotCommand("start", "Start / Main Menu"),
+            BotCommand("login", "Login to EnviroFRONT"),
+            BotCommand("logout", "Logout session"),
+            BotCommand("manual", "Operator Manual"),
+            BotCommand("menu", "Open Main Menu"),
+            BotCommand("next", "Next Page"),
         ]
     )
-    app.create_task(background_monitor_loop(app))
+    application.create_task(background_poll_loop(application))
 
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable missing hai!")
+        raise RuntimeError("BOT_TOKEN environment variable set nahi hai.")
 
     init_db()
     load_persisted_state()
@@ -5187,43 +4580,14 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("logout", cmd_logout))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("allsite", cmd_allsite))
-    app.add_handler(CommandHandler("dash", cmd_dash))
-    app.add_handler(CommandHandler("apireport", cmd_apireport))
-    app.add_handler(CommandHandler("instruments", cmd_instruments))
-    app.add_handler(CommandHandler("online", cmd_online))
-    app.add_handler(CommandHandler("unassigned", cmd_unassigned))
-    app.add_handler(CommandHandler("aging", cmd_aging))
-    app.add_handler(CommandHandler("age", cmd_age))
-    app.add_handler(CommandHandler("next", cmd_next))
-    app.add_handler(CommandHandler("prev", cmd_prev))
-    app.add_handler(CommandHandler("health", cmd_health))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("site", cmd_site))
-    app.add_handler(CommandHandler("ai_analyze", cmd_ai_analyze))
-    app.add_handler(CommandHandler("ai", cmd_ai))
-    app.add_handler(CommandHandler("exit_ai", cmd_exit_ai))
+    app.add_handler(CommandHandler("manual", cmd_manual))
+    app.add_handler(CommandHandler("menu", cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("set_theme", cmd_set_theme))
-    app.add_handler(CommandHandler("bot_on", cmd_bot_on))
-    app.add_handler(CommandHandler("bot_off", cmd_bot_off))
-    app.add_handler(CommandHandler("maint_on", cmd_maint_on))
-    app.add_handler(CommandHandler("maint_off", cmd_maint_off))
-    app.add_handler(CommandHandler("set_refresh", cmd_set_refresh))
-    app.add_handler(CommandHandler("set_notif", cmd_set_notif))
-
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
-    )
-
-    logger.info("Baagi Jaat Ultra Telemetry Suite starting...")
+    logger.info("%s Ultra Telemetry Bot starting...", CLIENT_NAME)
     app.run_polling(drop_pending_updates=True)
 
 
