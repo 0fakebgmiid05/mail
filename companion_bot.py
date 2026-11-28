@@ -12,7 +12,13 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from telegram import BotCommand, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -28,7 +34,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("BaagiJaatCompanionSuite")
+logger = logging.getLogger("CompanionCoreController")
 
 # ==============================================================================
 # ENVIRONMENT & SHARED AUTHORITY CONFIG
@@ -38,6 +44,10 @@ COMPANION_BOT_TOKEN: str = (
     or os.getenv("COMPANION_BOT_TOKEN", "").strip()
 )
 MAIN_BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
+THIRD_BOT_TOKEN: str = (
+    os.getenv("THIRD_BOT_TOKEN", "").strip()
+    or os.getenv("DYNAMIC_BOT_TOKEN", "").strip()
+)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "").strip()
 ADMIN_TG_ID: int = int(
     os.getenv("ADMIN_TG_ID", "1390658041").strip() or "1390658041"
@@ -50,11 +60,6 @@ DB_PATH: str = os.getenv("BOT_DB_PATH", "baagijaat_telemetry.db").strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 THIRD_BOT_FILE = os.path.join(BASE_DIR, "third_bot.py")
 BACKUP_DIR = os.path.join(BASE_DIR, "bot_backups")
-
-MEDIA_ANIM_URL: str = os.getenv("COMPANION_ANIM_URL", "").strip()
-MEDIA_GIF_URL: str = os.getenv("COMPANION_GIF_URL", "").strip()
-MEDIA_PHOTO_URL: str = os.getenv("COMPANION_PHOTO_URL", "").strip()
-MEDIA_VIDEO_URL: str = os.getenv("COMPANION_VIDEO_URL", "").strip()
 
 IST = timezone(timedelta(hours=5, minutes=30))
 GROQ_CHAT_URL: str = "https://api.groq.com/openai/v1/chat/completions"
@@ -69,7 +74,6 @@ _SMALL_CAPS = str.maketrans(
 AWAITING_INPUT: dict[int, str] = {}
 MENU_STACK: dict[int, list[str]] = {}
 MENU_STATE: dict[int, str] = {}
-ACTIVE_GAMES: dict[int, dict[str, Any]] = {}
 ACTIVE_STORY_ID: dict[int, int] = {}
 LAST_SYNC_META: dict[str, Any] = {
     "last_sync_ist": "Not synced yet",
@@ -81,15 +85,11 @@ LAST_SYNC_META: dict[str, Any] = {
 }
 
 DEFAULT_CUSTOM_CONFIG: dict[str, str] = {
-    "bot_title": f"{DEFAULT_CLIENT_NAME} ULTRA COMPANION",
-    "welcome_banner": "2nd Bot → 1st Bot Sync • 3rd Bot Live Editor • Murim Story",
-    "btn_games": "🎮 AI & Games Arcade",
+    "bot_title": f"{DEFAULT_CLIENT_NAME} COMPANION",
+    "welcome_banner": "Murim Story • 1st/2nd/3rd Sync • Live 3rd Bot AI Editor",
     "btn_story": "📜 Murim Story Mode",
-    "btn_sync": "🔄 Sync 1st & 2nd Bot",
-    "btn_ai": "🤖 AI Advisor",
-    "btn_media": "🎬 Media Showcase",
-    "btn_admin_custom": "👑 Admin Customize",
-    "game_max_rounds": "5",
+    "btn_sync": "🔄 Sync Bots",
+    "btn_admin": "👑 Admin Panel",
     "bot1_theme": "obsidian",
     "bot1_notif_style": "detailed",
     "bot1_refresh_sec": "60",
@@ -164,18 +164,6 @@ def init_companion_db() -> None:
         )
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS game_scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                game_name TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                score_delta INTEGER NOT NULL,
-                played_at TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
             CREATE TABLE IF NOT EXISTS sync_heartbeats (
                 service_name TEXT PRIMARY KEY,
                 last_ping TEXT NOT NULL,
@@ -232,7 +220,7 @@ def get_custom_config() -> dict[str, str]:
     return cfg
 
 
-def push_customization_to_bot1_db(key: str, val: str) -> None:
+def push_customization_to_db(key: str, val: str) -> None:
     clean_val = str(val).strip()
     stamp = now_ist_str()
     conn = get_db_conn()
@@ -262,63 +250,6 @@ def push_customization_to_bot1_db(key: str, val: str) -> None:
         conn.commit()
     finally:
         conn.close()
-
-
-def reset_all_customizations() -> None:
-    conn = get_db_conn()
-    try:
-        stamp = now_ist_str()
-        for k, v in DEFAULT_CUSTOM_CONFIG.items():
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO admin_custom_config(cfg_key, cfg_val, updated_at)
-                VALUES(?, ?, ?)
-                """,
-                (k, v, stamp),
-            )
-        conn.execute(
-            "INSERT OR REPLACE INTO bot_settings(k, v) VALUES('active_theme', ?)",
-            (DEFAULT_CUSTOM_CONFIG["bot1_theme"],),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO bot_settings(k, v) VALUES('notif_style', ?)",
-            (DEFAULT_CUSTOM_CONFIG["bot1_notif_style"],),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO bot_settings(k, v) VALUES('refresh_sec', ?)",
-            (DEFAULT_CUSTOM_CONFIG["bot1_refresh_sec"],),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO bot_settings(k, v) VALUES('maint_mode', ?)",
-            (DEFAULT_CUSTOM_CONFIG["bot1_maint_mode"],),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO bot_settings(k, v) VALUES('bot_enabled', ?)",
-            (DEFAULT_CUSTOM_CONFIG["bot1_bot_enabled"],),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def record_game_score(
-    user_id: int, game_name: str, outcome: str, score_delta: int
-) -> None:
-    try:
-        conn = get_db_conn()
-        try:
-            conn.execute(
-                """
-                INSERT INTO game_scores(user_id, game_name, outcome, score_delta, played_at)
-                VALUES(?, ?, ?, ?, ?)
-                """,
-                (user_id, game_name, outcome, score_delta, now_ist_str()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("record_game_score failed: %s", exc)
 
 
 def sync_bots_db() -> dict[str, Any]:
@@ -406,7 +337,7 @@ def sync_bots_db() -> dict[str, Any]:
 
 
 # ==============================================================================
-# RESILIENT GROQ AI ENGINE (LIVE MODEL DISCOVERY + FALLBACK)
+# RESILIENT GROQ AI ENGINE
 # ==============================================================================
 _CACHED_GROQ_MODELS: list[str] = []
 _CACHED_MODELS_AT: float = 0.0
@@ -461,8 +392,8 @@ def get_groq_models() -> list[str]:
 def call_groq_resilient(
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 380,
-    temperature: float = 0.45,
+    max_tokens: int = 1800,
+    temperature: float = 0.2,
 ) -> tuple[bool, str]:
     if not GROQ_API_KEY:
         return False, "GROQ_API_KEY missing hai."
@@ -486,9 +417,8 @@ def call_groq_resilient(
                     ],
                     "max_tokens": max_tokens,
                     "temperature": temperature,
-                    "frequency_penalty": 0.35,
                 },
-                timeout=25,
+                timeout=30,
             )
             if r.ok:
                 data = r.json()
@@ -498,7 +428,7 @@ def call_groq_resilient(
                     or ""
                 ).strip()
                 if content:
-                    return True, content[:1800]
+                    return True, content
                 last_reason = f"{model_id} ne khali response diya."
             else:
                 last_reason = f"{model_id} HTTP {r.status_code}"
@@ -509,9 +439,9 @@ def call_groq_resilient(
 
 
 # ==============================================================================
-# 3RD BOT LIVE EDITOR ENGINE (AI EDIT + MANUAL CODE + VIEW + ROLLBACK)
+# 3RD BOT LIVE EDITOR + AI COMMAND ENGINE
 # ==============================================================================
-def _strip_code_fences(raw: str) -> str:
+def _clean_and_normalize_python(raw: str) -> str:
     cleaned = (raw or "").strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
@@ -520,11 +450,15 @@ def _strip_code_fences(raw: str) -> str:
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
+
+    # Repair mangled double-underscore main guard if present
+    cleaned = cleaned.replace('if name == "main":', 'if __name__ == "__main__":')
+    cleaned = cleaned.replace("if name == 'main':", "if __name__ == '__main__':")
     return cleaned
 
 
 def apply_code_to_third_bot(raw_code: str) -> tuple[bool, str]:
-    code = _strip_code_fences(raw_code)
+    code = _clean_and_normalize_python(raw_code)
     if not code:
         return False, "Code khali hai."
 
@@ -557,22 +491,81 @@ def ai_edit_third_bot_code(instruction: str) -> tuple[bool, str]:
 
     sys_prompt = (
         "You are an expert Python Telegram bot developer using python-telegram-bot v20+. "
-        "Modify or build the complete, runnable third_bot.py according to the admin instruction. "
-        "Preserve token reading via os.getenv('THIRD_BOT_TOKEN') and drop_pending_updates=True. "
-        "Return ONLY raw valid Python code without markdown fences or explanations."
+        "Modify or build the complete, runnable third_bot.py based on the admin instruction. "
+        "Use os.getenv('THIRD_BOT_TOKEN') or os.getenv('DYNAMIC_BOT_TOKEN') and drop_pending_updates=True. "
+        "If asked to remove all buttons, use ReplyKeyboardRemove() or omit ReplyKeyboardMarkup/InlineKeyboardMarkup completely. "
+        "If asked for notifications, include notification sending capability cleanly. "
+        "Return ONLY raw valid Python code with proper __name__ == '__main__' and no markdown fences."
     )
-    user_prompt = (
-        f"CURRENT third_bot.py:\n{existing_code}\n\n"
-        f"ADMIN EDIT REQUEST:\n{instruction}\n\n"
+    prompt = (
+        f"CURRENT third_bot.py:\n{existing_code[:3800]}\n\n"
+        f"ADMIN INSTRUCTION:\n{instruction}\n\n"
         "Output ONLY complete valid Python code for third_bot.py:"
     )
-    ok, generated = call_groq_resilient(
-        sys_prompt, user_prompt, max_tokens=2200, temperature=0.2
-    )
-    if not ok:
-        return False, f"AI edit fail: {generated}"
 
-    return apply_code_to_third_bot(generated)
+    last_err = "AI response fail"
+    for _ in range(3):
+        ok, generated = call_groq_resilient(
+            sys_prompt, prompt, max_tokens=2200, temperature=0.15
+        )
+        if not ok:
+            last_err = generated
+            continue
+
+        code = _clean_and_normalize_python(generated)
+        try:
+            ast.parse(code)
+            return apply_code_to_third_bot(code)
+        except SyntaxError as exc:
+            last_err = f"Line {exc.lineno}: {exc.msg}"
+            prompt = (
+                f"Previous code had SyntaxError ({last_err}). Fix it completely and return ONLY valid Python code:\n"
+                f"{code[:3800]}"
+            )
+
+    return False, f"AI 3 attempts mein valid syntax nahi bana paya ({last_err}). Manual Code use karein."
+
+
+async def ai_send_direct_notification(bot, instruction: str) -> tuple[bool, str]:
+    """Allows AI to parse and send an immediate Telegram notification to target chat/admin."""
+    target_chat_id = ADMIN_TG_ID
+    msg_text = instruction.strip()
+
+    ok, parsed = await asyncio.to_thread(
+        call_groq_resilient,
+        "Extract notification target chat_id (default null) and clean notification message text from the user instruction. "
+        "Return STRICT JSON only: {\"chat_id\": null_or_int, \"message\": \"...\"}.",
+        instruction,
+        220,
+        0.1,
+    )
+    if ok:
+        try:
+            i1 = parsed.find("{")
+            i2 = parsed.rfind("}")
+            if i1 != -1 and i2 > i1:
+                obj = json.loads(parsed[i1 : i2 + 1])
+                if isinstance(obj.get("chat_id"), int):
+                    target_chat_id = int(obj["chat_id"])
+                elif isinstance(obj.get("chat_id"), str) and obj["chat_id"].lstrip("-").isdigit():
+                    target_chat_id = int(obj["chat_id"])
+                if obj.get("message"):
+                    msg_text = str(obj["message"]).strip()
+        except Exception:
+            pass
+
+    if not msg_text:
+        return False, "Notification message khali hai."
+
+    try:
+        await bot.send_message(
+            chat_id=target_chat_id,
+            text=f"🔔 <b>AI NOTIFICATION</b>\n{esc_html(msg_text)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return True, f"Notification sent to <code>{target_chat_id}</code>!"
+    except Exception as exc:
+        return False, f"Notification send fail: {esc_html(exc)}"
 
 
 def get_third_bot_preview() -> str:
@@ -857,7 +850,7 @@ def advance_story_choice(user_id: int, choice_letter: str) -> str:
         ok, ai_raw = call_groq_resilient(
             "Tum Kavana-style interactive crazy fantasy & Murim cultivation story writer ho. Sirf valid JSON do.",
             ai_prompt,
-            max_tokens=360,
+            max_tokens=380,
             temperature=0.65,
         )
 
@@ -941,555 +934,15 @@ def advance_story_choice(user_id: int, choice_letter: str) -> str:
 
 
 # ==============================================================================
-# MULTI-GAME ARCADE + GROQ AI GAME ENGINE
-# ==============================================================================
-TRIVIA_BANK: list[tuple[str, str, str]] = [
-    ("Modbus RTU ka physical serial layer aam taur par kaunsa hota hai?", "RS-485", "485"),
-    ("HART protocol analog signal ke saath kaunsa signal overlay karta hai?", "FSK Digital Signal", "fsk"),
-    ("PLC Ladder Logic mein normally open contact ko kya kehte hain?", "XIC / NO Contact", "no"),
-    ("Python mein immutable sequence ka common example kaunsa hai?", "Tuple", "tuple"),
-    ("SQLite mein primary key unique index banata hai — True ya False?", "True", "true"),
-]
-
-SCRAMBLE_WORDS: list[tuple[str, str]] = [
-    ("TELEMETRY", "Remote sensor & meter data transmission"),
-    ("CALIBRATION", "Tank dip chart & sensor accuracy alignment"),
-    ("AUTOMATION", "PLC & industrial control process"),
-    ("DATABASE", "Structured persistent storage like SQLite"),
-    ("PROTOCOL", "Communication rule set like Modbus or HART"),
-]
-
-MATH_OPS = ["+", "-", "*"]
-
-
-def start_game_session(chat_id: int, game_key: str) -> str:
-    cfg = get_custom_config()
-    max_rounds = max(1, min(15, int(cfg.get("game_max_rounds") or "5")))
-
-    if game_key == "ai_riddle":
-        ok, riddle_txt = call_groq_resilient(
-            "Tum ek smart Hinglish game master ho. Ek chhota, mazedaar tech ya logic riddle poochho aur end mein sirf 'Hint:' likh kar 1 line hint do. Jawab abhi mat batao.",
-            "Ek naya riddle banao.",
-            max_tokens=180,
-            temperature=0.6,
-        )
-        if not ok:
-            riddle_txt = "Main bina bole sab kuch sunta hoon aur data ko safe rakhta hoon — batao main kaun hoon? Hint: DB/Server"
-        ACTIVE_GAMES[chat_id] = {"type": "ai_riddle", "riddle": riddle_txt}
-        return (
-            f"❖ <b>{esc_html(sc('AI RIDDLE CHALLENGE'))}</b>\n"
-            f"{esc_html(riddle_txt)}\n\n"
-            "▸ Apna jawab type karein:"
-        )
-
-    if game_key == "ai_scenario":
-        ok, sc_txt = call_groq_resilient(
-            "Tum ek Hinglish adventure & strategy game host ho. Ek short 3-line situation do jisme user ko 2 options (A ya B) milen.",
-            "Ek naya adventure scenario shuru karo.",
-            max_tokens=200,
-            temperature=0.65,
-        )
-        if not ok:
-            sc_txt = "Ek purane control room mein alarm baja hai. Option A: Main breaker check karein. Option B: Backup console dekhein."
-        ACTIVE_GAMES[chat_id] = {"type": "ai_scenario", "scenario": sc_txt}
-        return (
-            f"❖ <b>{esc_html(sc('AI STRATEGY QUEST'))}</b>\n"
-            f"{esc_html(sc_txt)}\n\n"
-            "▸ Apna choice ya action type karein:"
-        )
-
-    if game_key == "ttt":
-        ACTIVE_GAMES[chat_id] = {"type": "ttt", "board": [" "] * 9}
-        return render_ttt(
-            ACTIVE_GAMES[chat_id]["board"],
-            "Aap 'X' hain, Bot 'O' hai. Cell 1–9 bhejein:",
-        )
-
-    if game_key == "guess":
-        secret = random.randint(1, 100)
-        ACTIVE_GAMES[chat_id] = {
-            "type": "guess",
-            "secret": secret,
-            "tries": 0,
-            "low": 1,
-            "high": 100,
-        }
-        return (
-            f"❖ <b>{esc_html(sc('NUMBER GUESS (1–100)'))}</b>\n"
-            "▸ Maine 1 se 100 ke beech ek number socha hai. Guess number bhejein:"
-        )
-
-    if game_key == "rps":
-        ACTIVE_GAMES[chat_id] = {
-            "type": "rps",
-            "user_pts": 0,
-            "bot_pts": 0,
-            "round": 0,
-            "max_rounds": max_rounds,
-        }
-        return (
-            f"❖ <b>{esc_html(sc('ROCK • PAPER • SCISSORS'))}</b> (Best of {max_rounds})\n"
-            "▸ <code>Rock</code>, <code>Paper</code>, ya <code>Scissors</code> bhejein:"
-        )
-
-    if game_key == "rpsls":
-        ACTIVE_GAMES[chat_id] = {
-            "type": "rpsls",
-            "user_pts": 0,
-            "bot_pts": 0,
-            "round": 0,
-            "max_rounds": max_rounds,
-        }
-        return (
-            f"❖ <b>{esc_html(sc('RPSLS ARCADE'))}</b>\n"
-            "▸ <code>Rock</code>, <code>Paper</code>, <code>Scissors</code>, <code>Lizard</code>, ya <code>Spock</code>:"
-        )
-
-    if game_key == "math":
-        a = random.randint(12, 99)
-        b = random.randint(2, 25)
-        op = random.choice(MATH_OPS)
-        ans = a + b if op == "+" else (a - b if op == "-" else a * b)
-        ACTIVE_GAMES[chat_id] = {
-            "type": "math",
-            "answer": ans,
-            "streak": 0,
-            "round": 1,
-            "max_rounds": max_rounds,
-        }
-        return (
-            f"❖ <b>{esc_html(sc('SPEED MATH'))}</b> (Round 1/{max_rounds})\n"
-            f"▸ Solve karein: <code>{a} {op} {b} = ?</code>"
-        )
-
-    if game_key == "trivia":
-        q_txt, ans_disp, ans_key = random.choice(TRIVIA_BANK)
-        ACTIVE_GAMES[chat_id] = {
-            "type": "trivia",
-            "question": q_txt,
-            "ans_disp": ans_disp,
-            "ans_key": ans_key.lower(),
-        }
-        return (
-            f"❖ <b>{esc_html(sc('TECH TRIVIA'))}</b>\n"
-            f"▸ <b>{esc_html(q_txt)}</b>"
-        )
-
-    if game_key == "scramble":
-        word, hint = random.choice(SCRAMBLE_WORDS)
-        letters = list(word)
-        random.shuffle(letters)
-        scrambled = "".join(letters)
-        if scrambled == word:
-            scrambled = word[::-1]
-        ACTIVE_GAMES[chat_id] = {
-            "type": "scramble",
-            "word": word,
-            "hint": hint,
-            "scrambled": scrambled,
-        }
-        return (
-            f"❖ <b>{esc_html(sc('WORD SCRAMBLE'))}</b>\n"
-            f"▸ Word: <code>{esc_html(scrambled)}</code>\n"
-            f"▸ Hint: <i>{esc_html(hint)}</i>"
-        )
-
-    if game_key == "dice":
-        u_roll = random.randint(1, 6)
-        b_roll = random.randint(1, 6)
-        if u_roll > b_roll:
-            res, delta = "Aap jeete!", 10
-        elif b_roll > u_roll:
-            res, delta = "Bot jeeta!", -5
-        else:
-            res, delta = "Tie!", 2
-        record_game_score(chat_id, "Dice Duel", res, delta)
-        return (
-            f"❖ <b>{esc_html(sc('DICE DUEL'))}</b>\n"
-            f"▸ Aap: <b>{u_roll}</b> | Bot: <b>{b_roll}</b> → <b>{esc_html(res)}</b> ({delta:+d} pts)"
-        )
-
-    if game_key == "coin":
-        u_side = random.choice(["Heads", "Tails"])
-        b_side = random.choice(["Heads", "Tails"])
-        won = u_side == b_side
-        res = "Match!" if won else "Miss!"
-        delta = 10 if won else 0
-        record_game_score(chat_id, "Coin Flip", res, delta)
-        return (
-            f"❖ <b>{esc_html(sc('COIN FLIP'))}</b>\n"
-            f"▸ Call: <b>{u_side}</b> | Coin: <b>{b_side}</b> → <b>{esc_html(res)}</b>"
-        )
-
-    if game_key == "slots":
-        syms = ["🍒", "🍋", "🔔", "💎", "7️⃣"]
-        reels = [random.choice(syms) for _ in range(3)]
-        if len(set(reels)) == 1:
-            res, delta = "JACKPOT!", 50
-        elif len(set(reels)) == 2:
-            res, delta = "Pair Win!", 15
-        else:
-            res, delta = "Try Again", 0
-        record_game_score(chat_id, "Lucky Slots", res, delta)
-        return (
-            f"❖ <b>{esc_html(sc('LUCKY SLOTS'))}</b>\n"
-            f"▸ [ <b>{reels[0]} | {reels[1]} | {reels[2]}</b> ] → <b>{esc_html(res)}</b> ({delta:+d} pts)"
-        )
-
-    if game_key == "bomb":
-        safe_wire = random.choice(["RED", "BLUE", "GREEN"])
-        ACTIVE_GAMES[chat_id] = {"type": "bomb", "safe": safe_wire}
-        return (
-            f"❖ <b>{esc_html(sc('BOMB DEFUSAL'))}</b>\n"
-            "▸ Wire chuniye: <code>RED</code>, <code>BLUE</code>, ya <code>GREEN</code>:"
-        )
-
-    if game_key == "highlow":
-        cur_num = random.randint(15, 85)
-        next_num = random.randint(1, 100)
-        ACTIVE_GAMES[chat_id] = {
-            "type": "highlow",
-            "current": cur_num,
-            "next": next_num,
-        }
-        return (
-            f"❖ <b>{esc_html(sc('HIGHER OR LOWER'))}</b>\n"
-            f"▸ Current: <b>{cur_num}</b> — Agla number <code>HIGH</code> ya <code>LOW</code>?"
-        )
-
-    return "Game start nahi ho saka."
-
-
-def _ttt_win(b: list[str]) -> str | None:
-    lines = [
-        (0, 1, 2),
-        (3, 4, 5),
-        (6, 7, 8),
-        (0, 3, 6),
-        (1, 4, 7),
-        (2, 5, 8),
-        (0, 4, 8),
-        (2, 4, 6),
-    ]
-    for x, y, z in lines:
-        if b[x] != " " and b[x] == b[y] == b[z]:
-            return b[x]
-    return "DRAW" if " " not in b else None
-
-
-def render_ttt(b: list[str], note: str) -> str:
-    disp = [
-        ("✕" if v == "X" else ("◯" if v == "O" else str(i + 1)))
-        for i, v in enumerate(b)
-    ]
-    grid = (
-        f"<code>  {disp[0]} │ {disp[1]} │ {disp[2]}  </code>\n"
-        f"<code> ───┼───┼─── </code>\n"
-        f"<code>  {disp[3]} │ {disp[4]} │ {disp[5]}  </code>\n"
-        f"<code> ───┼───┼─── </code>\n"
-        f"<code>  {disp[6]} │ {disp[7]} │ {disp[8]}  </code>"
-    )
-    return f"❖ <b>{esc_html(sc('TIC-TAC-TOE'))}</b>\n{grid}\n\n▸ {esc_html(note)}"
-
-
-def handle_active_game_input(chat_id: int, text: str) -> str | None:
-    st = ACTIVE_GAMES.get(chat_id)
-    if not st:
-        return None
-
-    gtype = st.get("type")
-    low = text.strip().lower()
-
-    if gtype == "ai_riddle":
-        riddle = str(st.get("riddle") or "")
-        ACTIVE_GAMES.pop(chat_id, None)
-        ok, judge = call_groq_resilient(
-            "Tum Hinglish riddle judge ho. User ke jawab ko evaluate karo, short aur friendly response do, aur sahi hint/answer clarify karo.",
-            f"Riddle: {riddle}\nUser Answer: {text}",
-            max_tokens=180,
-            temperature=0.3,
-        )
-        won = ok and any(
-            w in judge.lower() for w in ("sahi", "correct", "badhai", "shabaash")
-        )
-        record_game_score(chat_id, "AI Riddle", "Evaluated", 15 if won else 5)
-        return f"🤖 <b>AI Riddle Result</b>\n{esc_html(judge if ok else 'Jawab receive hua!')}"
-
-    if gtype == "ai_scenario":
-        sc_txt = str(st.get("scenario") or "")
-        ACTIVE_GAMES.pop(chat_id, None)
-        ok, outcome = call_groq_resilient(
-            "Tum Hinglish adventure narrator ho. User ke move ka 3-4 line ka interesting result likho aur score/ending batao.",
-            f"Scenario: {sc_txt}\nUser Move: {text}",
-            max_tokens=200,
-            temperature=0.5,
-        )
-        record_game_score(chat_id, "AI Quest", "Completed", 15)
-        return f"🤖 <b>AI Quest Outcome</b>\n{esc_html(outcome if ok else 'Aapka move record ho gaya!')}"
-
-    if gtype == "ttt":
-        if text.strip() not in {"1", "2", "3", "4", "5", "6", "7", "8", "9"}:
-            return render_ttt(st["board"], "1 se 9 tak cell number bhejein.")
-        idx = int(text.strip()) - 1
-        board: list[str] = st["board"]
-        if board[idx] != " ":
-            return render_ttt(board, "Yeh cell pehle se bhara hai.")
-        board[idx] = "X"
-        w = _ttt_win(board)
-        if w == "X":
-            ACTIVE_GAMES.pop(chat_id, None)
-            record_game_score(chat_id, "Tic-Tac-Toe", "Win", 20)
-            return render_ttt(board, "Aap jeet gaye! (+20 pts)")
-        if w == "DRAW":
-            ACTIVE_GAMES.pop(chat_id, None)
-            record_game_score(chat_id, "Tic-Tac-Toe", "Draw", 5)
-            return render_ttt(board, "Match Draw! (+5 pts)")
-
-        empties = [i for i, v in enumerate(board) if v == " "]
-        choice = 4 if 4 in empties else random.choice(empties)
-        board[choice] = "O"
-        w2 = _ttt_win(board)
-        if w2 == "O":
-            ACTIVE_GAMES.pop(chat_id, None)
-            record_game_score(chat_id, "Tic-Tac-Toe", "Loss", 0)
-            return render_ttt(board, "Bot jeet gaya!")
-        if w2 == "DRAW":
-            ACTIVE_GAMES.pop(chat_id, None)
-            record_game_score(chat_id, "Tic-Tac-Toe", "Draw", 5)
-            return render_ttt(board, "Match Draw! (+5 pts)")
-        return render_ttt(
-            board, f"Bot ne cell {choice + 1} chuna. Ab aapki baari:"
-        )
-
-    if gtype == "guess":
-        try:
-            g_val = int(text.strip())
-        except ValueError:
-            return "Kripya ek valid number (1–100) bhejein."
-        st["tries"] = int(st["tries"]) + 1
-        secret = int(st["secret"])
-        if g_val == secret:
-            tries = int(st["tries"])
-            ACTIVE_GAMES.pop(chat_id, None)
-            pts = max(10, 50 - tries * 4)
-            record_game_score(chat_id, "Number Guess", f"Won in {tries}", pts)
-            return f"🎉 Sahi number <b>{secret}</b> aapne <b>{tries}</b> tries mein guess kiya! (+{pts} pts)"
-        if g_val < secret:
-            st["low"] = max(int(st["low"]), g_val + 1)
-            return f"📈 Thoda <b>BADA</b> number try karein (Range: <code>{st['low']}–{st['high']}</code>)"
-        st["high"] = min(int(st["high"]), g_val - 1)
-        return f"📉 Thoda <b>CHHOTA</b> number try karein (Range: <code>{st['low']}–{st['high']}</code>)"
-
-    if gtype == "rps":
-        if "rock" in low:
-            u = "Rock"
-        elif "paper" in low:
-            u = "Paper"
-        elif "scissor" in low:
-            u = "Scissors"
-        else:
-            return "<code>Rock</code>, <code>Paper</code>, ya <code>Scissors</code> chuniye."
-        b = random.choice(["Rock", "Paper", "Scissors"])
-        st["round"] = int(st["round"]) + 1
-        beats = {"Rock": "Scissors", "Paper": "Rock", "Scissors": "Paper"}
-        if u == b:
-            msg = "Round Draw!"
-        elif beats[u] == b:
-            st["user_pts"] = int(st["user_pts"]) + 1
-            msg = "Aap round jeete!"
-        else:
-            st["bot_pts"] = int(st["bot_pts"]) + 1
-            msg = "Bot round jeeta!"
-
-        done = int(st["round"]) >= int(st["max_rounds"])
-        score_str = f"Aap <b>{st['user_pts']}</b> - <b>{st['bot_pts']}</b> Bot (Round {st['round']}/{st['max_rounds']})"
-        if done:
-            ACTIVE_GAMES.pop(chat_id, None)
-            won = int(st["user_pts"]) >= int(st["bot_pts"])
-            record_game_score(
-                chat_id, "RPS", "Win" if won else "Loss", 15 if won else 0
-            )
-            return f"Aap: <b>{u}</b> vs Bot: <b>{b}</b> → {msg}\nFinal: {score_str}"
-        return f"Aap: <b>{u}</b> vs Bot: <b>{b}</b> → {msg}\n{score_str}"
-
-    if gtype == "rpsls":
-        valid = ["rock", "paper", "scissors", "lizard", "spock"]
-        u = next((v.capitalize() for v in valid if v in low), None)
-        if not u:
-            return "<code>Rock</code>, <code>Paper</code>, <code>Scissors</code>, <code>Lizard</code>, ya <code>Spock</code> bhejein."
-        b = random.choice([v.capitalize() for v in valid])
-        wins_map = {
-            "Rock": {"Scissors", "Lizard"},
-            "Paper": {"Rock", "Spock"},
-            "Scissors": {"Paper", "Lizard"},
-            "Lizard": {"Spock", "Paper"},
-            "Spock": {"Scissors", "Rock"},
-        }
-        st["round"] = int(st["round"]) + 1
-        if u == b:
-            res = "Draw"
-        elif b in wins_map[u]:
-            st["user_pts"] = int(st["user_pts"]) + 1
-            res = "Aap jeete!"
-        else:
-            st["bot_pts"] = int(st["bot_pts"]) + 1
-            res = "Bot jeeta!"
-        if int(st["round"]) >= int(st["max_rounds"]):
-            ACTIVE_GAMES.pop(chat_id, None)
-            record_game_score(chat_id, "RPSLS", res, 15)
-        return (
-            f"Aap: <b>{u}</b> vs Bot: <b>{b}</b> → <b>{esc_html(res)}</b>\n"
-            f"Score: Aap <b>{st['user_pts']}</b> | Bot <b>{st['bot_pts']}</b>"
-        )
-
-    if gtype == "math":
-        try:
-            u_ans = int(text.strip())
-        except ValueError:
-            return "Integer answer bhejein."
-        correct = int(st["answer"])
-        if u_ans == correct:
-            st["streak"] = int(st["streak"]) + 1
-            if int(st["round"]) >= int(st["max_rounds"]):
-                pts = int(st["streak"]) * 10
-                ACTIVE_GAMES.pop(chat_id, None)
-                record_game_score(chat_id, "Speed Math", "Completed", pts)
-                return f"🎉 Sab rounds complete! Streak: <b>{st['streak']}</b> (+{pts} pts)"
-            st["round"] = int(st["round"]) + 1
-            a = random.randint(12, 99)
-            b = random.randint(2, 25)
-            op = random.choice(MATH_OPS)
-            st["answer"] = (
-                a + b if op == "+" else (a - b if op == "-" else a * b)
-            )
-            return f"✅ Sahi! (Round {st['round']}/{st['max_rounds']})\nAgla: <code>{a} {op} {b} = ?</code>"
-        ACTIVE_GAMES.pop(chat_id, None)
-        return f"❌ Galat! Sahi jawab <b>{correct}</b> tha."
-
-    if gtype == "trivia":
-        ans_key = str(st.get("ans_key") or "")
-        ans_disp = str(st.get("ans_disp") or "")
-        ACTIVE_GAMES.pop(chat_id, None)
-        if ans_key and ans_key in low:
-            record_game_score(chat_id, "Trivia", "Correct", 15)
-            return f"✅ Sahi jawab! <b>{esc_html(ans_disp)}</b> (+15 pts)"
-        return f"ℹ Sahi answer: <b>{esc_html(ans_disp)}</b>"
-
-    if gtype == "scramble":
-        target = str(st.get("word") or "").lower()
-        ACTIVE_GAMES.pop(chat_id, None)
-        if low == target:
-            record_game_score(chat_id, "Word Scramble", "Solved", 15)
-            return f"✅ Shabaash! Word: <b>{esc_html(target.upper())}</b> (+15 pts)"
-        return f"ℹ Sahi word: <b>{esc_html(target.upper())}</b>"
-
-    if gtype == "bomb":
-        safe = str(st.get("safe") or "").lower()
-        ACTIVE_GAMES.pop(chat_id, None)
-        if low == safe:
-            record_game_score(chat_id, "Bomb Defusal", "Defused", 25)
-            return f"💣✅ Bomb defuse ho gaya! Safe wire: <b>{safe.upper()}</b> (+25 pts)"
-        return f"💥 Galat wire! Safe wire: <b>{safe.upper()}</b> thi."
-
-    if gtype == "highlow":
-        cur_n = int(st.get("current") or 50)
-        nxt_n = int(st.get("next") or 50)
-        ACTIVE_GAMES.pop(chat_id, None)
-        if "high" in low:
-            won = nxt_n >= cur_n
-        elif "low" in low:
-            won = nxt_n <= cur_n
-        else:
-            return "<code>HIGH</code> ya <code>LOW</code> type karein."
-        record_game_score(
-            chat_id, "Higher/Lower", "Win" if won else "Loss", 10 if won else 0
-        )
-        return (
-            f"Current: <b>{cur_n}</b> → Next: <b>{nxt_n}</b>\n"
-            f"Result: <b>{'Aap jeete! (+10 pts)' if won else 'Aap haar gaye!'}</b>"
-        )
-
-    return None
-
-
-# ==============================================================================
-# MEDIA DELIVERY ENGINE (PHOTO / ANIMATION / GIF / VIDEO WITH SAFE FALLBACK)
-# ==============================================================================
-async def send_media_showcase(bot, chat_id: int, kind: str, caption: str) -> None:
-    target_map = {
-        "anim": MEDIA_ANIM_URL,
-        "gif": MEDIA_GIF_URL,
-        "photo": MEDIA_PHOTO_URL,
-        "video": MEDIA_VIDEO_URL,
-    }
-    media_val = target_map.get(kind, "")
-    try:
-        if media_val:
-            if kind in ("anim", "gif"):
-                await bot.send_animation(
-                    chat_id=chat_id,
-                    animation=media_val,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            if kind == "photo":
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=media_val,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            if kind == "video":
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=media_val,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-    except Exception as exc:
-        logger.warning("Media send (%s) fallback: %s", kind, exc)
-
-    tag_map = {
-        "anim": "ANIMATION READY (Set COMPANION_ANIM_URL)",
-        "gif": "GIF READY (Set COMPANION_GIF_URL)",
-        "photo": "PHOTO READY (Set COMPANION_PHOTO_URL)",
-        "video": "VIDEO READY (Set COMPANION_VIDEO_URL)",
-    }
-    card = (
-        f"{frame_box(sc(tag_map.get(kind, 'MEDIA')), caption)}\n"
-        f"▸ Status : <b>Active UI Media Engine</b>"
-    )
-    await bot.send_message(
-        chat_id=chat_id,
-        text=card,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ==============================================================================
-# KEYBOARDS (WITH BACK & MAIN MENU EVERYWHERE + STORY + 3RD BOT + ADMIN CUSTOM)
+# FOCUSED KEYBOARDS (STORY + SYNC + ADMIN ONLY)
 # ==============================================================================
 def main_menu_keyboard(user_id: int | None) -> ReplyKeyboardMarkup:
     cfg = get_custom_config()
     rows: list[list[KeyboardButton]] = [
-        [
-            KeyboardButton(cfg["btn_story"]),
-            KeyboardButton(cfg["btn_games"]),
-        ],
-        [
-            KeyboardButton(cfg["btn_sync"]),
-            KeyboardButton(cfg["btn_ai"]),
-        ],
-        [
-            KeyboardButton(cfg["btn_media"]),
-            KeyboardButton("📊 Leaderboard"),
-        ],
+        [KeyboardButton(cfg["btn_story"]), KeyboardButton(cfg["btn_sync"])],
     ]
     if is_admin(user_id):
-        rows.append([KeyboardButton(cfg["btn_admin_custom"])])
+        rows.append([KeyboardButton(cfg["btn_admin"])])
     rows.append([KeyboardButton("🏠 Main Menu")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
@@ -1507,47 +960,14 @@ def story_hub_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def games_arcade_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("🤖 AI Riddle"), KeyboardButton("🧭 AI Quest")],
-            [KeyboardButton("🎲 Tic-Tac-Toe"), KeyboardButton("🔢 Number Guess")],
-            [KeyboardButton("✂ RPS"), KeyboardButton("🖖 RPSLS")],
-            [KeyboardButton("🧮 Speed Math"), KeyboardButton("🧠 Trivia")],
-            [KeyboardButton("🔤 Scramble"), KeyboardButton("🎲 Dice Duel")],
-            [KeyboardButton("🪙 Coin Flip"), KeyboardButton("🎰 Lucky Slots")],
-            [KeyboardButton("💣 Bomb Defusal"), KeyboardButton("📈 Higher Lower")],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-def media_hub_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("🎞 Animation"), KeyboardButton("🖼 GIF Card")],
-            [KeyboardButton("📷 Photo Card"), KeyboardButton("🎥 Video Card")],
-            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-def admin_customize_keyboard() -> ReplyKeyboardMarkup:
+def admin_panel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🤖 AI Edit 3rd Bot"), KeyboardButton("📥 Manual Code 3rd Bot")],
             [KeyboardButton("📄 View 3rd Bot"), KeyboardButton("⏪ Rollback 3rd Bot")],
-            [KeyboardButton("✏ 2nd Bot Title"), KeyboardButton("📝 Welcome Banner")],
-            [KeyboardButton("🎨 1st Bot Theme"), KeyboardButton("🔔 1st Bot Notif")],
-            [KeyboardButton("⏱ 1st Bot Sync Sec"), KeyboardButton("🛠 1st Bot Maint")],
-            [KeyboardButton("⚡ 1st Bot ON/OFF"), KeyboardButton("🔢 Game Rounds")],
-            [KeyboardButton("🔄 Force Sync Now"), KeyboardButton("📋 View Custom Config")],
-            [KeyboardButton("♻ Reset Defaults"), KeyboardButton("⬅ Back")],
-            [KeyboardButton("🏠 Main Menu")],
+            [KeyboardButton("🔔 AI Notify"), KeyboardButton("🔄 Force Sync Now")],
+            [KeyboardButton("⚡ 1st Bot ON/OFF"), KeyboardButton("🛠 1st Bot Maint")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1560,12 +980,8 @@ def keyboard_for_state(
     state = MENU_STATE.get(chat_id, "main")
     if state == "story":
         return story_hub_keyboard()
-    if state == "games":
-        return games_arcade_keyboard()
-    if state == "media":
-        return media_hub_keyboard()
-    if state == "admin_custom" and is_admin(user_id):
-        return admin_customize_keyboard()
+    if state == "admin" and is_admin(user_id):
+        return admin_panel_keyboard()
     return main_menu_keyboard(user_id)
 
 
@@ -1578,7 +994,6 @@ def push_state(chat_id: int, new_state: str) -> None:
 
 async def pop_state(chat_id: int, user_id: int | None, bot) -> None:
     AWAITING_INPUT.pop(chat_id, None)
-    ACTIVE_GAMES.pop(chat_id, None)
     st = MENU_STACK.get(chat_id) or []
     prev = st.pop() if st else "main"
     MENU_STATE[chat_id] = prev
@@ -1594,54 +1009,39 @@ async def pop_state(chat_id: int, user_id: int | None, bot) -> None:
 # HANDLERS & BACKGROUND SYNC WORKER
 # ==============================================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else None
     AWAITING_INPUT.pop(chat_id, None)
-    ACTIVE_GAMES.pop(chat_id, None)
     MENU_STATE[chat_id] = "main"
     MENU_STACK[chat_id] = ["main"]
 
     cfg = get_custom_config()
     meta = await asyncio.to_thread(sync_bots_db)
     role_badge = (
-        "ADMIN (1st + 2nd + 3rd Bot Live Controller)"
+        "ADMIN (Story + Sync + 3rd Bot AI/Manual Controller)"
         if is_admin(user_id)
-        else "OPERATOR (Story, Games & Sync)"
+        else "USER (Story + Sync)"
     )
 
     msg = (
         f"{frame_box(sc(cfg['bot_title']), cfg['welcome_banner'])}\n"
         f"  ❖ Role         : <b>{esc_html(role_badge)}</b>\n"
-        f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code> | Stories Saved: <b>{meta.get('story_saves_count', 0)}</b>\n"
-        f"  ❖ 1st Bot Mode : Theme <code>{esc_html(cfg['bot1_theme'])}</code> | Notif <code>{esc_html(cfg['bot1_notif_style'])}</code>\n"
+        f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code> | Stories: <b>{meta.get('story_saves_count', 0)}</b>\n"
         f"  ❖ Last Sync    : <code>{esc_html(meta.get('last_sync_ist', 'N/A'))}</code>"
     )
-    if MEDIA_ANIM_URL or MEDIA_GIF_URL or MEDIA_PHOTO_URL:
-        await send_media_showcase(
-            context.bot,
-            chat_id,
-            "anim" if MEDIA_ANIM_URL else ("gif" if MEDIA_GIF_URL else "photo"),
-            msg,
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❖ <b>Command Menu Ready</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_keyboard(user_id),
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=msg,
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_keyboard(user_id),
-        )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(user_id),
+    )
 
 
 async def handle_document(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Allows Admin to upload a .py file directly to live-update third_bot.py."""
     if not update.message or not update.message.document:
         return
     chat_id = update.effective_chat.id
@@ -1662,7 +1062,7 @@ async def handle_document(
             chat_id=chat_id,
             text="Kripya <code>.py</code> Python file bhejein.",
             parse_mode=ParseMode.HTML,
-            reply_markup=admin_customize_keyboard(),
+            reply_markup=admin_panel_keyboard(),
         )
         return
 
@@ -1675,7 +1075,7 @@ async def handle_document(
         chat_id=chat_id,
         text=f"{'✅' if ok else '❌'} {esc_html(status_msg)}",
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_customize_keyboard(),
+        reply_markup=admin_panel_keyboard(),
     )
 
 
@@ -1693,12 +1093,11 @@ async def handle_text(
 
     if text in ("🏠 Main Menu", "/menu"):
         AWAITING_INPUT.pop(chat_id, None)
-        ACTIVE_GAMES.pop(chat_id, None)
         MENU_STATE[chat_id] = "main"
         MENU_STACK[chat_id] = ["main"]
         await context.bot.send_message(
             chat_id=chat_id,
-            text=frame_box(sc(cfg["bot_title"]), "Main Control Menu"),
+            text=frame_box(sc(cfg["bot_title"]), "Main Menu"),
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_keyboard(user_id),
         )
@@ -1723,28 +1122,10 @@ async def handle_text(
             )
             return
 
-        if pending == "ask_ai":
-            meta = await asyncio.to_thread(sync_bots_db)
-            ok, ans = await asyncio.to_thread(
-                call_groq_resilient,
-                "Tum ek crisp, helpful Hinglish telemetry & system advisor ho. Bina kisi repetition ke clean jawab do.",
-                f"Sync Context: {json.dumps(meta, default=str)}\nQuestion: {text}",
-                320,
-                0.25,
-            )
-            body = esc_html(ans) if ok else f"AI note: <code>{esc_html(ans)}</code>"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{frame_box(sc('GROQ AI ADVISOR'))}\n{body}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu_keyboard(user_id),
-            )
-            return
-
         if not is_admin(user_id):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="⛔ Yeh customization / 3rd-bot edit sirf <b>Admin</b> ke liye allowed hai.",
+                text="⛔ Yeh action sirf <b>Admin</b> ke liye allowed hai.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu_keyboard(user_id),
             )
@@ -1753,15 +1134,15 @@ async def handle_text(
         if pending == "ai_edit_third":
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="🤖 AI `third_bot.py` ka code generate aur syntax-check kar raha hai...",
-                reply_markup=admin_customize_keyboard(),
+                text="🤖 AI `third_bot.py` ko edit aur syntax-check kar raha hai...",
+                reply_markup=admin_panel_keyboard(),
             )
             ok, res_msg = await asyncio.to_thread(ai_edit_third_bot_code, text)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"{'✅' if ok else '❌'} {esc_html(res_msg)}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -1771,129 +1152,17 @@ async def handle_text(
                 chat_id=chat_id,
                 text=f"{'✅' if ok else '❌'} {esc_html(res_msg)}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
-        if pending == "set_title":
-            push_customization_to_bot1_db("bot_title", text[:100])
+        if pending == "ai_notify":
+            ok, n_msg = await ai_send_direct_notification(context.bot, text)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"✅ 2nd Bot Title updated: <b>{esc_html(text[:100])}</b>",
+                text=f"{'✅' if ok else '❌'} {n_msg}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if pending == "set_banner":
-            push_customization_to_bot1_db("welcome_banner", text[:160])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ Banner updated: <b>{esc_html(text[:160])}</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if pending == "set_theme":
-            valid_t = next(
-                (t for t in ("obsidian", "minimal", "cyber", "royal") if t in low),
-                None,
-            )
-            if not valid_t:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="Theme likhein: <code>obsidian</code>, <code>minimal</code>, <code>cyber</code>, ya <code>royal</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=admin_customize_keyboard(),
-                )
-                return
-            push_customization_to_bot1_db("bot1_theme", valid_t)
-            await asyncio.to_thread(sync_bots_db)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 1st Bot (`main.py`) theme synced to <b>{esc_html(valid_t)}</b>.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if pending == "set_notif":
-            if "alert" in low:
-                n_val = "alerts_only"
-            elif "compact" in low:
-                n_val = "compact"
-            elif "digest" in low:
-                n_val = "digest"
-            elif "detail" in low:
-                n_val = "detailed"
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="Mode likhein: <code>detailed</code>, <code>compact</code>, <code>alerts_only</code>, ya <code>digest</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=admin_customize_keyboard(),
-                )
-                return
-            push_customization_to_bot1_db("bot1_notif_style", n_val)
-            await asyncio.to_thread(sync_bots_db)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 1st Bot notification mode synced to <b>{esc_html(n_val)}</b>.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if pending == "set_sync_sec":
-            try:
-                sec = int(text)
-                if 15 <= sec <= 3600:
-                    push_customization_to_bot1_db("bot1_refresh_sec", str(sec))
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"✅ 1st Bot poll interval synced to <b>{sec}s</b>.",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=admin_customize_keyboard(),
-                    )
-                    return
-            except ValueError:
-                pass
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="15 se 3600 ke beech seconds bhejein.",
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if pending == "set_maint_msg":
-            push_customization_to_bot1_db("bot1_maint_msg", text[:220])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 1st Bot maintenance message synced: <code>{esc_html(text[:220])}</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if pending == "set_rounds":
-            try:
-                r_num = int(text)
-                if 1 <= r_num <= 15:
-                    push_customization_to_bot1_db("game_max_rounds", str(r_num))
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"✅ Game rounds set to <b>{r_num}</b>.",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=admin_customize_keyboard(),
-                    )
-                    return
-            except ValueError:
-                pass
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="1 se 15 ke beech number bhejein.",
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -1903,9 +1172,9 @@ async def handle_text(
         hub_msg = (
             f"{frame_box(sc('MURIM & DEMONIC STORY MODE'), 'Kavana-Style Crazy Fantasy • A/B Choices')}\n"
             "  ❖ <b>🆕 New Story</b>      : Nayi crazy Murim / Demonic Emperor kahani\n"
-            "  ❖ <b>▶ Continue Story</b> : Wapas aakar saved chapter yahin se continue karein\n"
-            "  ❖ <b>📚 Old Stories</b>     : Purani saved stories dekhein aur load karein\n"
-            "  ❖ <b>Choice A / B</b>   : Story ko agle crazy twist par le jaane ke liye dabayein"
+            "  ❖ <b>▶ Continue Story</b> : Saved chapter yahin se continue karein\n"
+            "  ❖ <b>📚 Old Stories</b>     : Purani saved stories load karein\n"
+            "  ❖ <b>Choice A / B</b>   : Agla twist chunne ke liye dabayein"
         )
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1966,108 +1235,16 @@ async def handle_text(
             )
             return
 
-    # Active game turn
-    if chat_id in ACTIVE_GAMES:
-        g_out = handle_active_game_input(chat_id, text)
-        if g_out:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=g_out,
-                parse_mode=ParseMode.HTML,
-                reply_markup=games_arcade_keyboard(),
-            )
-            return
-
-    # Arcade menu
-    if text == cfg["btn_games"]:
-        push_state(chat_id, "games")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{frame_box(sc('AI & MULTI-GAME ARCADE'))}\n  ▸ Koi game chuniye:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=games_arcade_keyboard(),
-        )
-        return
-
-    game_btn_map = {
-        "🤖 AI Riddle": "ai_riddle",
-        "🧭 AI Quest": "ai_scenario",
-        "🎲 Tic-Tac-Toe": "ttt",
-        "🔢 Number Guess": "guess",
-        "✂ RPS": "rps",
-        "🖖 RPSLS": "rpsls",
-        "🧮 Speed Math": "math",
-        "🧠 Trivia": "trivia",
-        "🔤 Scramble": "scramble",
-        "🎲 Dice Duel": "dice",
-        "🪙 Coin Flip": "coin",
-        "🎰 Lucky Slots": "slots",
-        "💣 Bomb Defusal": "bomb",
-        "📈 Higher Lower": "highlow",
-    }
-    if text in game_btn_map:
-        push_state(chat_id, "games")
-        out = await asyncio.to_thread(
-            start_game_session, chat_id, game_btn_map[text]
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=out,
-            parse_mode=ParseMode.HTML,
-            reply_markup=games_arcade_keyboard(),
-        )
-        return
-
-    # Media hub
-    if text == cfg["btn_media"]:
-        push_state(chat_id, "media")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{frame_box(sc('MEDIA SHOWCASE'))}\n  ▸ Animation, GIF, Photo, ya Video chuniye:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=media_hub_keyboard(),
-        )
-        return
-
-    media_btn_map = {
-        "🎞 Animation": ("anim", "Companion Live Animation"),
-        "🖼 GIF Card": ("gif", "Companion GIF Card"),
-        "📷 Photo Card": ("photo", "Companion Photo Card"),
-        "🎥 Video Card": ("video", "Companion Video Card"),
-    }
-    if text in media_btn_map:
-        m_kind, m_cap = media_btn_map[text]
-        await send_media_showcase(context.bot, chat_id, m_kind, m_cap)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❖ Media Hub",
-            parse_mode=ParseMode.HTML,
-            reply_markup=media_hub_keyboard(),
-        )
-        return
-
-    # Sync 1st & 2nd bot
+    # Sync 1st, 2nd & 3rd bot
     if text == cfg["btn_sync"]:
         meta = await asyncio.to_thread(sync_bots_db)
-        snap_lines = []
-        for s in meta.get("latest_snapshots") or []:
-            snap_lines.append(
-                f"  • Chat <code>{esc_html(s.get('chat_id'))}</code>: "
-                f"Online <b>{s.get('online', 0)}</b> | Off <b>{s.get('offline', 0)}</b> | Stale <b>{s.get('stale', 0)}</b>"
-            )
-        b1s = meta.get("bot1_settings") or {}
-        third_exists = os.path.exists(THIRD_BOT_FILE)
+        third_ready = os.path.exists(THIRD_BOT_FILE)
         body = (
             f"{frame_box(sc('1ST, 2ND & 3RD BOT SYNC'))}\n"
             f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code>\n"
             f"  ❖ Last Sync    : <code>{esc_html(meta.get('last_sync_ist', 'N/A'))}</code>\n"
-            f"  ❖ 3rd Bot File : <b>{'Ready (third_bot.py)' if third_exists else 'Pending'}</b>\n"
-            f"  ❖ Snapshots    : <b>{meta.get('snapshots_count', 0)}</b> | "
-            f"Stories: <b>{meta.get('story_saves_count', 0)}</b> | Alerts: <b>{meta.get('alerts_count', 0)}</b>\n"
-            f"  ❖ 1st Bot DB   : Theme=<code>{esc_html(b1s.get('active_theme', cfg['bot1_theme']))}</code> | "
-            f"Mode=<code>{esc_html(b1s.get('notif_style', cfg['bot1_notif_style']))}</code> | "
-            f"Interval=<code>{esc_html(b1s.get('refresh_sec', cfg['bot1_refresh_sec']))}s</code>\n"
-            + ("\n".join(snap_lines) if snap_lines else "  • Main bot snapshot pending.")
+            f"  ❖ 3rd Bot File : <b>{'Live Ready' if third_ready else 'Not Created'}</b>\n"
+            f"  ❖ Stories Saved: <b>{meta.get('story_saves_count', 0)}</b> | Snapshots: <b>{meta.get('snapshots_count', 0)}</b>"
         )
         await context.bot.send_message(
             chat_id=chat_id,
@@ -2077,64 +1254,23 @@ async def handle_text(
         )
         return
 
-    if text == cfg["btn_ai"]:
-        AWAITING_INPUT[chat_id] = "ask_ai"
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🤖 Apna sawaal type karein:",
-            reply_markup=main_menu_keyboard(user_id),
-        )
-        return
-
-    if text == "📊 Leaderboard":
-        conn = get_db_conn()
-        try:
-            rows = conn.execute(
-                """
-                SELECT user_id, COALESCE(SUM(score_delta), 0) AS pts, COUNT(*) AS plays
-                FROM game_scores
-                GROUP BY user_id
-                ORDER BY pts DESC
-                LIMIT 10
-                """
-            ).fetchall()
-        finally:
-            conn.close()
-        if not rows:
-            lb_txt = f"{frame_box(sc('LEADERBOARD'))}\n  • Abhi koi score record nahi hai."
-        else:
-            lines = [frame_box(sc("LEADERBOARD"))]
-            for i, r in enumerate(rows, start=1):
-                lines.append(
-                    f"  {i}. User <code>{r['user_id']}</code> — <b>{r['pts']} pts</b> ({r['plays']} plays)"
-                )
-            lb_txt = "\n".join(lines)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=lb_txt,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard_for_state(chat_id, user_id),
-        )
-        return
-
-    # Admin-only customization & 3rd bot live controls
-    if text == cfg["btn_admin_custom"] or MENU_STATE.get(chat_id) == "admin_custom":
+    # Admin Panel buttons
+    if text == cfg["btn_admin"] or MENU_STATE.get(chat_id) == "admin":
         if not is_admin(user_id):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="⛔ Yeh customization / 3rd-bot panel <b>sirf Admin</b> ke liye locked hai.",
-                parse_mode=ParseMode.HTML,
+                text="⛔ Admin Panel sirf Admin ke liye hai.",
                 reply_markup=main_menu_keyboard(user_id),
             )
             return
 
-        if text == cfg["btn_admin_custom"]:
-            push_state(chat_id, "admin_custom")
+        if text == cfg["btn_admin"]:
+            push_state(chat_id, "admin")
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{frame_box(sc('ADMIN & 3RD BOT CONTROL'), 'Live AI/Manual Edit + 1st/2nd Sync')}",
+                text=f"{frame_box(sc('ADMIN & 3RD BOT CONTROLLER'), 'AI Edit • Manual Code • Rollback • Notify')}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -2142,8 +1278,8 @@ async def handle_text(
             AWAITING_INPUT[chat_id] = "ai_edit_third"
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="🤖 Bataiye `third_bot.py` mein kya feature, command, ya change AI se karwana hai:",
-                reply_markup=admin_customize_keyboard(),
+                text="🤖 Bataiye `third_bot.py` mein kya change/feature chahiye (e.g. 'sab button hata do' ya 'notification command add karo'):",
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -2151,8 +1287,8 @@ async def handle_text(
             AWAITING_INPUT[chat_id] = "manual_code_third"
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="📥 `third_bot.py` ka poora Python code yahan paste karein ya `.py` file document bhejein:",
-                reply_markup=admin_customize_keyboard(),
+                text="📥 `third_bot.py` ka Python code paste karein ya `.py` file bhejein:",
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -2162,7 +1298,7 @@ async def handle_text(
                 chat_id=chat_id,
                 text=preview,
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -2172,86 +1308,16 @@ async def handle_text(
                 chat_id=chat_id,
                 text=f"{'✅' if ok else '❌'} {rb_msg}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
-        if text == "✏ 2nd Bot Title":
-            AWAITING_INPUT[chat_id] = "set_title"
+        if text == "🔔 AI Notify":
+            AWAITING_INPUT[chat_id] = "ai_notify"
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="2nd Bot ka naya title bhejein:",
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "📝 Welcome Banner":
-            AWAITING_INPUT[chat_id] = "set_banner"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Naya welcome banner text bhejein:",
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "🎨 1st Bot Theme":
-            AWAITING_INPUT[chat_id] = "set_theme"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="1st Bot (`main.py`) theme likhein: <code>obsidian</code>, <code>minimal</code>, <code>cyber</code>, ya <code>royal</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "🔔 1st Bot Notif":
-            AWAITING_INPUT[chat_id] = "set_notif"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="1st Bot mode likhein: <code>detailed</code>, <code>compact</code>, <code>alerts_only</code>, ya <code>digest</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "⏱ 1st Bot Sync Sec":
-            AWAITING_INPUT[chat_id] = "set_sync_sec"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="1st Bot poll interval (15–3600 seconds) bhejein:",
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "🛠 1st Bot Maint":
-            cur_m = "0" if cfg.get("bot1_maint_mode") == "1" else "1"
-            push_customization_to_bot1_db("bot1_maint_mode", cur_m)
-            AWAITING_INPUT[chat_id] = "set_maint_msg"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 1st Bot Maintenance: <b>{'ON' if cur_m == '1' else 'OFF'}</b>\nNaya maintenance message bhejein (ya <b>⬅ Back</b> dabayein):",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "⚡ 1st Bot ON/OFF":
-            cur_en = "0" if cfg.get("bot1_bot_enabled") == "1" else "1"
-            push_customization_to_bot1_db("bot1_bot_enabled", cur_en)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚡ 1st Bot Global State: <b>{'ENABLED' if cur_en == '1' else 'DISABLED'}</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
-            )
-            return
-
-        if text == "🔢 Game Rounds":
-            AWAITING_INPUT[chat_id] = "set_rounds"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Game rounds limit (1–15) bhejein:",
-                reply_markup=admin_customize_keyboard(),
+                text="🔔 Notification message likhein (optional chat_id bhi likh sakte hain):",
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -2261,31 +1327,70 @@ async def handle_text(
                 chat_id=chat_id,
                 text=f"✅ Synced <code>v{meta.get('sync_version')}</code> at <code>{esc_html(meta.get('last_sync_ist'))}</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
-        if text == "📋 View Custom Config":
-            cur_cfg = get_custom_config()
-            lines = [frame_box(sc("ACTIVE CUSTOM CONFIG"))]
-            for k, v in cur_cfg.items():
-                lines.append(f"  ❖ <code>{esc_html(k)}</code> = <b>{esc_html(v)}</b>")
+        if text == "⚡ 1st Bot ON/OFF":
+            cur_en = "0" if cfg.get("bot1_bot_enabled") == "1" else "1"
+            push_customization_to_db("bot1_bot_enabled", cur_en)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="\n".join(lines),
+                text=f"⚡ 1st Bot State: <b>{'ENABLED' if cur_en == '1' else 'DISABLED'}</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
-        if text == "♻ Reset Defaults":
-            reset_all_customizations()
-            await asyncio.to_thread(sync_bots_db)
+        if text == "🛠 1st Bot Maint":
+            cur_m = "0" if cfg.get("bot1_maint_mode") == "1" else "1"
+            push_customization_to_db("bot1_maint_mode", cur_m)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="♻ Sabhi customizations default par reset ho gaye.",
+                text=f"🛠 1st Bot Maintenance: <b>{'ON' if cur_m == '1' else 'OFF'}</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=admin_customize_keyboard(),
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+    # Natural-language AI Router for Admin (e.g. "3rd bot se sab button hata do", "notification bhejo", etc.)
+    if is_admin(user_id):
+        if any(
+            k in low
+            for k in (
+                "button",
+                "3rd bot",
+                "third bot",
+                "code",
+                "command",
+                "hata",
+                "remove",
+                "add",
+                "badal",
+                "edit",
+            )
+        ):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🤖 AI aapki instruction ke hisaab se `third_bot.py` ko live edit kar raha hai...",
+                reply_markup=admin_panel_keyboard(),
+            )
+            ok, res_msg = await asyncio.to_thread(ai_edit_third_bot_code, text)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{'✅' if ok else '❌'} {esc_html(res_msg)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        if any(k in low for k in ("notify", "notification", "alert bhejo", "msg bhejo")):
+            ok, n_msg = await ai_send_direct_notification(context.bot, text)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{'✅' if ok else '❌'} {n_msg}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_panel_keyboard(),
             )
             return
 
@@ -2312,8 +1417,8 @@ async def post_init(application) -> None:
     await asyncio.to_thread(sync_bots_db)
     await application.bot.set_my_commands(
         [
-            BotCommand("start", "Start Companion Suite"),
-            BotCommand("menu", "Open Main Menu"),
+            BotCommand("start", "Start Companion"),
+            BotCommand("menu", "Open Menu"),
         ]
     )
     application.create_task(background_sync_worker(application))
@@ -2343,7 +1448,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Baagi Jaat Ultra Companion Bot starting...")
+    logger.info("Focused Companion Bot starting...")
     app.run_polling(drop_pending_updates=True)
 
 
