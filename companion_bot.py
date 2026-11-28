@@ -45,7 +45,6 @@ DEFAULT_CLIENT_NAME: str = (
 )
 DB_PATH: str = os.getenv("BOT_DB_PATH", "baagijaat_telemetry.db").strip()
 
-# Optional Media Assets (URL or local file path; safe fallback if empty)
 MEDIA_ANIM_URL: str = os.getenv("COMPANION_ANIM_URL", "").strip()
 MEDIA_GIF_URL: str = os.getenv("COMPANION_GIF_URL", "").strip()
 MEDIA_PHOTO_URL: str = os.getenv("COMPANION_PHOTO_URL", "").strip()
@@ -65,6 +64,7 @@ AWAITING_INPUT: dict[int, str] = {}
 MENU_STACK: dict[int, list[str]] = {}
 MENU_STATE: dict[int, str] = {}
 ACTIVE_GAMES: dict[int, dict[str, Any]] = {}
+ACTIVE_STORY_ID: dict[int, int] = {}
 LAST_SYNC_META: dict[str, Any] = {
     "last_sync_ist": "Not synced yet",
     "snapshots_count": 0,
@@ -75,8 +75,9 @@ LAST_SYNC_META: dict[str, Any] = {
 
 DEFAULT_CUSTOM_CONFIG: dict[str, str] = {
     "bot_title": f"{DEFAULT_CLIENT_NAME} ULTRA COMPANION",
-    "welcome_banner": "2nd Bot → 1st Bot Sync • Admin Custom Engine • AI Arcade",
+    "welcome_banner": "2nd Bot → 1st Bot Sync • Murim Story • AI Arcade",
     "btn_games": "🎮 AI & Games Arcade",
+    "btn_story": "📜 Murim Story Mode",
     "btn_sync": "🔄 Sync 1st & 2nd Bot",
     "btn_ai": "🤖 AI Advisor",
     "btn_media": "🎬 Media Showcase",
@@ -125,7 +126,7 @@ def frame_box(title: str, subtitle: str = "") -> str:
 
 
 # ==============================================================================
-# SHARED SQLITE DATABASE SYNC (2ND BOT <-> 1ST BOT main.py)
+# SHARED SQLITE DATABASE SYNC + STORY PERSISTENCE
 # ==============================================================================
 def get_db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=20.0)
@@ -176,6 +177,25 @@ def init_companion_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS story_saves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                arc_type TEXT NOT NULL,
+                chapter INTEGER NOT NULL,
+                realm TEXT NOT NULL,
+                demonic_qi INTEGER NOT NULL,
+                hp INTEGER NOT NULL,
+                current_scene TEXT NOT NULL,
+                opt_a TEXT NOT NULL,
+                opt_b TEXT NOT NULL,
+                history_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         for k, v in DEFAULT_CUSTOM_CONFIG.items():
             cur.execute(
                 """
@@ -206,7 +226,6 @@ def get_custom_config() -> dict[str, str]:
 
 
 def push_customization_to_bot1_db(key: str, val: str) -> None:
-    """Writes admin customization into both companion config and 1st bot's bot_settings."""
     clean_val = str(val).strip()
     stamp = now_ist_str()
     conn = get_db_conn()
@@ -296,10 +315,10 @@ def record_game_score(
 
 
 def sync_bots_db() -> dict[str, Any]:
-    """Reads main.py tables and syncs settings/heartbeats between 1st and 2nd bot."""
     snap_cnt = 0
     watch_cnt = 0
     alert_cnt = 0
+    story_cnt = 0
     latest_snapshots: list[dict[str, Any]] = []
     bot1_settings: dict[str, str] = {}
 
@@ -343,6 +362,11 @@ def sync_bots_db() -> dict[str, Any]:
                 cur.execute("SELECT COUNT(*) FROM sent_alerts").fetchone()[0]
             )
 
+        if "story_saves" in tables:
+            story_cnt = int(
+                cur.execute("SELECT COUNT(*) FROM story_saves").fetchone()[0]
+            )
+
         if "bot_settings" in tables:
             for b_row in cur.execute("SELECT k, v FROM bot_settings").fetchall():
                 bot1_settings[str(b_row["k"])] = str(b_row["v"])
@@ -354,6 +378,7 @@ def sync_bots_db() -> dict[str, Any]:
             "snapshots_count": snap_cnt,
             "watchlist_count": watch_cnt,
             "alerts_count": alert_cnt,
+            "story_saves_count": story_cnt,
             "sync_version": new_ver,
             "latest_snapshots": latest_snapshots,
             "bot1_settings": bot1_settings,
@@ -405,11 +430,12 @@ def get_groq_models() -> list[str]:
                 for m in (data.get("data") or [])
                 if isinstance(m, dict) and m.get("id")
             ]
-            # Prioritize chat/instruct models first
             preferred = [
                 mid
                 for mid in ids
-                if any(k in mid.lower() for k in ("llama", "gemma", "qwen", "mixtral"))
+                if any(
+                    k in mid.lower() for k in ("llama", "gemma", "qwen", "mixtral")
+                )
                 and "whisper" not in mid.lower()
                 and "guard" not in mid.lower()
             ]
@@ -428,8 +454,8 @@ def get_groq_models() -> list[str]:
 def call_groq_resilient(
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 350,
-    temperature: float = 0.3,
+    max_tokens: int = 380,
+    temperature: float = 0.45,
 ) -> tuple[bool, str]:
     if not GROQ_API_KEY:
         return False, "GROQ_API_KEY missing hai."
@@ -465,7 +491,7 @@ def call_groq_resilient(
                     or ""
                 ).strip()
                 if content:
-                    return True, content[:1500]
+                    return True, content[:1600]
                 last_reason = f"{model_id} ne khali response diya."
             else:
                 last_reason = f"{model_id} HTTP {r.status_code}"
@@ -473,6 +499,344 @@ def call_groq_resilient(
             last_reason = f"{model_id}: {exc}"
 
     return False, last_reason
+
+
+# ==============================================================================
+# KAVANA-STYLE CRAZY FANTASY / MURIM / MURIM LOGIN / DEMONIC EMPEROR STORY ENGINE
+# ==============================================================================
+STORY_STARTERS: list[dict[str, str]] = [
+    {
+        "title": "Demonic Emperor: Blood Heaven Awakening",
+        "arc": "Demonic Emperor • Crazy Fantasy",
+        "realm": "Demonic Qi Condensation Lv.1",
+        "scene": (
+            "Aasman mein kaali bijli garajti hai aur tumhara purana sharir 'Demonic Emperor' ki aatma ke saath reborn hota hai! "
+            "Samne Blood Sect ke elders aur ek ajeeb glowing 'Murim Login Gate' khul chuka hai."
+        ),
+        "opt_a": "A: Murim Login Gate ke andar kadam rakho aur Demonic System unlock karo",
+        "opt_b": "B: Blood Sect elders ke saamne Demonic Aura chhod kar unhe ghutno par lao",
+    },
+    {
+        "title": "Murim Login: Crazy Sword God Ascension",
+        "arc": "Martial Art Cultivation • Murim Login",
+        "realm": "Mortal Body → Sword Qi Initiate",
+        "scene": (
+            "Subah aankh khulte hi tumhare samne ek crazy neon prompt chamakta hai: [MURIM LOGIN SUCCESSFUL — 999x Cultivation Multiplier]! "
+            "Bahar Heavenly Sword Pavilion ke disciples ek ancient martial tablet par lad rahe hain."
+        ),
+        "opt_a": "A: Sword Tablet absorb karke Crazy Demonic Sword Art seekho",
+        "opt_b": "B: Pavilion Elder ke saath challenge lekar Murim ranking mein top par aao",
+    },
+    {
+        "title": "Crazy Murim Abyss: Sovereign of Ten Thousand Demons",
+        "arc": "Crazy Fantasy • Murim & Demonic Realm",
+        "realm": "Abyssal Foundation Lv.1",
+        "scene": (
+            "Ek crazy dimensional rift se tum Murim ke sabse khatarnak 'Abyssal Demon Valley' mein girte ho. "
+            "Ek talking Spirit Fox kehti hai ki yahan har pill ya sword crazy side-effects deta hai par unlimited power bhi!"
+        ),
+        "opt_a": "A: Spirit Fox ke saath Crazy Forbidden Pill nigal kar Realm break karo",
+        "opt_b": "B: Demon Lord ke throne hall mein ghus kar direct Demonic Crown chhino",
+    },
+]
+
+FALLBACK_BRANCHES: list[dict[str, Any]] = [
+    {
+        "scene": (
+            "Tumhara decision poore Murim world mein goonj uthta hai! Aasman se Demonic Dragon ki dahad sunai deti hai "
+            "aur tumhare meridians mein crazy golden-black energy daudne lagti hai. Ek masked Martial Saint tumhe parakh raha hai."
+        ),
+        "opt_a": "A: Masked Saint ke attack ko Demonic Palm se tod kar aage badho",
+        "opt_b": "B: Illusion step se peeche jaakar Hidden Ancient Vault kholo",
+        "qi_delta": 35,
+        "hp_delta": -5,
+    },
+    {
+        "scene": (
+            "Murim Login System ek naya crazy quest deta hai: [Defeat the Immortal Sect Heir or Claim the Demon Core]. "
+            "Charon taraf qi storms ban rahe hain aur ancient sects ke elders shock mein hain."
+        ),
+        "opt_a": "A: Demon Core ko absorb karke crazy Demonic Emperor aura unleash karo",
+        "opt_b": "B: Ancient Formation ko reverse karke poore sect ka qi apni talwar mein bharo",
+        "qi_delta": 50,
+        "hp_delta": 10,
+    },
+    {
+        "scene": (
+            "Crazy fantasy twist aata hai — ek golden phoenix aur ek abyssal demon ek hi talwar ke andar merge ho jaate hain! "
+            "Tum ab Demonic Martial cultivation ke ek naye crazy level par khade ho."
+        ),
+        "opt_a": "A: Twin-Element Strike se Mountain Peak ko do hisson mein kaato",
+        "opt_b": "B: Demonic Domain khol kar sabhi rivals ko apne control mein lo",
+        "qi_delta": 45,
+        "hp_delta": 5,
+    },
+]
+
+
+def _format_story_card(row: sqlite3.Row, extra_note: str = "") -> str:
+    hist: list[dict[str, str]] = []
+    try:
+        hist = json.loads(row["history_json"] or "[]")
+    except Exception:
+        hist = []
+    last_step = hist[-1]["choice"] if hist else "Start"
+
+    lines = [
+        frame_box(
+            sc(str(row["title"])),
+            f"Ch.{row['chapter']} • {row['arc_type']}",
+        ),
+        f"  ❖ Save ID : <code>#{row['id']}</code> | Last Choice: <b>{esc_html(last_step)}</b>",
+        f"  ❖ Realm   : <b>{esc_html(row['realm'])}</b>",
+        f"  ❖ Qi / HP : <b>{row['demonic_qi']} Qi</b> | <b>{row['hp']} HP</b>",
+        "────────────────────────────",
+    ]
+    if extra_note:
+        lines.append(f"  ▸ <i>{esc_html(extra_note)}</i>\n")
+    lines.append(f"{esc_html(row['current_scene'])}\n")
+    lines.append(f"<b>{esc_html(row['opt_a'])}</b>")
+    lines.append(f"<b>{esc_html(row['opt_b'])}</b>")
+    lines.append("\n▸ Niche <b>Choice A</b> ya <b>Choice B</b> dabayein:")
+    return "\n".join(lines)
+
+
+def start_new_story(user_id: int) -> str:
+    starter = random.choice(STORY_STARTERS)
+    stamp = now_ist_str()
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO story_saves(
+                user_id, title, arc_type, chapter, realm, demonic_qi, hp,
+                current_scene, opt_a, opt_b, history_json, updated_at
+            ) VALUES(?, ?, ?, 1, ?, 100, 100, ?, ?, ?, '[]', ?)
+            """,
+            (
+                user_id,
+                starter["title"],
+                starter["arc"],
+                starter["realm"],
+                starter["scene"],
+                starter["opt_a"],
+                starter["opt_b"],
+                stamp,
+            ),
+        )
+        conn.commit()
+        new_id = int(cur.lastrowid)
+        row = cur.execute(
+            "SELECT * FROM story_saves WHERE id = ?", (new_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    ACTIVE_STORY_ID[user_id] = new_id
+    return _format_story_card(row, "Nayi Crazy Murim / Demonic Emperor story shuru hui!")
+
+
+def continue_latest_story(user_id: int) -> str:
+    conn = get_db_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM story_saves WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return start_new_story(user_id)
+
+    ACTIVE_STORY_ID[user_id] = int(row["id"])
+    return _format_story_card(
+        row, f"Saved story resume hui (Updated: {row['updated_at']})"
+    )
+
+
+def list_old_stories_text(user_id: int) -> str:
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, chapter, realm, demonic_qi, updated_at
+            FROM story_saves
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 8
+            """,
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return (
+            f"{frame_box(sc('OLD STORIES'))}\n"
+            "  • Abhi koi purani story save nahi hai. <b>🆕 New Story</b> dabayein!"
+        )
+
+    lines = [frame_box(sc("SAVED / OLD STORIES"), "Load karne ke liye Save ID bhejein")]
+    for r in rows:
+        lines.append(
+            f"  ❖ <code>#{r['id']}</code> — <b>{esc_html(r['title'])}</b> "
+            f"(Ch.{r['chapter']} | {esc_html(r['realm'])} | {r['demonic_qi']} Qi)"
+        )
+    lines.append("\n▸ Kisi purani story ko kholne ke liye uska number (e.g. <code>1</code>) type karein:")
+    AWAITING_INPUT[user_id] = "load_story_id"
+    return "\n".join(lines)
+
+
+def load_story_by_id(user_id: int, story_id_str: str) -> str:
+    try:
+        sid = int(story_id_str.strip().lstrip("#"))
+    except ValueError:
+        return "Kripya valid Story ID number bhejein (jaise <code>1</code>)."
+
+    conn = get_db_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM story_saves WHERE id = ? AND user_id = ?",
+            (sid, user_id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return f"Story <code>#{sid}</code> nahi mili."
+
+    ACTIVE_STORY_ID[user_id] = int(row["id"])
+    return _format_story_card(row, f"Old Story #{sid} load ho gayi!")
+
+
+def advance_story_choice(user_id: int, choice_letter: str) -> str:
+    ch = choice_letter.strip().upper()
+    if ch not in ("A", "B"):
+        return "Kripya <b>Choice A</b> ya <b>Choice B</b> chuniye."
+
+    conn = get_db_conn()
+    try:
+        sid = ACTIVE_STORY_ID.get(user_id)
+        if sid:
+            row = conn.execute(
+                "SELECT * FROM story_saves WHERE id = ? AND user_id = ?",
+                (sid, user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM story_saves WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+
+        if not row:
+            return start_new_story(user_id)
+
+        cur_chap = int(row["chapter"])
+        next_chap = cur_chap + 1
+        chosen_text = str(row["opt_a"] if ch == "A" else row["opt_b"])
+
+        hist: list[dict[str, str]] = []
+        try:
+            hist = json.loads(row["history_json"] or "[]")
+        except Exception:
+            hist = []
+        hist.append({"chapter": str(cur_chap), "choice": ch, "picked": chosen_text})
+
+        # Try Groq AI for crazy Murim / Demonic Emperor next chapter
+        ai_prompt = (
+            f"Title: {row['title']}\nArc: {row['arc_type']}\nChapter: {next_chap}\n"
+            f"Current Realm: {row['realm']} | Qi: {row['demonic_qi']} | HP: {row['hp']}\n"
+            f"Previous Scene: {row['current_scene']}\nUser Chose: {chosen_text}\n"
+            "Return STRICT JSON only with keys: scene, opt_a, opt_b, realm, qi_delta, hp_delta. "
+            "Make it crazy fantasy, martial art cultivation, Murim login, demonic emperor style in Hinglish. "
+            "opt_a must start with 'A: ' and opt_b must start with 'B: '."
+        )
+        ok, ai_raw = call_groq_resilient(
+            "Tum Kavana-style interactive crazy fantasy & Murim cultivation story writer ho. Sirf valid JSON do.",
+            ai_prompt,
+            max_tokens=360,
+            temperature=0.65,
+        )
+
+        next_scene = ""
+        next_a = ""
+        next_b = ""
+        next_realm = str(row["realm"])
+        qi_delta = 25 if ch == "A" else 30
+        hp_delta = 0
+
+        if ok:
+            try:
+                start_i = ai_raw.find("{")
+                end_i = ai_raw.rfind("}")
+                if start_i != -1 and end_i != -1 and end_i > start_i:
+                    obj = json.loads(ai_raw[start_i : end_i + 1])
+                    if isinstance(obj, dict):
+                        next_scene = str(obj.get("scene") or "").strip()
+                        next_a = str(obj.get("opt_a") or "").strip()
+                        next_b = str(obj.get("opt_b") or "").strip()
+                        if obj.get("realm"):
+                            next_realm = str(obj.get("realm")).strip()[:70]
+                        if isinstance(obj.get("qi_delta"), (int, float)):
+                            qi_delta = int(obj["qi_delta"])
+                        if isinstance(obj.get("hp_delta"), (int, float)):
+                            hp_delta = int(obj["hp_delta"])
+            except Exception:
+                pass
+
+        if not next_scene or not next_a or not next_b:
+            fb = FALLBACK_BRANCHES[(next_chap - 2) % len(FALLBACK_BRANCHES)]
+            next_scene = fb["scene"]
+            next_a = fb["opt_a"]
+            next_b = fb["opt_b"]
+            qi_delta = int(fb["qi_delta"])
+            hp_delta = int(fb["hp_delta"])
+            if next_chap >= 3:
+                next_realm = "Demonic Core / Murim Sovereign"
+
+        if not next_a.upper().startswith("A:"):
+            next_a = f"A: {next_a}"
+        if not next_b.upper().startswith("B:"):
+            next_b = f"B: {next_b}"
+
+        new_qi = max(0, int(row["demonic_qi"]) + qi_delta)
+        new_hp = max(10, min(150, int(row["hp"]) + hp_delta))
+        stamp = now_ist_str()
+
+        conn.execute(
+            """
+            UPDATE story_saves
+            SET chapter = ?, realm = ?, demonic_qi = ?, hp = ?,
+                current_scene = ?, opt_a = ?, opt_b = ?,
+                history_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                next_chap,
+                next_realm,
+                new_qi,
+                new_hp,
+                next_scene[:1100],
+                next_a[:180],
+                next_b[:180],
+                json.dumps(hist[-15:]),
+                stamp,
+                int(row["id"]),
+            ),
+        )
+        conn.commit()
+        updated_row = conn.execute(
+            "SELECT * FROM story_saves WHERE id = ?", (int(row["id"]),)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    ACTIVE_STORY_ID[user_id] = int(updated_row["id"])
+    return _format_story_card(
+        updated_row, f"Choice {ch} applied (Qi {qi_delta:+d} | HP {hp_delta:+d})"
+    )
 
 
 # ==============================================================================
@@ -744,7 +1108,9 @@ def handle_active_game_input(chat_id: int, text: str) -> str | None:
             max_tokens=180,
             temperature=0.3,
         )
-        won = ok and any(w in judge.lower() for w in ("sahi", "correct", "badhai", "shabaash"))
+        won = ok and any(
+            w in judge.lower() for w in ("sahi", "correct", "badhai", "shabaash")
+        )
         record_game_score(chat_id, "AI Riddle", "Evaluated", 15 if won else 5)
         return f"🤖 <b>AI Riddle Result</b>\n{esc_html(judge if ok else 'Jawab receive hua!')}"
 
@@ -986,15 +1352,14 @@ async def send_media_showcase(bot, chat_id: int, kind: str, caption: str) -> Non
         logger.warning("Media send (%s) fallback: %s", kind, exc)
 
     tag_map = {
-        "anim": "ANIMATION READY (Set COMPANION_ANIM_URL for custom media)",
-        "gif": "GIF READY (Set COMPANION_GIF_URL for custom GIF)",
-        "photo": "PHOTO CARD READY (Set COMPANION_PHOTO_URL for custom photo)",
-        "video": "VIDEO CARD READY (Set COMPANION_VIDEO_URL for custom video)",
+        "anim": "ANIMATION READY (Set COMPANION_ANIM_URL)",
+        "gif": "GIF READY (Set COMPANION_GIF_URL)",
+        "photo": "PHOTO READY (Set COMPANION_PHOTO_URL)",
+        "video": "VIDEO READY (Set COMPANION_VIDEO_URL)",
     }
     card = (
         f"{frame_box(sc(tag_map.get(kind, 'MEDIA')), caption)}\n"
-        f"▸ Status : <b>Active UI Media Engine</b>\n"
-        f"▸ Tip    : Env variable mein URL ya file path set karne par direct media bheja jayega."
+        f"▸ Status : <b>Active UI Media Engine</b>"
     )
     await bot.send_message(
         chat_id=chat_id,
@@ -1004,25 +1369,41 @@ async def send_media_showcase(bot, chat_id: int, kind: str, caption: str) -> Non
 
 
 # ==============================================================================
-# KEYBOARDS (WITH BACK & MAIN MENU EVERYWHERE + ADMIN-ONLY CUSTOMIZATION)
+# KEYBOARDS (WITH BACK & MAIN MENU EVERYWHERE + STORY + ADMIN CUSTOMIZE)
 # ==============================================================================
 def main_menu_keyboard(user_id: int | None) -> ReplyKeyboardMarkup:
     cfg = get_custom_config()
     rows: list[list[KeyboardButton]] = [
         [
+            KeyboardButton(cfg["btn_story"]),
             KeyboardButton(cfg["btn_games"]),
-            KeyboardButton(cfg["btn_sync"]),
         ],
         [
+            KeyboardButton(cfg["btn_sync"]),
             KeyboardButton(cfg["btn_ai"]),
-            KeyboardButton(cfg["btn_media"]),
         ],
-        [KeyboardButton("📊 Leaderboard")],
+        [
+            KeyboardButton(cfg["btn_media"]),
+            KeyboardButton("📊 Leaderboard"),
+        ],
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton(cfg["btn_admin_custom"])])
     rows.append([KeyboardButton("🏠 Main Menu")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def story_hub_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🆕 New Story"), KeyboardButton("▶ Continue Story")],
+            [KeyboardButton("📚 Old Stories")],
+            [KeyboardButton("Choice A"), KeyboardButton("Choice B")],
+            [KeyboardButton("⬅ Back"), KeyboardButton("🏠 Main Menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def games_arcade_keyboard() -> ReplyKeyboardMarkup:
@@ -1074,6 +1455,8 @@ def keyboard_for_state(
     chat_id: int, user_id: int | None
 ) -> ReplyKeyboardMarkup:
     state = MENU_STATE.get(chat_id, "main")
+    if state == "story":
+        return story_hub_keyboard()
     if state == "games":
         return games_arcade_keyboard()
     if state == "media":
@@ -1120,13 +1503,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     role_badge = (
         "ADMIN (1st + 2nd Bot Customizer)"
         if is_admin(user_id)
-        else "OPERATOR (Games & Sync View)"
+        else "OPERATOR (Story, Games & Sync)"
     )
 
     msg = (
         f"{frame_box(sc(cfg['bot_title']), cfg['welcome_banner'])}\n"
         f"  ❖ Role         : <b>{esc_html(role_badge)}</b>\n"
-        f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code> | Snapshots: <b>{meta.get('snapshots_count', 0)}</b>\n"
+        f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code> | Stories Saved: <b>{meta.get('story_saves_count', 0)}</b>\n"
         f"  ❖ 1st Bot Mode : Theme <code>{esc_html(cfg['bot1_theme'])}</code> | Notif <code>{esc_html(cfg['bot1_notif_style'])}</code>\n"
         f"  ❖ Last Sync    : <code>{esc_html(meta.get('last_sync_ist', 'N/A'))}</code>"
     )
@@ -1158,8 +1541,10 @@ async def handle_text(
     if not update.message or not update.message.text:
         return
     chat_id = update.effective_chat.id
-    user_id = update.effective_user.id if update.effective_user else None
+    user = update.effective_user
+    user_id = user.id if user else chat_id
     text = update.message.text.strip()
+    low = text.lower()
     cfg = get_custom_config()
 
     if text in ("🏠 Main Menu", "/menu"):
@@ -1184,6 +1569,16 @@ async def handle_text(
     if pending:
         AWAITING_INPUT.pop(chat_id, None)
 
+        if pending == "load_story_id":
+            out = await asyncio.to_thread(load_story_by_id, user_id, text)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=out,
+                parse_mode=ParseMode.HTML,
+                reply_markup=story_hub_keyboard(),
+            )
+            return
+
         if pending == "ask_ai":
             meta = await asyncio.to_thread(sync_bots_db)
             ok, ans = await asyncio.to_thread(
@@ -1202,7 +1597,6 @@ async def handle_text(
             )
             return
 
-        # All other pending actions are strictly Admin-only
         if not is_admin(user_id):
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -1233,9 +1627,8 @@ async def handle_text(
             return
 
         if pending == "set_theme":
-            t_low = text.lower()
             valid_t = next(
-                (t for t in ("obsidian", "minimal", "cyber", "royal") if t in t_low),
+                (t for t in ("obsidian", "minimal", "cyber", "royal") if t in low),
                 None,
             )
             if not valid_t:
@@ -1257,14 +1650,13 @@ async def handle_text(
             return
 
         if pending == "set_notif":
-            n_low = text.lower()
-            if "alert" in n_low:
+            if "alert" in low:
                 n_val = "alerts_only"
-            elif "compact" in n_low:
+            elif "compact" in low:
                 n_val = "compact"
-            elif "digest" in n_low:
+            elif "digest" in low:
                 n_val = "digest"
-            elif "detail" in n_low:
+            elif "detail" in low:
                 n_val = "detailed"
             else:
                 await context.bot.send_message(
@@ -1333,6 +1725,75 @@ async def handle_text(
                 chat_id=chat_id,
                 text="1 se 15 ke beech number bhejein.",
                 reply_markup=admin_customize_keyboard(),
+            )
+            return
+
+    # Story Hub & A/B Choice actions
+    if text == cfg["btn_story"]:
+        push_state(chat_id, "story")
+        hub_msg = (
+            f"{frame_box(sc('MURIM & DEMONIC STORY MODE'), 'Kavana-Style Crazy Fantasy • A/B Choices')}\n"
+            "  ❖ <b>🆕 New Story</b>      : Nayi crazy Murim / Demonic Emperor kahani\n"
+            "  ❖ <b>▶ Continue Story</b> : Wapas aakar saved chapter yahin se continue karein\n"
+            "  ❖ <b>📚 Old Stories</b>     : Purani saved stories dekhein aur load karein\n"
+            "  ❖ <b>Choice A / B</b>   : Story ko agle crazy twist par le jaane ke liye dabayein"
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=hub_msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=story_hub_keyboard(),
+        )
+        return
+
+    if MENU_STATE.get(chat_id) == "story":
+        if text == "🆕 New Story":
+            out = await asyncio.to_thread(start_new_story, user_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=out,
+                parse_mode=ParseMode.HTML,
+                reply_markup=story_hub_keyboard(),
+            )
+            return
+
+        if text == "▶ Continue Story":
+            out = await asyncio.to_thread(continue_latest_story, user_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=out,
+                parse_mode=ParseMode.HTML,
+                reply_markup=story_hub_keyboard(),
+            )
+            return
+
+        if text == "📚 Old Stories":
+            out = await asyncio.to_thread(list_old_stories_text, user_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=out,
+                parse_mode=ParseMode.HTML,
+                reply_markup=story_hub_keyboard(),
+            )
+            return
+
+        if text in ("Choice A", "A", "a"):
+            out = await asyncio.to_thread(advance_story_choice, user_id, "A")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=out,
+                parse_mode=ParseMode.HTML,
+                reply_markup=story_hub_keyboard(),
+            )
+            return
+
+        if text in ("Choice B", "B", "b"):
+            out = await asyncio.to_thread(advance_story_choice, user_id, "B")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=out,
+                parse_mode=ParseMode.HTML,
+                reply_markup=story_hub_keyboard(),
             )
             return
 
@@ -1431,7 +1892,7 @@ async def handle_text(
             f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code>\n"
             f"  ❖ Last Sync    : <code>{esc_html(meta.get('last_sync_ist', 'N/A'))}</code>\n"
             f"  ❖ Snapshots    : <b>{meta.get('snapshots_count', 0)}</b> | "
-            f"Watchlist: <b>{meta.get('watchlist_count', 0)}</b> | Alerts: <b>{meta.get('alerts_count', 0)}</b>\n"
+            f"Stories: <b>{meta.get('story_saves_count', 0)}</b> | Alerts: <b>{meta.get('alerts_count', 0)}</b>\n"
             f"  ❖ 1st Bot DB   : Theme=<code>{esc_html(b1s.get('active_theme', cfg['bot1_theme']))}</code> | "
             f"Mode=<code>{esc_html(b1s.get('notif_style', cfg['bot1_notif_style']))}</code> | "
             f"Interval=<code>{esc_html(b1s.get('refresh_sec', cfg['bot1_refresh_sec']))}s</code>\n"
