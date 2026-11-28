@@ -1,8 +1,10 @@
+import ast
 import asyncio
 import json
 import logging
 import os
 import random
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,10 @@ DEFAULT_CLIENT_NAME: str = (
 )
 DB_PATH: str = os.getenv("BOT_DB_PATH", "baagijaat_telemetry.db").strip()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+THIRD_BOT_FILE = os.path.join(BASE_DIR, "third_bot.py")
+BACKUP_DIR = os.path.join(BASE_DIR, "bot_backups")
+
 MEDIA_ANIM_URL: str = os.getenv("COMPANION_ANIM_URL", "").strip()
 MEDIA_GIF_URL: str = os.getenv("COMPANION_GIF_URL", "").strip()
 MEDIA_PHOTO_URL: str = os.getenv("COMPANION_PHOTO_URL", "").strip()
@@ -70,12 +76,13 @@ LAST_SYNC_META: dict[str, Any] = {
     "snapshots_count": 0,
     "watchlist_count": 0,
     "alerts_count": 0,
+    "story_saves_count": 0,
     "sync_version": 1,
 }
 
 DEFAULT_CUSTOM_CONFIG: dict[str, str] = {
     "bot_title": f"{DEFAULT_CLIENT_NAME} ULTRA COMPANION",
-    "welcome_banner": "2nd Bot → 1st Bot Sync • Murim Story • AI Arcade",
+    "welcome_banner": "2nd Bot → 1st Bot Sync • 3rd Bot Live Editor • Murim Story",
     "btn_games": "🎮 AI & Games Arcade",
     "btn_story": "📜 Murim Story Mode",
     "btn_sync": "🔄 Sync 1st & 2nd Bot",
@@ -491,7 +498,7 @@ def call_groq_resilient(
                     or ""
                 ).strip()
                 if content:
-                    return True, content[:1600]
+                    return True, content[:1800]
                 last_reason = f"{model_id} ne khali response diya."
             else:
                 last_reason = f"{model_id} HTTP {r.status_code}"
@@ -499,6 +506,101 @@ def call_groq_resilient(
             last_reason = f"{model_id}: {exc}"
 
     return False, last_reason
+
+
+# ==============================================================================
+# 3RD BOT LIVE EDITOR ENGINE (AI EDIT + MANUAL CODE + VIEW + ROLLBACK)
+# ==============================================================================
+def _strip_code_fences(raw: str) -> str:
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def apply_code_to_third_bot(raw_code: str) -> tuple[bool, str]:
+    code = _strip_code_fences(raw_code)
+    if not code:
+        return False, "Code khali hai."
+
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"SyntaxError (Line {exc.lineno}): {exc.msg}"
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if os.path.exists(THIRD_BOT_FILE):
+        stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(
+            THIRD_BOT_FILE, os.path.join(BACKUP_DIR, f"third_bot_{stamp}.py")
+        )
+
+    with open(THIRD_BOT_FILE, "w", encoding="utf-8") as f:
+        f.write(code + "\n")
+
+    return (
+        True,
+        f"third_bot.py live update ho gaya ({len(code.splitlines())} lines). Runner 2s mein reload karega!",
+    )
+
+
+def ai_edit_third_bot_code(instruction: str) -> tuple[bool, str]:
+    existing_code = ""
+    if os.path.exists(THIRD_BOT_FILE):
+        with open(THIRD_BOT_FILE, "r", encoding="utf-8") as f:
+            existing_code = f.read()
+
+    sys_prompt = (
+        "You are an expert Python Telegram bot developer using python-telegram-bot v20+. "
+        "Modify or build the complete, runnable third_bot.py according to the admin instruction. "
+        "Preserve token reading via os.getenv('THIRD_BOT_TOKEN') and drop_pending_updates=True. "
+        "Return ONLY raw valid Python code without markdown fences or explanations."
+    )
+    user_prompt = (
+        f"CURRENT third_bot.py:\n{existing_code}\n\n"
+        f"ADMIN EDIT REQUEST:\n{instruction}\n\n"
+        "Output ONLY complete valid Python code for third_bot.py:"
+    )
+    ok, generated = call_groq_resilient(
+        sys_prompt, user_prompt, max_tokens=2200, temperature=0.2
+    )
+    if not ok:
+        return False, f"AI edit fail: {generated}"
+
+    return apply_code_to_third_bot(generated)
+
+
+def get_third_bot_preview() -> str:
+    if not os.path.exists(THIRD_BOT_FILE):
+        return "third_bot.py abhi disk par maujood nahi hai."
+    with open(THIRD_BOT_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
+    lines = content.splitlines()
+    snippet = "\n".join(lines[-45:])
+    return (
+        f"{frame_box(sc('THIRD_BOT.PY PREVIEW'), f'Total Lines: {len(lines)}')}\n"
+        f"<code>{esc_html(snippet[-1400:])}</code>"
+    )
+
+
+def rollback_third_bot_code() -> tuple[bool, str]:
+    if not os.path.isdir(BACKUP_DIR):
+        return False, "Koi backup folder nahi mila."
+    backups = sorted(
+        f
+        for f in os.listdir(BACKUP_DIR)
+        if f.startswith("third_bot_") and f.endswith(".py")
+    )
+    if not backups:
+        return False, "Restore karne ke liye koi backup nahi hai."
+    latest = os.path.join(BACKUP_DIR, backups[-1])
+    shutil.copy2(latest, THIRD_BOT_FILE)
+    return True, f"Rollback complete from <code>{esc_html(backups[-1])}</code>!"
 
 
 # ==============================================================================
@@ -744,7 +846,6 @@ def advance_story_choice(user_id: int, choice_letter: str) -> str:
             hist = []
         hist.append({"chapter": str(cur_chap), "choice": ch, "picked": chosen_text})
 
-        # Try Groq AI for crazy Murim / Demonic Emperor next chapter
         ai_prompt = (
             f"Title: {row['title']}\nArc: {row['arc_type']}\nChapter: {next_chap}\n"
             f"Current Realm: {row['realm']} | Qi: {row['demonic_qi']} | HP: {row['hp']}\n"
@@ -1369,7 +1470,7 @@ async def send_media_showcase(bot, chat_id: int, kind: str, caption: str) -> Non
 
 
 # ==============================================================================
-# KEYBOARDS (WITH BACK & MAIN MENU EVERYWHERE + STORY + ADMIN CUSTOMIZE)
+# KEYBOARDS (WITH BACK & MAIN MENU EVERYWHERE + STORY + 3RD BOT + ADMIN CUSTOM)
 # ==============================================================================
 def main_menu_keyboard(user_id: int | None) -> ReplyKeyboardMarkup:
     cfg = get_custom_config()
@@ -1438,6 +1539,8 @@ def media_hub_keyboard() -> ReplyKeyboardMarkup:
 def admin_customize_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
+            [KeyboardButton("🤖 AI Edit 3rd Bot"), KeyboardButton("📥 Manual Code 3rd Bot")],
+            [KeyboardButton("📄 View 3rd Bot"), KeyboardButton("⏪ Rollback 3rd Bot")],
             [KeyboardButton("✏ 2nd Bot Title"), KeyboardButton("📝 Welcome Banner")],
             [KeyboardButton("🎨 1st Bot Theme"), KeyboardButton("🔔 1st Bot Notif")],
             [KeyboardButton("⏱ 1st Bot Sync Sec"), KeyboardButton("🛠 1st Bot Maint")],
@@ -1501,7 +1604,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = get_custom_config()
     meta = await asyncio.to_thread(sync_bots_db)
     role_badge = (
-        "ADMIN (1st + 2nd Bot Customizer)"
+        "ADMIN (1st + 2nd + 3rd Bot Live Controller)"
         if is_admin(user_id)
         else "OPERATOR (Story, Games & Sync)"
     )
@@ -1533,6 +1636,47 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_keyboard(user_id),
         )
+
+
+async def handle_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Allows Admin to upload a .py file directly to live-update third_bot.py."""
+    if not update.message or not update.message.document:
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_admin(user_id):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⛔ Sirf Admin hi 3rd bot ki file edit kar sakta hai.",
+            reply_markup=main_menu_keyboard(user_id),
+        )
+        return
+
+    doc = update.message.document
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".py"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Kripya <code>.py</code> Python file bhejein.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_customize_keyboard(),
+        )
+        return
+
+    tg_file = await doc.get_file()
+    raw_bytes = await tg_file.download_as_bytearray()
+    code_str = raw_bytes.decode("utf-8", errors="replace")
+    ok, status_msg = await asyncio.to_thread(apply_code_to_third_bot, code_str)
+    AWAITING_INPUT.pop(chat_id, None)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{'✅' if ok else '❌'} {esc_html(status_msg)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_customize_keyboard(),
+    )
 
 
 async def handle_text(
@@ -1600,9 +1744,34 @@ async def handle_text(
         if not is_admin(user_id):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="⛔ Yeh customization sirf <b>Admin</b> ke liye allowed hai.",
+                text="⛔ Yeh customization / 3rd-bot edit sirf <b>Admin</b> ke liye allowed hai.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu_keyboard(user_id),
+            )
+            return
+
+        if pending == "ai_edit_third":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🤖 AI `third_bot.py` ka code generate aur syntax-check kar raha hai...",
+                reply_markup=admin_customize_keyboard(),
+            )
+            ok, res_msg = await asyncio.to_thread(ai_edit_third_bot_code, text)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{'✅' if ok else '❌'} {esc_html(res_msg)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_customize_keyboard(),
+            )
+            return
+
+        if pending == "manual_code_third":
+            ok, res_msg = await asyncio.to_thread(apply_code_to_third_bot, text)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{'✅' if ok else '❌'} {esc_html(res_msg)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_customize_keyboard(),
             )
             return
 
@@ -1887,10 +2056,12 @@ async def handle_text(
                 f"Online <b>{s.get('online', 0)}</b> | Off <b>{s.get('offline', 0)}</b> | Stale <b>{s.get('stale', 0)}</b>"
             )
         b1s = meta.get("bot1_settings") or {}
+        third_exists = os.path.exists(THIRD_BOT_FILE)
         body = (
-            f"{frame_box(sc('1ST & 2ND BOT SYNC'))}\n"
+            f"{frame_box(sc('1ST, 2ND & 3RD BOT SYNC'))}\n"
             f"  ❖ Sync Version : <code>v{meta.get('sync_version', 1)}</code>\n"
             f"  ❖ Last Sync    : <code>{esc_html(meta.get('last_sync_ist', 'N/A'))}</code>\n"
+            f"  ❖ 3rd Bot File : <b>{'Ready (third_bot.py)' if third_exists else 'Pending'}</b>\n"
             f"  ❖ Snapshots    : <b>{meta.get('snapshots_count', 0)}</b> | "
             f"Stories: <b>{meta.get('story_saves_count', 0)}</b> | Alerts: <b>{meta.get('alerts_count', 0)}</b>\n"
             f"  ❖ 1st Bot DB   : Theme=<code>{esc_html(b1s.get('active_theme', cfg['bot1_theme']))}</code> | "
@@ -1946,12 +2117,12 @@ async def handle_text(
         )
         return
 
-    # Admin-only customization controls
+    # Admin-only customization & 3rd bot live controls
     if text == cfg["btn_admin_custom"] or MENU_STATE.get(chat_id) == "admin_custom":
         if not is_admin(user_id):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="⛔ Yeh customization panel <b>sirf Admin</b> ke liye locked hai.",
+                text="⛔ Yeh customization / 3rd-bot panel <b>sirf Admin</b> ke liye locked hai.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu_keyboard(user_id),
             )
@@ -1961,7 +2132,45 @@ async def handle_text(
             push_state(chat_id, "admin_custom")
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{frame_box(sc('ADMIN CUSTOM ENGINE'), '1st & 2nd Bot Live Control')}",
+                text=f"{frame_box(sc('ADMIN & 3RD BOT CONTROL'), 'Live AI/Manual Edit + 1st/2nd Sync')}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_customize_keyboard(),
+            )
+            return
+
+        if text == "🤖 AI Edit 3rd Bot":
+            AWAITING_INPUT[chat_id] = "ai_edit_third"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🤖 Bataiye `third_bot.py` mein kya feature, command, ya change AI se karwana hai:",
+                reply_markup=admin_customize_keyboard(),
+            )
+            return
+
+        if text == "📥 Manual Code 3rd Bot":
+            AWAITING_INPUT[chat_id] = "manual_code_third"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📥 `third_bot.py` ka poora Python code yahan paste karein ya `.py` file document bhejein:",
+                reply_markup=admin_customize_keyboard(),
+            )
+            return
+
+        if text == "📄 View 3rd Bot":
+            preview = await asyncio.to_thread(get_third_bot_preview)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=preview,
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_customize_keyboard(),
+            )
+            return
+
+        if text == "⏪ Rollback 3rd Bot":
+            ok, rb_msg = await asyncio.to_thread(rollback_third_bot_code)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{'✅' if ok else '❌'} {rb_msg}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=admin_customize_keyboard(),
             )
@@ -2131,6 +2340,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_start))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Baagi Jaat Ultra Companion Bot starting...")
